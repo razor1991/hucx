@@ -141,7 +141,9 @@ void* ucs_strided_alloc_get(ucs_strided_alloc_t *sa, const char *alloc_name)
         ucs_strided_alloc_grow(sa UCS_MEMTRACK_VAL);
     }
 
-    ucs_assert(sa->freelist != NULL);
+    if (sa->freelist == NULL) {
+        return NULL;
+    }
 
     elem         = sa->freelist;
     VALGRIND_MAKE_MEM_DEFINED(elem, sizeof(*elem));
