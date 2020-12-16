@@ -251,6 +251,9 @@ struct uct_ud_ep {
     uint8_t          rx_creq_count; /* TODO: remove when reason for DUP/OOO CREQ is found */
     ucs_wtimer_t     slow_timer;
     ucs_time_t       close_time;   /* timestamp of closure */
+#if HAVE_HNS_ROCE
+    ucs_queue_head_t pending_skb;
+#endif
     UCS_STATS_NODE_DECLARE(stats);
     UCT_UD_EP_HOOK_DECLARE(timer_hook);
 #if ENABLE_DEBUG_DATA
