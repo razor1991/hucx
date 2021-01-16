@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "timerq.h"
 
 #include <ucs/debug/log.h>
@@ -16,7 +20,7 @@ ucs_status_t ucs_timerq_init(ucs_timer_queue_t *timerq)
 {
     ucs_trace_func("timerq=%p", timerq);
 
-    pthread_spin_init(&timerq->lock, 0);
+    ucs_recursive_spinlock_init(&timerq->lock, 0);
     timerq->timers       = NULL;
     timerq->num_timers   = 0;
     /* coverity[missing_lock] */
@@ -26,12 +30,19 @@ ucs_status_t ucs_timerq_init(ucs_timer_queue_t *timerq)
 
 void ucs_timerq_cleanup(ucs_timer_queue_t *timerq)
 {
+    ucs_status_t status;
+
     ucs_trace_func("timerq=%p", timerq);
 
     if (timerq->num_timers > 0) {
         ucs_warn("timer queue with %d timers being destroyed", timerq->num_timers);
     }
     ucs_free(timerq->timers);
+
+    status = ucs_recursive_spinlock_destroy(&timerq->lock);
+    if (status != UCS_OK) {
+        ucs_warn("ucs_recursive_spinlock_destroy() failed (%d)", status);
+    }
 }
 
 ucs_status_t ucs_timerq_add(ucs_timer_queue_t *timerq, int timer_id,
@@ -43,7 +54,7 @@ ucs_status_t ucs_timerq_add(ucs_timer_queue_t *timerq, int timer_id,
     ucs_trace_func("timerq=%p interval=%.2fus timer_id=%d", timerq,
                    ucs_time_to_usec(interval), timer_id);
 
-    pthread_spin_lock(&timerq->lock);
+    ucs_recursive_spin_lock(&timerq->lock);
 
     /* Make sure ID is unique */
     for (ptr = timerq->timers; ptr < timerq->timers + timerq->num_timers; ++ptr) {
@@ -74,7 +85,7 @@ ucs_status_t ucs_timerq_add(ucs_timer_queue_t *timerq, int timer_id,
     status = UCS_OK;
 
 out_unlock:
-    pthread_spin_unlock(&timerq->lock);
+    ucs_recursive_spin_unlock(&timerq->lock);
     return status;
 }
 
@@ -87,7 +98,7 @@ ucs_status_t ucs_timerq_remove(ucs_timer_queue_t *timerq, int timer_id)
 
     status = UCS_ERR_NO_ELEM;
 
-    pthread_spin_lock(&timerq->lock);
+    ucs_recursive_spin_lock(&timerq->lock);
     timerq->min_interval = UCS_TIME_INFINITY;
     ptr = timerq->timers;
     while (ptr < timerq->timers + timerq->num_timers) {
@@ -109,6 +120,6 @@ ucs_status_t ucs_timerq_remove(ucs_timer_queue_t *timerq, int timer_id)
         ucs_assert(timerq->min_interval != UCS_TIME_INFINITY);
     }
 
-    pthread_spin_unlock(&timerq->lock);
+    ucs_recursive_spin_unlock(&timerq->lock);
     return status;
 }

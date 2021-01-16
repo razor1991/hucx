@@ -55,6 +55,13 @@
    obj:*libcuda*.so*
 }
 {
+   fun:gdr_open
+   Memcheck:Param
+   ioctl(generic)
+   fun:ioctl
+   fun:gdr_open
+}
+{
    gdr_get_info_ioctl
    Memcheck:Param
    ioctl(generic)
@@ -148,4 +155,125 @@
    Memcheck:Leak
    ...
    fun:ib_cm_open_device
+}
+{
+   <insert_a_suppression_name_here>
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   obj:*/libhfi1verbs-rdmav22.so*
+   obj:*/libibverbs.so*
+   ...
+   fun:ibv_get_device_list
+}
+{
+   rdma_core_ibv_get_device_list
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   ...
+   obj:*/libibverbs.so*
+   ...
+   fun:ibv_get_device_list
+}
+{
+   verbs_open_device
+   Memcheck:Leak
+   match-leak-kinds: possible
+   ...
+   fun:verbs_open_device
+}
+{
+   uct_ib_iface_prepare_rx_wrs_val
+   Memcheck:Value8
+   fun:uct_ib_iface_prepare_rx_wrs
+}
+{
+   uct_ib_iface_prepare_rx_wrs_cond
+   Memcheck:Cond
+   fun:uct_ib_iface_prepare_rx_wrs
+}
+{
+   uct_ib_iface_recv_desc_hdr
+   Memcheck:Value8
+   fun:uct_ib_iface_recv_desc_hdr
+}
+{
+   mlx4_ibv_post_srq_recv_val
+   Memcheck:Value8
+   obj:*/libmlx4.so*
+   fun:ibv_post_srq_recv
+}
+{
+   mlx4_ibv_post_srq_recv_cond
+   Memcheck:Cond
+   obj:*/libmlx4.so*
+   fun:ibv_post_srq_recv
+}
+{
+   uct_rc_verbs_iface_common_prepost_recvs
+   Memcheck:Cond
+   fun:uct_rc_verbs_iface_common_prepost_recvs
+}
+{
+   uct_rc_verbs_iface_post_recv_always_val
+   Memcheck:Value8
+   fun:uct_rc_verbs_iface_post_recv_always
+}
+{
+   uct_rc_verbs_iface_post_recv_always_cond
+   Memcheck:Cond
+   fun:uct_rc_verbs_iface_post_recv_always
+}
+{
+   uct_rc_verbs_iface_post_recv_common_val
+   Memcheck:Value8
+   ...
+   fun:uct_rc_verbs_iface_post_recv_common
+}
+{
+   uct_rc_verbs_iface_post_recv_common_cond
+   Memcheck:Cond
+   fun:uct_rc_verbs_iface_post_recv_common
+}
+{
+   gdrcopy_ioctl
+   Memcheck:Param
+   ioctl(generic)
+   fun:ioctl
+   fun:gdr_pin_buffer
+}
+{
+   gdr_map
+   Memcheck:Cond
+   fun:gdr_map
+}
+{
+   gdr_copy_to_mapping_cond
+   Memcheck:Cond
+   ...
+   fun:gdr_copy_to_mapping
+}
+{
+   fun:gdr_copy_from_mapping_cond
+   Memcheck:Cond
+   ...
+   fun:gdr_copy_from_mapping
+}
+{
+   gdr_copy_to_mapping_value8
+   Memcheck:Value8
+   ...
+   fun:gdr_copy_to_mapping
+}
+{
+   gdr_copy_from_mapping_value8
+   Memcheck:Value8
+   ...
+   fun:gdr_copy_from_mapping
+}
+{
+   gdr_unmap
+   Memcheck:Cond
+   fun:gdr_unmap
 }

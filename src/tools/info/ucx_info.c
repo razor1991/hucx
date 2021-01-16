@@ -1,9 +1,13 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
 *
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 * See file LICENSE for terms.
 */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include "ucx_info.h"
 
@@ -13,6 +17,7 @@
 #include <getopt.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 
 static void usage() {
@@ -30,6 +35,7 @@ static void usage() {
     printf("  -p              Show UCP context information\n");
     printf("  -w              Show UCP worker information\n");
     printf("  -e              Show UCP endpoint configuration\n");
+    printf("  -m <size>       Show UCP memory allocation method for a given size\n");
     printf("  -u <features>   UCP context features to use. String of one or more of:\n");
     printf("                    'a' : atomic operations\n");
     printf("                    'r' : remote memory access\n");
@@ -40,6 +46,7 @@ static void usage() {
     printf("\nOther settings:\n");
     printf("  -t <name>       Filter devices information using specified transport (requires -d)\n");
     printf("  -n <count>      Estimated UCP endpoint count (for ucp_init)\n");
+    printf("  -N <count>      Estimated UCP endpoint count per node (for ucp_init)\n");
     printf("  -D <type>       Set which device types to use when creating UCP context:\n");
     printf("                    'all'  : all possible devices (default)\n");
     printf("                    'shm'  : shared memory devices only\n");
@@ -56,19 +63,22 @@ int main(int argc, char **argv)
     unsigned dev_type_bitmap;
     uint64_t ucp_features;
     size_t ucp_num_eps;
+    size_t ucp_num_ppn;
     unsigned print_opts;
-    char *tl_name;
+    char *tl_name, *mem_size;
     const char *f;
     int c;
 
     print_opts               = 0;
-    print_flags              = 0;
+    print_flags              = (ucs_config_print_flags_t)0;
     tl_name                  = NULL;
     ucp_features             = 0;
     ucp_num_eps              = 1;
-    dev_type_bitmap          = -1;
+    ucp_num_ppn              = 1;
+    mem_size                 = NULL;
+    dev_type_bitmap          = UINT_MAX;
     ucp_ep_params.field_mask = 0;
-    while ((c = getopt(argc, argv, "fahvcydbswpegt:n:u:D:P:T:C:I:R:")) != -1) {
+    while ((c = getopt(argc, argv, "fahvcydbswpegt:n:u:D:m:N:P:T:C:I:R:")) != -1) {
         switch (c) {
         case 'f':
             print_flags |= UCS_CONFIG_PRINT_CONFIG | UCS_CONFIG_PRINT_HEADER | UCS_CONFIG_PRINT_DOC;
@@ -103,11 +113,18 @@ int main(int argc, char **argv)
         case 'e':
             print_opts |= PRINT_UCP_EP;
             break;
+        case 'm':
+            print_opts |= PRINT_MEM_MAP;
+            mem_size = optarg;
+            break;
         case 't':
             tl_name = optarg;
             break;
         case 'n':
             ucp_num_eps = atol(optarg);
+            break;
+        case 'N':
+            ucp_num_ppn = atol(optarg);
             break;
         case 'u':
             for (f = optarg; *f; ++f) {
@@ -124,9 +141,9 @@ int main(int argc, char **argv)
                 case 'w':
                     ucp_features |= UCP_FEATURE_WAKEUP;
                     break;
+                    break;
                 case 'g':
                     ucp_features |= UCP_FEATURE_GROUPS | UCP_FEATURE_TAG;
-                    break;
                 case 'e':
                     ucp_ep_params.field_mask |= UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
                     ucp_ep_params.err_mode    = UCP_ERR_HANDLING_MODE_PEER;
@@ -145,7 +162,7 @@ int main(int argc, char **argv)
             } else if (!strcasecmp(optarg, "self")) {
                 dev_type_bitmap = UCS_BIT(UCT_DEVICE_TYPE_SELF);
             } else if (!strcasecmp(optarg, "all")) {
-                dev_type_bitmap = -1;
+                dev_type_bitmap = UINT_MAX;
             } else {
                 usage();
                 return -1;
@@ -183,16 +200,17 @@ int main(int argc, char **argv)
 
     if ((print_opts & PRINT_DEVICES) || (print_flags & UCS_CONFIG_PRINT_CONFIG)) {
         /* if UCS_CONFIG_PRINT_CONFIG is ON, trigger loading UCT modules by
-         * calling print_uct_info()->uct_query_md_resources()
+         * calling print_uct_info()->uct_component_query()
          */
         print_uct_info(print_opts, print_flags, tl_name);
     }
 
     if (print_flags & UCS_CONFIG_PRINT_CONFIG) {
-        ucs_config_parser_print_all_opts(stdout, print_flags);
+        ucs_config_parser_print_all_opts(stdout, UCS_DEFAULT_ENV_PREFIX,
+                                         print_flags);
     }
 
-    if (print_opts & (PRINT_UCP_CONTEXT | PRINT_UCP_WORKER | PRINT_UCP_EP |
+    if (print_opts & (PRINT_UCP_CONTEXT|PRINT_UCP_WORKER|PRINT_UCP_EP|PRINT_MEM_MAP|
                       PRINT_UCG | PRINT_UCG_TOPO)) {
         if (ucp_features == 0) {
             printf("Please select UCP features using -u switch: a|r|t|w|g\n");
@@ -200,7 +218,7 @@ int main(int argc, char **argv)
             return -1;
         }
         print_ucp_info(print_opts, print_flags, ucp_features, &ucp_ep_params,
-                       ucp_num_eps, dev_type_bitmap);
+                       ucp_num_eps, ucp_num_ppn, dev_type_bitmap, mem_size);
     }
 
     return 0;

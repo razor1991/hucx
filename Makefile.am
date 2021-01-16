@@ -3,7 +3,6 @@
 # Copyright (C) UT-Battelle, LLC. 2014-2015. ALL RIGHTS RESERVED.
 # Copyright (C) The University of Tennessee and The University
 #               of Tennessee Research Foundation. 2016. ALL RIGHTS RESERVED.
-# Copyright (C) Huawei Technologies Co.,Ltd. 2020. ALL RIGHTS RESERVED.
 #
 # See file LICENSE for terms.
 #
@@ -22,11 +21,11 @@ doc_dir = $(pkgdatadir)/doc
 if !DOCS_ONLY
 perftest_dir = $(pkgdatadir)/perftest
 dist_perftest__DATA = contrib/ucx_perftest_config/msg_pow2 \
+					  contrib/ucx_perftest_config/msg_pow2_large \
 					  contrib/ucx_perftest_config/README \
 					  contrib/ucx_perftest_config/test_types_uct \
 					  contrib/ucx_perftest_config/test_types_ucp \
 					  contrib/ucx_perftest_config/transports
-
 SUBDIRS = \
 	src/ucm \
 	src/ucs \
@@ -34,15 +33,16 @@ SUBDIRS = \
 	src/ucp
 
 if HAVE_UCG
-SUBDIRS += src/ucg
+SUBDIRS += $(UCG_SUBDIR)
 endif
 
 SUBDIRS += \
 	src/tools/info \
 	src/tools/perf \
 	src/tools/profile \
+	bindings/java \
 	test/apps \
-	test/examples
+	examples
 
 if HAVE_GTEST
 SUBDIRS += test/gtest
@@ -52,11 +52,6 @@ if HAVE_MPICC
 SUBDIRS += test/mpi
 endif
 
-if HAVE_JAVA
-SUBDIRS += bindings/java/src/main/native
-endif
-
-EXTRA_DIST += bindings/java
 EXTRA_DIST += contrib/configure-devel
 EXTRA_DIST += contrib/configure-release
 EXTRA_DIST += contrib/configure-prof
@@ -70,16 +65,16 @@ EXTRA_DIST += debian
 EXTRA_DIST += ucx.pc.in
 EXTRA_DIST += LICENSE
 endif #!DOCS_ONLY
-EXTRA_DIST += doc/uml/uct.dot
+EXTRA_DIST += docs/uml/uct.dot
 
-include $(srcdir)/doc/doxygen/doxygen.am
+include $(srcdir)/docs/doxygen/doxygen.am
 
 .PHONY: docs docs-clean
 
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = ucx.pc
 
-DOCLIST = doc/doxygen/doxygen-doc/ucx.tag
+DOCLIST = docs/doxygen/doxygen-doc/ucx.tag
 
 FORMAT = pdf
 DOT_CLEANFILES =
@@ -90,8 +85,8 @@ gtest:
 endif
 
 if HAVE_DOT
-DOCLIST += doc/uml/uml.tag doc/uml/uct.$(FORMAT) doc/uml/ucp.$(FORMAT)
-DOT_CLEANFILES += doc/uml/uml.tag doc/uml/uct.$(FORMAT) doc/uml/ucp.$(FORMAT)
+DOCLIST += docs/uml/uml.tag docs/uml/uct.$(FORMAT) docs/uml/ucp.$(FORMAT)
+DOT_CLEANFILES += docs/uml/uml.tag docs/uml/uct.$(FORMAT) docs/uml/ucp.$(FORMAT)
 endif
 
 docs: $(DOCLIST)
@@ -100,10 +95,10 @@ docs-clean:
 	$(RM) $(DX_CLEANFILES)
 	$(RM) $(DOT_CLEANFILES)
 
-doc/doxygen/doxygen-doc/ucx.tag: $(doxygen_doc_files) doxygen-doc
+docs/doxygen/doxygen-doc/ucx.tag: $(doxygen_doc_files) doxygen-doc
 
-doc/uml/uml.tag:
-	mkdir -p doc/uml
+docs/uml/uml.tag:
+	mkdir -p docs/uml
 	echo `date` > $@
 
 .dot.pdf:

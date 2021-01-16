@@ -4,6 +4,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ugni_smsg_iface.h"
 #include "ugni_smsg_ep.h"
 #include <uct/ugni/base/ugni_def.h>
@@ -11,7 +15,8 @@
 #include <uct/ugni/base/ugni_device.h>
 #include <ucs/arch/cpu.h>
 
-#define UCT_UGNI_SMSG_TL_NAME "ugni_smsg"
+
+extern ucs_class_t UCS_CLASS_DECL_NAME(uct_ugni_smsg_iface_t);
 
 static ucs_config_field_t uct_ugni_smsg_iface_config_table[] = {
     {"", "ALLOC=huge,thp,mmap,heap", NULL,
@@ -64,7 +69,7 @@ static void process_mbox(uct_ugni_smsg_iface_t *iface, uct_ugni_smsg_ep_t *ep){
 
     /* Only one thread at a time can process mboxes for the iface. After it's done
        then everyone's messages have been drained. */
-    if (!ucs_spin_trylock(&iface->mbox_lock)) {
+    if (!ucs_recursive_spin_trylock(&iface->mbox_lock)) {
         return;
     }
     while(1){
@@ -100,7 +105,7 @@ static void process_mbox(uct_ugni_smsg_iface_t *iface, uct_ugni_smsg_ep_t *ep){
             break;
         }
     }
-    ucs_spin_unlock(&iface->mbox_lock);
+    ucs_recursive_spin_unlock(&iface->mbox_lock);
 }
 
 static void uct_ugni_smsg_handle_remote_overflow(uct_ugni_smsg_iface_t *iface){
@@ -183,19 +188,12 @@ static unsigned uct_ugni_smsg_progress(void *arg)
     return count - 2;
 }
 
-static ucs_status_t uct_ugni_smsg_query_tl_resources(uct_md_h md,
-                                                     uct_tl_resource_desc_t **resource_p,
-                                                     unsigned *num_resources_p)
-{
-    return uct_ugni_query_tl_resources(md, UCT_UGNI_SMSG_TL_NAME,
-                                       resource_p, num_resources_p);
-}
-
 static ucs_status_t uct_ugni_smsg_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 {
     uct_ugni_smsg_iface_t *iface = ucs_derived_of(tl_iface, uct_ugni_smsg_iface_t);
 
-    memset(iface_attr, 0, sizeof(uct_iface_attr_t));
+    uct_base_iface_query(&iface->super.super, iface_attr);
+
     iface_attr->cap.am.max_short       = iface->config.smsg_seg_size-sizeof(uint64_t);
     iface_attr->cap.am.max_bcopy       = iface->config.smsg_seg_size;
     iface_attr->cap.am.opt_zcopy_align = 1;
@@ -211,21 +209,28 @@ static ucs_status_t uct_ugni_smsg_iface_query(uct_iface_h tl_iface, uct_iface_at
                                          UCT_IFACE_FLAG_PENDING;
 
     iface_attr->overhead               = 1e-6;  /* 1 usec */
-    iface_attr->latency.overhead       = 40e-6; /* 40 usec */
-    iface_attr->latency.growth         = 0;
-    iface_attr->bandwidth              = pow(1024, 2); /* bytes */
+    iface_attr->latency                = ucs_linear_func_make(40e-6, 0); /* 40 usec */
+    iface_attr->bandwidth.dedicated    = 1.0 * UCS_MBYTE; /* bytes */
+    iface_attr->bandwidth.shared       = 0;
     iface_attr->priority               = 0;
+
     return UCS_OK;
 }
 
 
 static UCS_CLASS_CLEANUP_FUNC(uct_ugni_smsg_iface_t)
 {
+    ucs_status_t status;
+
     uct_worker_progress_remove(self->super.super.worker, &self->super.super.prog);
     ucs_mpool_cleanup(&self->free_desc, 1);
     ucs_mpool_cleanup(&self->free_mbox, 1);
     uct_ugni_destroy_cq(self->remote_cq, &self->super.cdm);
-    ucs_spinlock_destroy(&self->mbox_lock);
+
+    status = ucs_recursive_spinlock_destroy(&self->mbox_lock);
+    if (status != UCS_OK) {
+        ucs_warn("ucs_recursive_spinlock_destroy() failed (%d)", status);
+    }
 }
 
 static uct_iface_ops_t uct_ugni_smsg_iface_ops = {
@@ -289,7 +294,7 @@ static UCS_CLASS_INIT_FUNC(uct_ugni_smsg_iface_t, uct_md_h md, uct_worker_h work
     smsg_attr.msg_type = GNI_SMSG_TYPE_MBOX_AUTO_RETRANSMIT;
     smsg_attr.mbox_maxcredit = self->config.smsg_max_credit;
     smsg_attr.msg_maxsize = self->config.smsg_seg_size;
-    status = ucs_spinlock_init(&self->mbox_lock);
+    status = ucs_recursive_spinlock_init(&self->mbox_lock, 0);
     if (UCS_OK != status) {
             goto exit;
     }
@@ -359,7 +364,7 @@ static UCS_CLASS_INIT_FUNC(uct_ugni_smsg_iface_t, uct_md_h md, uct_worker_h work
  clean_cq:
     uct_ugni_destroy_cq(self->remote_cq, &self->super.cdm);
  clean_lock:
-    ucs_spinlock_destroy(&self->mbox_lock);
+    ucs_recursive_spinlock_destroy(&self->mbox_lock);
  exit:
     uct_ugni_cleanup_base_iface(&self->super);
     ucs_error("Failed to activate interface");
@@ -371,12 +376,6 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_ugni_smsg_iface_t, uct_iface_t, uct_md_h,
                           uct_worker_h, const uct_iface_params_t*,
                           const uct_iface_config_t *);
 
-UCT_TL_COMPONENT_DEFINE(uct_ugni_smsg_tl_component,
-                        uct_ugni_smsg_query_tl_resources,
-                        uct_ugni_smsg_iface_t,
-                        UCT_UGNI_SMSG_TL_NAME,
-                        "UGNI_SMSG",
-                        uct_ugni_smsg_iface_config_table,
-                        uct_ugni_iface_config_t);
-
-UCT_MD_REGISTER_TL(&uct_ugni_md_component, &uct_ugni_smsg_tl_component);
+UCT_TL_DEFINE(&uct_ugni_component, ugni_smsg, uct_ugni_query_devices,
+              uct_ugni_smsg_iface_t, "UGNI_SMSG_",
+              uct_ugni_smsg_iface_config_table, uct_ugni_iface_config_t);

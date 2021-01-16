@@ -48,7 +48,7 @@ protected:
     virtual void ack_event() = 0;
     virtual int event_id() = 0;
 
-    static void cb(int id, void *arg) {
+    static void cb(int id, int events, void *arg) {
         base *self = reinterpret_cast<base*>(arg);
         self->handler();
     }
@@ -79,9 +79,10 @@ public:
     }
 
     void set_handler(ucs_async_context_t *async) {
-        ucs_status_t status = ucs_async_set_event_handler(mode(), event_fd(),
-                                                          POLLIN, cb, this,
-                                                          async);
+        ucs_status_t status =
+            ucs_async_set_event_handler(mode(), event_fd(),
+                                        UCS_EVENT_SET_EVREAD,
+                                        cb, this, async);
         ASSERT_UCS_OK(status);
         base::set_handler();
     }
@@ -94,9 +95,13 @@ public:
         ucs_async_pipe_push(&m_event_pipe);
     }
 
+    void reset() {
+        ucs_async_pipe_drain(&m_event_pipe);
+    }
+
 protected:
     virtual void ack_event() {
-        ucs_async_pipe_drain(&m_event_pipe);
+        reset();
     }
 
 private:
@@ -225,8 +230,10 @@ class local_timer : public local,
                     public base_timer
 {
 public:
+    static const int TIMER_INTERVAL_USEC = 1000;
+
     local_timer(ucs_async_mode_t mode) : local(mode), base_timer(mode) {
-        set_timer(&m_async, ucs_time_from_usec(1000));
+        set_timer(&m_async, ucs_time_from_usec(TIMER_INTERVAL_USEC));
     }
 
     ~local_timer() {
@@ -242,7 +249,7 @@ public:
 protected:
     static const int      COUNT           = 40;
     static const unsigned SLEEP_USEC      = 1000;
-    static const int      TIMER_RETRIES   = 100;
+    static const int      NUM_RETRIES     = 100;
     static const int      TIMER_EXP_COUNT = COUNT / 4;
 
     void suspend(double scale = 1.0) {
@@ -272,6 +279,20 @@ protected:
             suspend(scale);
         }
     }
+
+    template<typename E>
+    void expect_count_GE(E& event, int value) {
+        for (int retry = 0; retry < NUM_RETRIES; ++retry) {
+             suspend_and_poll(&event, COUNT);
+             if (event.count() >= value) {
+                  return;
+             }
+             UCS_TEST_MESSAGE << "retry " << (retry + 1);
+         }
+         EXPECT_GE(event.count(), value) << "after " << int(NUM_RETRIES)
+                                         << " retries";
+    }
+
 };
 
 template<typename LOCAL>
@@ -364,24 +385,15 @@ private:
     LOCAL*                         m_ev[NUM_THREADS];
 };
 
-
 UCS_TEST_P(test_async, global_event) {
     global_event ge(GetParam());
     ge.push_event();
-    suspend_and_poll(&ge, COUNT);
-    EXPECT_GE(ge.count(), 1);
+    expect_count_GE(ge, 1);
 }
 
 UCS_TEST_P(test_async, global_timer) {
     global_timer gt(GetParam());
-    for (int i = 0; i < TIMER_RETRIES; ++i) {
-        suspend_and_poll(&gt, COUNT * 4);
-        if (gt.count() >= COUNT) {
-             break;
-        }
-        UCS_TEST_MESSAGE << "retry " << (i + 1);
-    }
-    EXPECT_GE(gt.count(), int(COUNT));
+    expect_count_GE(gt, COUNT);
 }
 
 UCS_TEST_P(test_async, max_events, "ASYNC_MAX_EVENTS=4") {
@@ -423,8 +435,8 @@ UCS_TEST_P(test_async, max_events, "ASYNC_MAX_EVENTS=4") {
 }
 
 UCS_TEST_P(test_async, many_timers) {
-
-    for (int count = 0; count < 4010; ++count) {
+    int max_iters = 4010 / ucs::test_time_multiplier();
+    for (int count = 0; count < max_iters; ++count) {
         std::vector<int> timers;
         ucs_status_t status;
         int timer_id;
@@ -447,32 +459,24 @@ UCS_TEST_P(test_async, many_timers) {
 UCS_TEST_P(test_async, ctx_event) {
     local_event le(GetParam());
     le.push_event();
-    suspend_and_poll(&le, COUNT);
-    EXPECT_GE(le.count(), 1);
+    expect_count_GE(le, 1);
 }
 
 UCS_TEST_P(test_async, ctx_timer) {
     local_timer lt(GetParam());
-    for (int i = 0; i < TIMER_RETRIES; ++i) {
-        suspend_and_poll(&lt, COUNT * 4);
-        if (lt.count() >= TIMER_EXP_COUNT) {
-            break;
-        }
-        UCS_TEST_MESSAGE << "retry " << (i + 1);
-    }
-    EXPECT_GE(lt.count(), int(TIMER_EXP_COUNT));
+    expect_count_GE(lt, TIMER_EXP_COUNT);
 }
 
 UCS_TEST_P(test_async, two_timers) {
     local_timer lt1(GetParam());
     local_timer lt2(GetParam());
-    for (int i = 0; i < TIMER_RETRIES; ++i) {
+    for (int retry = 0; retry < NUM_RETRIES; ++retry) {
         suspend_and_poll2(&lt1, &lt2, COUNT * 4);
         if ((lt1.count() >= TIMER_EXP_COUNT) &&
             (lt2.count() >= TIMER_EXP_COUNT)) {
              break;
         }
-        UCS_TEST_MESSAGE << "retry " << (i + 1);
+        UCS_TEST_MESSAGE << "retry " << (retry + 1);
     }
     EXPECT_GE(lt1.count(), int(TIMER_EXP_COUNT));
     EXPECT_GE(lt2.count(), int(TIMER_EXP_COUNT));
@@ -480,15 +484,23 @@ UCS_TEST_P(test_async, two_timers) {
 
 UCS_TEST_P(test_async, ctx_event_block) {
     local_event le(GetParam());
+    int count = 0;
 
-    le.block();
-    le.push_event();
-    suspend_and_poll(&le, COUNT);
-    EXPECT_EQ(0, le.count());
-    le.unblock();
+    for (int retry = 0; retry < NUM_RETRIES; ++retry) {
+        le.block();
+        count = le.count();
+        le.push_event();
+        suspend_and_poll(&le, COUNT);
+        EXPECT_EQ(count, le.count());
+        le.unblock();
 
-    le.check_miss();
-    EXPECT_GE(le.count(), 1);
+        le.check_miss();
+        if (le.count() > count) {
+            break;
+        }
+        UCS_TEST_MESSAGE << "retry " << (retry + 1);
+    }
+    EXPECT_GT(le.count(), count);
 }
 
 UCS_TEST_P(test_async, ctx_event_block_two_miss) {
@@ -526,21 +538,22 @@ UCS_TEST_P(test_async, ctx_event_block_two_miss) {
 
 UCS_TEST_P(test_async, ctx_timer_block) {
     local_timer lt(GetParam());
+    int count = 0;
 
-    for (int i = 0; i < TIMER_RETRIES; ++i) {
+    for (int retry = 0; retry < NUM_RETRIES; ++retry) {
         lt.block();
-        int count = lt.count();
+        count = lt.count();
         suspend_and_poll(&lt, COUNT);
         EXPECT_EQ(count, lt.count());
         lt.unblock();
 
         lt.check_miss();
-        if (lt.count() >= 1) {
+        if (lt.count() > count) {
             break;
         }
-        UCS_TEST_MESSAGE << "retry " << (i + 1);
+        UCS_TEST_MESSAGE << "retry " << (retry + 1);
     }
-    EXPECT_GE(lt.count(), 1); /* Timer could expire again after unblock */
+    EXPECT_GT(lt.count(), count); /* Timer could expire again after unblock */
 }
 
 UCS_TEST_P(test_async, modify_event) {
@@ -548,8 +561,7 @@ UCS_TEST_P(test_async, modify_event) {
     int count;
 
     le.push_event();
-    suspend_and_poll(&le, COUNT);
-    EXPECT_GE(le.count(), 1);
+    expect_count_GE(le, 1);
 
     ucs_async_modify_handler(le.event_id(), 0);
     sleep(1);
@@ -557,18 +569,12 @@ UCS_TEST_P(test_async, modify_event) {
     le.push_event();
     suspend_and_poll(&le, COUNT);
     EXPECT_EQ(le.count(), count);
+    le.reset();
 
-    ucs_async_modify_handler(le.event_id(), POLLIN);
+    ucs_async_modify_handler(le.event_id(), UCS_EVENT_SET_EVREAD);
     count = le.count();
     le.push_event();
-    for (int i = 0; i < TIMER_RETRIES; ++i) {
-        suspend_and_poll(&le, 1);
-        if (le.count() > count) {
-            break;
-        }
-        UCS_TEST_MESSAGE << "retry " << (i + 1);
-    }
-    EXPECT_GT(le.count(), count);
+    expect_count_GE(le, count + 1);
 
     ucs_async_modify_handler(le.event_id(), 0);
     sleep(1);
@@ -597,6 +603,43 @@ UCS_TEST_P(test_async, warn_block) {
     }
 }
 
+class local_timer_long_handler : public local_timer {
+public:
+    local_timer_long_handler(ucs_async_mode_t mode, int sleep_usec) :
+        local_timer(mode), m_sleep_usec(sleep_usec) {
+    }
+
+    virtual void handler() {
+        /* The handler would sleep long enough to increment the counter after
+         * main thread already considers it removed - unless the main thread
+         * waits for handler completion properly.
+         * It sleeps only once to avoid timer overrun deadlock in signal mode.
+         */
+        ucs::safe_usleep(m_sleep_usec * 2);
+        m_sleep_usec = 0;
+        local_timer::handler();
+    }
+
+    int m_sleep_usec;
+};
+
+UCS_TEST_P(test_async, remove_sync) {
+
+    /* create another handler so that removing the timer would not have to
+     * completely cleanup the async context, and race condition could happen
+     */
+    local_timer le(GetParam());
+
+    for (int retry = 0; retry < NUM_RETRIES; ++retry) {
+        local_timer_long_handler lt(GetParam(), SLEEP_USEC * 2);
+        suspend_and_poll(&lt, 1);
+        lt.unset_handler(true);
+        int count = lt.count();
+        suspend_and_poll(&lt, 1);
+        ASSERT_EQ(count, lt.count());
+    }
+}
+
 class local_timer_remove_handler : public local_timer {
 public:
     local_timer_remove_handler(ucs_async_mode_t mode) : local_timer(mode) {
@@ -611,11 +654,8 @@ protected:
 
 UCS_TEST_P(test_async, timer_unset_from_handler) {
     local_timer_remove_handler lt(GetParam());
-    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(10.0);
-    do {
-        suspend_and_poll(&lt, 1);
-    } while ((lt.count() == 0) && (ucs_get_time() < deadline));
-    EXPECT_GE(lt.count(), 1);
+
+    expect_count_GE(lt, 1);
     suspend_and_poll(&lt, COUNT);
     EXPECT_LE(lt.count(), 5); /* timer could fire multiple times before we remove it */
     int count = lt.count();
@@ -625,26 +665,39 @@ UCS_TEST_P(test_async, timer_unset_from_handler) {
 
 class local_event_remove_handler : public local_event {
 public:
-    local_event_remove_handler(ucs_async_mode_t mode) : local_event(mode) {
+    local_event_remove_handler(ucs_async_mode_t mode, bool sync) :
+        local_event(mode), m_sync(sync) {
     }
 
 protected:
     virtual void handler() {
          base::handler();
-         unset_handler(false);
+         unset_handler(m_sync);
+    }
+
+private:
+    bool m_sync;
+};
+
+class test_async_event_unset_from_handler : public test_async {
+protected:
+    void test_unset_from_handler(bool sync) {
+        local_event_remove_handler le(GetParam(), sync);
+
+        for (int iter = 0; iter < 5; ++iter) {
+            le.push_event();
+            expect_count_GE(le, 1);
+            EXPECT_EQ(1, le.count());
+        }
     }
 };
 
-UCS_TEST_P(test_async, event_unset_from_handler) {
-    local_event_remove_handler le(GetParam());
+UCS_TEST_P(test_async_event_unset_from_handler, sync) {
+    test_unset_from_handler(true);
+}
 
-    le.push_event();
-    suspend_and_poll(&le, COUNT);
-    EXPECT_EQ(1, le.count());
-
-    le.push_event();
-    suspend_and_poll(&le, COUNT);
-    EXPECT_EQ(1, le.count());
+UCS_TEST_P(test_async_event_unset_from_handler, async) {
+    test_unset_from_handler(false);
 }
 
 class local_event_add_handler : public local_event {
@@ -671,15 +724,16 @@ public:
     }
 
 protected:
-    static void dummy_cb(int id, void *arg) {
+    static void dummy_cb(int id, int events, void *arg) {
     }
 
     virtual void handler() {
          base::handler();
          if (!m_event_set) {
-             ucs_status_t status = ucs_async_set_event_handler(mode(), m_pipefd[0],
-                                                               POLLIN, dummy_cb,
-                                                               this, &m_async);
+             ucs_status_t status =
+                 ucs_async_set_event_handler(mode(), m_pipefd[0],
+                                             UCS_EVENT_SET_EVREAD,
+                                             dummy_cb, this, &m_async);
              ASSERT_UCS_OK(status);
              m_event_set = true;
          }
@@ -703,33 +757,39 @@ typedef test_async_mt<local_timer> test_async_timer_mt;
 /*
  * Run multiple threads which all process events independently.
  */
-UCS_TEST_P(test_async_event_mt, multithread) {
-    if (!(HAVE_DECL_F_SETOWN_EX)) {
-        UCS_TEST_SKIP;
-    }
-
-    spawn();
-
-    for (int j = 0; j < COUNT; ++j) {
-        for (unsigned i = 0; i < NUM_THREADS; ++i) {
-            event(i)->push_event();
-            suspend();
+UCS_TEST_SKIP_COND_P(test_async_event_mt, multithread,
+                     !(HAVE_DECL_F_SETOWN_EX)) {
+    const int exp_min_count = (int)(COUNT * 0.5);
+    int min_count = 0;
+    for (int retry = 0; retry < NUM_RETRIES; ++retry) {
+        spawn();
+        for (int j = 0; j < COUNT; ++j) {
+            for (unsigned i = 0; i < NUM_THREADS; ++i) {
+                event(i)->push_event();
+                suspend();
+            }
         }
+        suspend();
+        stop();
+
+        min_count = std::numeric_limits<int>::max();
+        for (unsigned i = 0; i < NUM_THREADS; ++i) {
+            int count = thread_count(i);
+            min_count = ucs_min(count, min_count);
+        }
+        if (min_count >= exp_min_count) {
+            break;
+        }
+
+        UCS_TEST_MESSAGE << "retry " << (retry + 1);
     }
-
-    suspend();
-
-    stop();
-
-    for (unsigned i = 0; i < NUM_THREADS; ++i) {
-        int count = thread_count(i);
-        EXPECT_GE(count, (int)(COUNT * 0.4));
-    }
+    EXPECT_GE(min_count, exp_min_count);
 }
+
 UCS_TEST_P(test_async_timer_mt, multithread) {
     const int exp_min_count = (int)(COUNT * 0.10);
     int min_count = 0;
-    for (int r = 0; r < TIMER_RETRIES; ++r) {
+    for (int retry = 0; retry < NUM_RETRIES; ++retry) {
         spawn();
         suspend(2 * COUNT);
         stop();
@@ -746,15 +806,18 @@ UCS_TEST_P(test_async_timer_mt, multithread) {
     EXPECT_GE(min_count, exp_min_count);
 }
 
-INSTANTIATE_TEST_CASE_P(signal,          test_async, ::testing::Values(UCS_ASYNC_MODE_SIGNAL));
-INSTANTIATE_TEST_CASE_P(thread_spinlock, test_async, ::testing::Values(UCS_ASYNC_MODE_THREAD_SPINLOCK));
-INSTANTIATE_TEST_CASE_P(thread_mutex,    test_async, ::testing::Values(UCS_ASYNC_MODE_THREAD_MUTEX));
-INSTANTIATE_TEST_CASE_P(poll,            test_async, ::testing::Values(UCS_ASYNC_MODE_POLL));
-INSTANTIATE_TEST_CASE_P(signal,          test_async_event_mt, ::testing::Values(UCS_ASYNC_MODE_SIGNAL));
-INSTANTIATE_TEST_CASE_P(thread_spinlock, test_async_event_mt, ::testing::Values(UCS_ASYNC_MODE_THREAD_SPINLOCK));
-INSTANTIATE_TEST_CASE_P(thread_mutex,    test_async_event_mt, ::testing::Values(UCS_ASYNC_MODE_THREAD_MUTEX));
-INSTANTIATE_TEST_CASE_P(poll,            test_async_event_mt, ::testing::Values(UCS_ASYNC_MODE_POLL));
-INSTANTIATE_TEST_CASE_P(signal,          test_async_timer_mt, ::testing::Values(UCS_ASYNC_MODE_SIGNAL));
-INSTANTIATE_TEST_CASE_P(thread_spinlock, test_async_timer_mt, ::testing::Values(UCS_ASYNC_MODE_THREAD_SPINLOCK));
-INSTANTIATE_TEST_CASE_P(thread_mutex,    test_async_timer_mt, ::testing::Values(UCS_ASYNC_MODE_THREAD_MUTEX));
-INSTANTIATE_TEST_CASE_P(poll,            test_async_timer_mt, ::testing::Values(UCS_ASYNC_MODE_POLL));
+std::ostream& operator<<(std::ostream& os, ucs_async_mode_t mode)
+{
+    return os << ucs_async_mode_names[mode];
+}
+
+#define INSTANTIATE_ASYNC_TEST_CASES(_test_fixture) \
+    INSTANTIATE_TEST_CASE_P(signal,          _test_fixture, ::testing::Values(UCS_ASYNC_MODE_SIGNAL)); \
+    INSTANTIATE_TEST_CASE_P(thread_spinlock, _test_fixture, ::testing::Values(UCS_ASYNC_MODE_THREAD_SPINLOCK)); \
+    INSTANTIATE_TEST_CASE_P(thread_mutex,    _test_fixture, ::testing::Values(UCS_ASYNC_MODE_THREAD_MUTEX)); \
+    INSTANTIATE_TEST_CASE_P(poll,            _test_fixture, ::testing::Values(UCS_ASYNC_MODE_POLL));
+
+INSTANTIATE_ASYNC_TEST_CASES(test_async);
+INSTANTIATE_ASYNC_TEST_CASES(test_async_event_unset_from_handler);
+INSTANTIATE_ASYNC_TEST_CASES(test_async_event_mt);
+INSTANTIATE_ASYNC_TEST_CASES(test_async_timer_mt);

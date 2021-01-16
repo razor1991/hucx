@@ -4,6 +4,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "rma.h"
 #include "rma.inl"
 
@@ -37,10 +41,9 @@ static ucs_status_t ucp_rma_sw_progress_put(uct_pending_req_t *self)
     ssize_t packed_len;
     ucs_status_t status;
 
-    ucs_assert(req->send.lane == ucp_ep_get_am_lane(ep));
-
-    packed_len = uct_ep_am_bcopy(ep->uct_eps[req->send.lane], UCP_AM_ID_PUT,
-                                 ucp_rma_sw_put_pack_cb, req, 0);
+    req->send.lane = ucp_ep_get_am_lane(ep);
+    packed_len     = uct_ep_am_bcopy(ep->uct_eps[req->send.lane], UCP_AM_ID_PUT,
+                                     ucp_rma_sw_put_pack_cb, req, 0);
     if (packed_len > 0) {
         status = UCS_OK;
         ucp_ep_rma_remote_request_sent(ep);
@@ -73,10 +76,10 @@ static ucs_status_t ucp_rma_sw_progress_get(uct_pending_req_t *self)
     ucs_status_t status;
     ssize_t packed_len;
 
-    ucs_assert(req->send.lane == ucp_ep_get_am_lane(ep));
-
-    packed_len = uct_ep_am_bcopy(ep->uct_eps[req->send.lane], UCP_AM_ID_GET_REQ,
-                                 ucp_rma_sw_get_req_pack_cb, req, 0);
+    req->send.lane = ucp_ep_get_am_lane(ep);
+    packed_len     = uct_ep_am_bcopy(ep->uct_eps[req->send.lane],
+                                     UCP_AM_ID_GET_REQ,
+                                     ucp_rma_sw_get_req_pack_cb, req, 0);
     if (packed_len < 0) {
         status = (ucs_status_t)packed_len;
         if (status != UCS_ERR_NO_RESOURCE) {
@@ -192,7 +195,7 @@ static ucs_status_t ucp_progress_get_reply(uct_pending_req_t *self)
     payload_len = packed_len - sizeof(ucp_rma_rep_hdr_t);
     ucs_assert(payload_len >= 0);
 
-    req->send.buffer += payload_len;
+    req->send.buffer  = UCS_PTR_BYTE_OFFSET(req->send.buffer, payload_len);
     req->send.length -= payload_len;
 
     if (req->send.length == 0) {
@@ -283,7 +286,8 @@ static void ucp_rma_sw_dump_packet(ucp_worker_h worker, uct_am_trace_type_t type
     }
 
     p = buffer + strlen(buffer);
-    ucp_dump_payload(worker->context, p, buffer + max - p, data + header_len,
+    ucp_dump_payload(worker->context, p, buffer + max - p,
+                     UCS_PTR_BYTE_OFFSET(data, header_len),
                      length - header_len);
 }
 

@@ -1,9 +1,13 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include <ucs/sys/compiler.h>
 #include <ucs/arch/cpu.h>
@@ -15,6 +19,7 @@
 #include <ucs/stats/stats.h>
 #include <ucs/async/async.h>
 #include <ucs/sys/sys.h>
+#include <ucs/sys/topo.h>
 
 
 /* run-time CPU detection */
@@ -79,14 +84,16 @@ static void UCS_F_CTOR ucs_init()
     ucs_check_cpu_flags();
     ucs_log_early_init(); /* Must be called before all others */
     ucs_global_opts_init();
+    ucs_cpu_init();
     ucs_log_init();
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
     ucs_stats_init();
 #endif
     ucs_memtrack_init();
     ucs_debug_init();
     ucs_profile_global_init();
     ucs_async_global_init();
+    ucs_topo_init();
     ucs_debug("%s loaded at 0x%lx", ucs_debug_get_lib_path(),
               ucs_debug_get_lib_base_addr());
     ucs_debug("cmd line: %s", ucs_get_process_cmdline());
@@ -94,11 +101,12 @@ static void UCS_F_CTOR ucs_init()
 
 static void UCS_F_DTOR ucs_cleanup(void)
 {
+    ucs_topo_cleanup();
     ucs_async_global_cleanup();
     ucs_profile_global_cleanup();
     ucs_debug_cleanup(0);
     ucs_memtrack_cleanup();
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
     ucs_stats_cleanup();
 #endif
     ucs_log_cleanup();

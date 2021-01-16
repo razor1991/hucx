@@ -10,46 +10,65 @@
 #include "ib_verbs.h"
 
 #include <uct/api/uct.h>
+#include <uct/base/uct_iface.h>
 #include <ucs/stats/stats.h>
 #include <ucs/debug/assert.h>
 #include <ucs/datastruct/khash.h>
 #include <ucs/type/spinlock.h>
+#include <ucs/sys/sock.h>
+#include <ucs/sys/topo.h>
 
 #include <endian.h>
+#include <linux/ip.h>
 
 
-#define UCT_IB_QPN_ORDER            24  /* How many bits can be an IB QP number */
-#define UCT_IB_LRH_LEN              8   /* IB Local routing header */
-#define UCT_IB_GRH_LEN              40  /* IB GLobal routing header */
-#define UCT_IB_BTH_LEN              12  /* IB base transport header */
-#define UCT_IB_ROCE_LEN             14  /* Ethernet header -
-                                           6B for Destination MAC +
-                                           6B for Source MAC + 2B Type (RoCE) */
-#define UCT_IB_DETH_LEN             8   /* IB datagram header */
-#define UCT_IB_RETH_LEN             16  /* IB RDMA header */
-#define UCT_IB_ATOMIC_ETH_LEN       28  /* IB atomic header */
-#define UCT_IB_AETH_LEN             4   /* IB ack */
-#define UCT_IB_PAYLOAD_ALIGN        4   /* IB payload padding */
-#define UCT_IB_ICRC_LEN             4   /* IB invariant crc footer */
-#define UCT_IB_VCRC_LEN             2   /* IB variant crc footer */
-#define UCT_IB_DELIM_LEN            2   /* IB wire delimiter */
-#define UCT_IB_FDR_PACKET_GAP       64  /* Minimal FDR packet gap */
-#define UCT_IB_MAX_MESSAGE_SIZE     (2 << 30) /* Maximal IB message size */
-#define UCT_IB_PKEY_PARTITION_MASK  0x7fff /* IB partition number mask */
-#define UCT_IB_PKEY_MEMBERSHIP_MASK 0x8000 /* Full/send-only member */
-#define UCT_IB_DEV_MAX_PORTS        2
-#define UCT_IB_INVALID_RKEY         0xffffffffu
-#define UCT_IB_KEY                  0x1ee7a330
-#define UCT_IB_LINK_LOCAL_PREFIX    be64toh(0xfe80000000000000ul) /* IBTA 4.1.1 12a */
-#define UCT_IB_SITE_LOCAL_PREFIX    be64toh(0xfec0000000000000ul) /* IBTA 4.1.1 12b */
-#define UCT_IB_SITE_LOCAL_MASK      be64toh(0xffffffffffff0000ul) /* IBTA 4.1.1 12b */
-#define UCT_IB_DEFAULT_ROCEV2_DSCP  106  /* Default DSCP for RoCE v2 */
+#define UCT_IB_QPN_ORDER                  24  /* How many bits can be an IB QP number */
+#define UCT_IB_LRH_LEN                    8   /* IB Local routing header */
+#define UCT_IB_GRH_LEN                    40  /* IB GLobal routing header */
+#define UCT_IB_BTH_LEN                    12  /* IB base transport header */
+#define UCT_IB_ROCE_LEN                   14  /* Ethernet header -
+                                                 6B for Destination MAC +
+                                                 6B for Source MAC + 2B Type (RoCE) */
+#define UCT_IB_DETH_LEN                   8   /* IB datagram header */
+#define UCT_IB_RETH_LEN                   16  /* IB RDMA header */
+#define UCT_IB_ATOMIC_ETH_LEN             28  /* IB atomic header */
+#define UCT_IB_AETH_LEN                   4   /* IB ack */
+#define UCT_IB_PAYLOAD_ALIGN              4   /* IB payload padding */
+#define UCT_IB_ICRC_LEN                   4   /* IB invariant crc footer */
+#define UCT_IB_VCRC_LEN                   2   /* IB variant crc footer */
+#define UCT_IB_DELIM_LEN                  2   /* IB wire delimiter */
+#define UCT_IB_FDR_PACKET_GAP             64  /* Minimal FDR packet gap */
+#define UCT_IB_MAX_MESSAGE_SIZE           (2UL << 30) /* Maximal IB message size */
+#define UCT_IB_PKEY_PARTITION_MASK        0x7fff /* IB partition number mask */
+#define UCT_IB_PKEY_MEMBERSHIP_MASK       0x8000 /* Full/send-only member */
+#define UCT_IB_DEV_MAX_PORTS              2
+#define UCT_IB_FABRIC_TIME_MAX            32
+#define UCT_IB_INVALID_RKEY               0xffffffffu
+#define UCT_IB_KEY                        0x1ee7a330
+#define UCT_IB_LINK_LOCAL_PREFIX          be64toh(0xfe80000000000000ul) /* IBTA 4.1.1 12a */
+#define UCT_IB_SITE_LOCAL_PREFIX          be64toh(0xfec0000000000000ul) /* IBTA 4.1.1 12b */
+#define UCT_IB_SITE_LOCAL_MASK            be64toh(0xffffffffffff0000ul) /* IBTA 4.1.1 12b */
+#define UCT_IB_DEFAULT_ROCEV2_DSCP        106  /* Default DSCP for RoCE v2 */
+#define UCT_IB_ROCE_UDP_SRC_PORT_BASE     0xC000
+#define UCT_IB_DEVICE_SYSFS_PFX           "/sys/class/infiniband/%s"
+#define UCT_IB_DEVICE_SYSFS_FMT           UCT_IB_DEVICE_SYSFS_PFX "/device/%s"
+#define UCT_IB_DEVICE_SYSFS_GID_ATTR_PFX  UCT_IB_DEVICE_SYSFS_PFX "/ports/%d/gid_attrs"
+#define UCT_IB_DEVICE_SYSFS_GID_TYPE_FMT  UCT_IB_DEVICE_SYSFS_GID_ATTR_PFX "/types/%d"
+#define UCT_IB_DEVICE_SYSFS_GID_NDEV_FMT  UCT_IB_DEVICE_SYSFS_GID_ATTR_PFX "/ndevs/%d"
 
 
 enum {
     UCT_IB_DEVICE_STAT_ASYNC_EVENT,
     UCT_IB_DEVICE_STAT_LAST
 };
+
+
+typedef enum uct_ib_roce_version {
+    UCT_IB_DEVICE_ROCE_V1,
+    UCT_IB_DEVICE_ROCE_V1_5,
+    UCT_IB_DEVICE_ROCE_V2,
+    UCT_IB_DEVICE_ROCE_ANY
+} uct_ib_roce_version_t;
 
 
 enum {
@@ -61,7 +80,8 @@ enum {
     UCT_IB_DEVICE_FLAG_DC_V2    = UCS_BIT(7),   /* Device supports DC ver 2 */
     UCT_IB_DEVICE_FLAG_AV       = UCS_BIT(8),   /* Device supports compact AV */
     UCT_IB_DEVICE_FLAG_DC       = UCT_IB_DEVICE_FLAG_DC_V1 |
-                                  UCT_IB_DEVICE_FLAG_DC_V2 /* Device supports DC */
+                                  UCT_IB_DEVICE_FLAG_DC_V2, /* Device supports DC */
+    UCT_IB_DEVICE_FLAG_ODP_IMPLICIT = UCS_BIT(9),
 };
 
 
@@ -69,13 +89,27 @@ enum {
  * Flags which specify which address fields are present
  */
 enum {
-    UCT_IB_ADDRESS_FLAG_LID      = UCS_BIT(0),
-    UCT_IB_ADDRESS_FLAG_IF_ID    = UCS_BIT(1),
-    UCT_IB_ADDRESS_FLAG_SUBNET16 = UCS_BIT(2),
-    UCT_IB_ADDRESS_FLAG_SUBNET64 = UCS_BIT(3),
-    UCT_IB_ADDRESS_FLAG_GID  = UCS_BIT(4),
-    UCT_IB_ADDRESS_FLAG_LINK_LAYER_IB = UCS_BIT(5),
-    UCT_IB_ADDRESS_FLAG_LINK_LAYER_ETH = UCS_BIT(6)
+    /* GID index, used for both ETH or IB link layer.  */
+    UCT_IB_ADDRESS_FLAG_GID_INDEX      = UCS_BIT(0),
+    /* Defines path MTU size, used for both ETH or IB link layer. */
+    UCT_IB_ADDRESS_FLAG_PATH_MTU       = UCS_BIT(1),
+    /* PKEY value, used for both ETH or IB link layer. */
+    UCT_IB_ADDRESS_FLAG_PKEY           = UCS_BIT(2),
+
+    /* If set - ETH link layer, else- IB link layer. */
+    UCT_IB_ADDRESS_FLAG_LINK_LAYER_ETH = UCS_BIT(3),
+
+    /* Used for ETH link layer. */
+    UCT_IB_ADDRESS_FLAG_ROCE_IPV6      = UCS_BIT(4),
+    /* Used for ETH link layer, following bits are used to pack RoCE version. */
+    UCT_IB_ADDRESS_FLAG_ETH_LAST       = UCS_BIT(5),
+
+    /* Used for IB link layer. */
+    UCT_IB_ADDRESS_FLAG_SUBNET16       = UCS_BIT(4),
+    /* Used for IB link layer. */
+    UCT_IB_ADDRESS_FLAG_SUBNET64       = UCS_BIT(5),
+    /* Used for IB link layer. */
+    UCT_IB_ADDRESS_FLAG_IF_ID          = UCS_BIT(6)
 };
 
 
@@ -83,6 +117,10 @@ enum {
  * IB network address
  */
 typedef struct uct_ib_address {
+    /* Using flags from UCT_IB_ADDRESS_FLAG_xx
+     * For ETH link layer, the 4 msb's are used to indicate the RoCE version -
+     * (by shifting the UCT_IB_DEVICE_ROCE_xx values when packing and unpacking
+     * the ib address) */
     uint8_t            flags;
     /* Following fields appear in this order (if specified by flags).
      * The full gid always appears last:
@@ -97,12 +135,20 @@ typedef struct uct_ib_address {
 
 
 /**
+ * PCI identifier of a device
+ */
+typedef struct {
+    uint16_t                    vendor;
+    uint16_t                    device;
+} uct_ib_pci_id_t;
+
+
+/**
  * IB device specification.
  */
 typedef struct uct_ib_device_spec {
-    uint16_t                    vendor_id;
-    uint16_t                    part_id;
     const char                  *name;
+    uct_ib_pci_id_t             pci_id;
     unsigned                    flags;
     uint8_t                     priority;
 } uct_ib_device_spec_t;
@@ -115,15 +161,16 @@ KHASH_TYPE(uct_ib_ah, struct ibv_ah_attr, struct ibv_ah*);
  */
 typedef struct uct_ib_device {
     struct ibv_context          *ibv_context;    /* Verbs context */
-    struct ibv_exp_device_attr  dev_attr;        /* Cached device attributes */
+    uct_ib_device_attr          dev_attr;        /* Cached device attributes */
     uint8_t                     first_port;      /* Number of first port (usually 1) */
     uint8_t                     num_ports;       /* Amount of physical ports */
-    cpu_set_t                   local_cpus;      /* CPUs local to device */
+    ucs_sys_cpuset_t            local_cpus;      /* CPUs local to device */
     int                         numa_node;       /* NUMA node of the device */
     int                         async_events;    /* Whether async events are handled */
     int                         max_zcopy_log_sge; /* Maximum sges log for zcopy am */
-    UCS_STATS_NODE_DECLARE(stats);
-    struct ibv_exp_port_attr    port_attr[UCT_IB_DEV_MAX_PORTS]; /* Cached port attributes */
+    UCS_STATS_NODE_DECLARE(stats)
+    struct ibv_port_attr        port_attr[UCT_IB_DEV_MAX_PORTS]; /* Cached port attributes */
+    uct_ib_pci_id_t             pci_id;
     unsigned                    flags;
     uint8_t                     atomic_arg_sizes;
     uint8_t                     atomic_arg_sizes_be;
@@ -131,20 +178,43 @@ typedef struct uct_ib_device {
     uint8_t                     ext_atomic_arg_sizes_be;
     uint8_t                     pci_fadd_arg_sizes;
     uint8_t                     pci_cswap_arg_sizes;
+    uint8_t                     atomic_align;
     /* AH hash */
     khash_t(uct_ib_ah)          ah_hash;
-    ucs_spinlock_t              ah_lock;
+    ucs_recursive_spinlock_t    ah_lock;
 } uct_ib_device_t;
 
 
 /**
- * RoCE version priorities
+ * RoCE version
  */
-typedef struct uct_ib_roce_version_desc {
-    uint8_t     roce_major;
-    uint8_t     roce_minor;
-    sa_family_t address_family;
-} uct_ib_roce_version_desc_t;
+typedef struct uct_ib_roce_version_info {
+    /** RoCE version described by the UCT_IB_DEVICE_ROCE_xx values */
+    uct_ib_roce_version_t ver;
+    /** Address family of the port */
+    sa_family_t           addr_family;
+} uct_ib_roce_version_info_t;
+
+
+typedef struct {
+    union ibv_gid              gid;
+    uint8_t                    gid_index;    /* IB/RoCE GID index to use */
+    uct_ib_roce_version_info_t roce_info;    /* For a RoCE port */
+} uct_ib_device_gid_info_t;
+
+
+typedef struct {
+    enum ibv_event_type event_type;
+    union {
+        uint8_t         port_num;
+        uint32_t        qp_num;
+        uint32_t        dct_num;
+        void            *cookie;
+    };
+} uct_ib_async_event_t;
+
+
+extern const double uct_ib_qp_rnr_time_ms[];
 
 
 /**
@@ -158,16 +228,16 @@ ucs_status_t uct_ib_device_port_check(uct_ib_device_t *dev, uint8_t port_num,
  * Helper function to list IB transport resources.
  *
  * @param dev              IB device.
- * @param tl_name          Transport name.
  * @param flags            Transport requirements from IB device (see UCT_IB_RESOURCE_FLAG_xx)
- * @param resources_p      Filled with a pointer to an array of resources.
- * @param num_resources_p  Filled with the number of resources.
+ * @param devices_p        Filled with a pointer to an array of devices.
+ * @param num_devices_p    Filled with the number of devices.
  */
-ucs_status_t uct_ib_device_query_tl_resources(uct_ib_device_t *dev,
-                                              const char *tl_name, unsigned flags,
-                                              uct_tl_resource_desc_t **resources_p,
-                                              unsigned *num_resources_p);
+ucs_status_t uct_ib_device_query_ports(uct_ib_device_t *dev, unsigned flags,
+                                       uct_tl_device_resource_t **devices_p,
+                                       unsigned *num_devices_p);
 
+ucs_status_t uct_ib_device_query(uct_ib_device_t *dev,
+                                 struct ibv_device *ibv_device);
 
 ucs_status_t uct_ib_device_init(uct_ib_device_t *dev,
                                 struct ibv_device *ibv_device, int async_events
@@ -183,17 +253,17 @@ const uct_ib_device_spec_t* uct_ib_device_spec(uct_ib_device_t *dev);
 
 
 /**
- * Select the IB gid index to use.
+ * Select the best gid to use and set its information on the RoCE port -
+ * gid index, RoCE version and address family.
  *
- * @param dev                   IB device.
- * @param port_num              Port number.
- * @param md_config_index       Gid index from the md configuration.
- * @param ib_gid_index          Filled with the selected gid index.
+ * @param [in]  dev             IB device.
+ * @param [in]  port_num        Port number.
+ * @param [out] gid_info        Filled with the selected gid index and the
+ *                              port's RoCE version and address family.
  */
-ucs_status_t uct_ib_device_select_gid_index(uct_ib_device_t *dev,
-                                            uint8_t port_num,
-                                            size_t md_config_index,
-                                            uint8_t *ib_gid_index);
+ucs_status_t uct_ib_device_select_gid(uct_ib_device_t *dev,
+                                      uint8_t port_num,
+                                      uct_ib_device_gid_info_t *gid_info);
 
 
 /**
@@ -203,19 +273,14 @@ const char *uct_ib_device_name(uct_ib_device_t *dev);
 
 
 /**
- * @return true if device name begins with "hns".
+ * For the given IB device find the associated bus information
+ *
+ * @param [in]  dev             IB device.
+ * @param [in]  port_num        Port number.
+ * @param [out] bus_id          Bus information.
  */
-static inline int uct_ib_device_is_hns(struct ibv_device *device)
-{
-#if HAVE_HNS_ROCE
-#define UCT_IB_DEVICE_HNS "hns"
-#define UCT_IB_DEVICE_HNS_LEN 3
-    return !strncmp(ibv_get_device_name(device), UCT_IB_DEVICE_HNS, UCT_IB_DEVICE_HNS_LEN);
-#else
-    return 0;
-#endif
-}
-
+ucs_status_t uct_ib_device_bus(uct_ib_device_t *dev, int port_num,
+                               ucs_sys_bus_id_t *bus_id);
 
 /**
  * @return whether the port is InfiniBand
@@ -236,9 +301,15 @@ int uct_ib_device_is_gid_raw_empty(uint8_t *gid_raw);
 
 
 /**
- * Convert time-in-seconds to IB fabric time value
+ * Convert time-in-seconds to IB fabric QP time value
  */
-uint8_t uct_ib_to_fabric_time(double time);
+uint8_t uct_ib_to_qp_fabric_time(double time);
+
+
+/**
+ * Convert time-in-seconds to IB fabric RNR time value
+ */
+uint8_t uct_ib_to_rnr_fabric_time(double time);
 
 
 /**
@@ -265,8 +336,6 @@ ucs_status_t uct_ib_device_find_port(uct_ib_device_t *dev,
 
 size_t uct_ib_device_odp_max_size(uct_ib_device_t *dev);
 
-int uct_ib_device_odp_has_global_mr(uct_ib_device_t *dev);
-
 const char *uct_ib_wc_status_str(enum ibv_wc_status wc_status);
 
 ucs_status_t uct_ib_device_create_ah_cached(uct_ib_device_t *dev,
@@ -276,17 +345,41 @@ ucs_status_t uct_ib_device_create_ah_cached(uct_ib_device_t *dev,
 
 void uct_ib_device_cleanup_ah_cached(uct_ib_device_t *dev);
 
-static inline struct ibv_exp_port_attr*
+unsigned uct_ib_device_get_roce_lag_level(uct_ib_device_t *dev,
+                                          uint8_t port_num);
+
+
+static inline struct ibv_port_attr*
 uct_ib_device_port_attr(uct_ib_device_t *dev, uint8_t port_num)
 {
     return &dev->port_attr[port_num - dev->first_port];
 }
 
+static inline int uct_ib_device_has_pci_atomics(uct_ib_device_t *dev)
+{
+    return !!((dev->pci_fadd_arg_sizes | dev->pci_cswap_arg_sizes) &
+              (sizeof(uint32_t) | sizeof(uint64_t)));
+}
+
+const char *uct_ib_roce_version_str(uct_ib_roce_version_t roce_ver);
+
+const char *uct_ib_gid_str(const union ibv_gid *gid, char *str, size_t max_size);
+
 ucs_status_t uct_ib_device_query_gid(uct_ib_device_t *dev, uint8_t port_num,
-                                     unsigned gid_index, union ibv_gid *gid,
-                                     int *is_roce_v2);
+                                     unsigned gid_index, union ibv_gid *gid);
+
+ucs_status_t uct_ib_device_query_gid_info(struct ibv_context *ctx, const char *dev_name,
+                                          uint8_t port_num, unsigned gid_index,
+                                          uct_ib_device_gid_info_t *info);
+
+int uct_ib_device_test_roce_gid_index(uct_ib_device_t *dev, uint8_t port_num,
+                                      const union ibv_gid *gid,
+                                      uint8_t gid_index);
 
 int uct_ib_get_cqe_size(int cqe_size_min);
+
+const char* uct_ib_ah_attr_str(char *buf, size_t max,
+                               const struct ibv_ah_attr *ah_attr);
 
 static inline ucs_status_t uct_ib_poll_cq(struct ibv_cq *cq, unsigned *count, struct ibv_wc *wcs)
 {
@@ -303,5 +396,7 @@ static inline ucs_status_t uct_ib_poll_cq(struct ibv_cq *cq, unsigned *count, st
     *count = ret;
     return UCS_OK;
 }
+
+void uct_ib_handle_async_event(uct_ib_device_t *dev, uct_ib_async_event_t *event);
 
 #endif

@@ -1,6 +1,6 @@
 /**
  * Copyright (C) Mellanox Technologies Ltd. 2001-2017.  ALL RIGHTS RESERVED.
- * Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+ * Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
  *
  * See file LICENSE for terms.
  */
@@ -47,10 +47,15 @@ typedef struct ucp_address_iface_attr   ucp_address_iface_attr_t;
 typedef struct ucp_address_entry        ucp_address_entry_t;
 typedef struct ucp_unpacked_address     ucp_unpacked_address_t;
 typedef struct ucp_wireup_ep            ucp_wireup_ep_t;
-typedef struct ucp_proto                ucp_proto_t;
+typedef struct ucp_request_send_proto   ucp_request_send_proto_t;
 typedef struct ucp_worker_iface         ucp_worker_iface_t;
+typedef struct ucp_worker_cm            ucp_worker_cm_t;
 typedef struct ucp_rma_proto            ucp_rma_proto_t;
 typedef struct ucp_amo_proto            ucp_amo_proto_t;
+typedef struct ucp_wireup_sockaddr_data ucp_wireup_sockaddr_data_t;
+typedef struct ucp_ep_config            ucp_ep_config_t;
+typedef struct ucp_ep_config_key        ucp_ep_config_key_t;
+typedef struct ucp_proto                ucp_proto_t;
 
 
 /**
@@ -85,7 +90,12 @@ enum {
     UCP_AM_ID_ATOMIC_REQ        =  20, /* Remote memory atomic request */
     UCP_AM_ID_ATOMIC_REP        =  21, /* Remote memory atomic reply */
     UCP_AM_ID_CMPL              =  22, /* Remote memory operation completion */
-
+    UCP_AM_ID_SINGLE            =  23, /* Single fragment user defined AM */
+    UCP_AM_ID_FIRST             =  24, /* First fragment of user defined AM */
+    UCP_AM_ID_MIDDLE            =  25, /* Middle or last fragment of user
+                                          defined AM */
+    UCP_AM_ID_SINGLE_REPLY      =  26, /* Single fragment user defined AM
+                                          carrying remote ep for reply */
     UCP_AM_ID_LAST,
     UCP_AM_ID_MAX               =  32  /* Total IDs available for pre-registration */
 };

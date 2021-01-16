@@ -1,14 +1,19 @@
 /**
  * Copyright (C) Mellanox Technologies Ltd. 2001-2016.  ALL RIGHTS RESERVED.
- * Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
  *
+ * Copyright (C) Huawei Technologies Co., Ltd. 2020-2021.  ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include "ucx_info.h"
 
 #include <ucp/api/ucp.h>
 #include <ucs/time/time.h>
+#include <ucs/sys/string.h>
 #include <sys/resource.h>
 #include <dirent.h>
 #include <string.h>
@@ -91,7 +96,8 @@ static void print_resource_usage(const resource_usage_t *usage_before,
 
 void print_ucp_info(int print_opts, ucs_config_print_flags_t print_flags,
                     uint64_t ctx_features, const ucp_ep_params_t *base_ep_params,
-                    size_t estimated_num_eps, unsigned dev_type_bitmap)
+                    size_t estimated_num_eps, size_t estimated_num_ppn,
+                    unsigned dev_type_bitmap, const char *mem_size)
 {
     ucp_config_t *config;
     ucs_status_t status;
@@ -113,9 +119,11 @@ void print_ucp_info(int print_opts, ucs_config_print_flags_t print_flags,
 
     memset(&params, 0, sizeof(params));
     params.field_mask        = UCP_PARAM_FIELD_FEATURES |
-                               UCP_PARAM_FIELD_ESTIMATED_NUM_EPS;
+                               UCP_PARAM_FIELD_ESTIMATED_NUM_EPS |
+                               UCP_PARAM_FIELD_ESTIMATED_NUM_PPN;
     params.features          = ctx_features;
     params.estimated_num_eps = estimated_num_eps;
+    params.estimated_num_ppn = estimated_num_ppn;
 
     get_resource_usage(&usage);
 
@@ -135,12 +143,16 @@ void print_ucp_info(int print_opts, ucs_config_print_flags_t print_flags,
         goto out_release_config;
     }
 
+    if ((print_opts & PRINT_MEM_MAP) && (mem_size != NULL)) {
+        ucp_mem_print_info(mem_size, context, stdout);
+    }
+
     if (print_opts & PRINT_UCP_CONTEXT) {
         ucp_context_print_info(context, stdout);
         print_resource_usage(&usage, "UCP context");
     }
 
-    if (!(print_opts & (PRINT_UCP_WORKER | PRINT_UCP_EP | PRINT_UCG | PRINT_UCG_TOPO))) {
+    if (!(print_opts & (PRINT_UCP_WORKER|PRINT_UCP_EP|PRINT_UCG|PRINT_UCG_TOPO))) {
         goto out_cleanup_context;
     }
 

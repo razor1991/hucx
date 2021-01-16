@@ -18,7 +18,7 @@ uct_p2p_mix_test::uct_p2p_mix_test() : uct_p2p_test(0), m_send_size(0) {
 ucs_status_t uct_p2p_mix_test::am_callback(void *arg, void *data, size_t length,
                                            unsigned flags)
 {
-    ucs_atomic_add32(&am_pending, -1);
+    ucs_atomic_sub32(&am_pending, 1);
     return UCS_OK;
 }
 
@@ -124,9 +124,7 @@ void uct_p2p_mix_test::random_op(const mapped_buffer &sendbuf,
 
     for (;;) {
         status = (this->*m_avail_send_funcs[op])(sendbuf, recvbuf, &comp);
-        if (status == UCS_OK) {
-            break;
-        } else if (status == UCS_INPROGRESS) {
+        if (status == UCS_INPROGRESS) {
             /* coverity[loop_condition] */
             while (comp.count > 0) {
                 progress();
@@ -137,22 +135,18 @@ void uct_p2p_mix_test::random_op(const mapped_buffer &sendbuf,
             continue;
         } else {
             ASSERT_UCS_OK(status);
+            break;
         }
     }
 }
 
-void uct_p2p_mix_test::check_run_conditions() {
+void uct_p2p_mix_test::run(unsigned count) {
     if (m_avail_send_funcs.size() == 0) {
         UCS_TEST_SKIP_R("unsupported");
     }
-    if (sender().md_attr().cap.mem_type != UCT_MD_MEM_TYPE_HOST) {
+    if (sender().md_attr().cap.access_mem_type != UCS_MEMORY_TYPE_HOST) {
         UCS_TEST_SKIP_R("skipping on non-host memory");
     }
-}
-
-void uct_p2p_mix_test::run(unsigned count) {
-
-    check_run_conditions();
 
     mapped_buffer sendbuf(m_send_size, 0, sender());
     mapped_buffer recvbuf(m_send_size, 0, receiver());
@@ -161,7 +155,7 @@ void uct_p2p_mix_test::run(unsigned count) {
         random_op(sendbuf, recvbuf);
     }
 
-    sender().flush();
+    flush();
 }
 
 void uct_p2p_mix_test::init() {

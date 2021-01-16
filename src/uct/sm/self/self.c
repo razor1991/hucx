@@ -3,9 +3,14 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "self.h"
 
 #include <uct/sm/base/sm_ep.h>
+#include <uct/sm/base/sm_iface.h>
 #include <ucs/type/class.h>
 #include <ucs/sys/string.h>
 #include <ucs/arch/cpu.h>
@@ -27,7 +32,20 @@
 
 /* Forward declarations */
 static uct_iface_ops_t uct_self_iface_ops;
-static uct_md_component_t uct_self_md;
+static uct_component_t uct_self_component;
+
+
+static ucs_config_field_t uct_self_iface_config_table[] = {
+    {"", "", NULL,
+     ucs_offsetof(uct_self_iface_config_t, super),
+     UCS_CONFIG_TYPE_TABLE(uct_iface_config_table)},
+
+    {"SEG_SIZE", "8k",
+     "Size of copy-out buffer",
+     ucs_offsetof(uct_self_iface_config_t, seg_size), UCS_CONFIG_TYPE_MEMUNITS},
+
+    {NULL}
+};
 
 
 static ucs_status_t uct_self_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *attr)
@@ -35,7 +53,8 @@ static ucs_status_t uct_self_iface_query(uct_iface_h tl_iface, uct_iface_attr_t 
     uct_self_iface_t *iface = ucs_derived_of(tl_iface, uct_self_iface_t);
 
     ucs_trace_func("iface=%p", iface);
-    memset(attr, 0, sizeof(*attr));
+
+    uct_base_iface_query(&iface->super, attr);
 
     attr->iface_addr_len         = sizeof(uct_self_iface_addr_t);
     attr->device_addr_len        = 0;
@@ -89,9 +108,9 @@ static ucs_status_t uct_self_iface_query(uct_iface_h tl_iface, uct_iface_attr_t 
     attr->cap.am.max_hdr          = 0;
     attr->cap.am.max_iov          = 1;
 
-    attr->latency.overhead        = 0;
-    attr->latency.growth          = 0;
-    attr->bandwidth               = 6911 * 1024.0 * 1024.0;
+    attr->latency                 = ucs_linear_func_make(0, 0);
+    attr->bandwidth.dedicated     = 6911.0 * UCS_MBYTE;
+    attr->bandwidth.shared        = 0;
     attr->overhead                = 10e-9;
     attr->priority                = 0;
 
@@ -140,12 +159,12 @@ static ucs_mpool_ops_t uct_self_iface_mpool_ops = {
     .obj_cleanup   = NULL
 };
 
-static UCS_CLASS_DEFINE_DELETE_FUNC(uct_self_iface_t, uct_iface_t);
-
 static UCS_CLASS_INIT_FUNC(uct_self_iface_t, uct_md_h md, uct_worker_h worker,
                            const uct_iface_params_t *params,
                            const uct_iface_config_t *tl_config)
 {
+    uct_self_iface_config_t *config = ucs_derived_of(tl_config,
+                                                     uct_self_iface_config_t);
     ucs_status_t status;
 
     UCT_CHECK_PARAM(params->field_mask & UCT_IFACE_PARAM_FIELD_OPEN_MODE,
@@ -160,11 +179,6 @@ static UCS_CLASS_INIT_FUNC(uct_self_iface_t, uct_md_h md, uct_worker_h worker,
         return UCS_ERR_INVALID_PARAM;
     }
 
-    if (strcmp(params->mode.device.dev_name, UCT_SELF_NAME) != 0) {
-        ucs_error("No device was found: %s", params->mode.device.dev_name);
-        return UCS_ERR_NO_DEVICE;
-    }
-
     UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_self_iface_ops, md, worker,
                               params, tl_config
                               UCS_STATS_ARG((params->field_mask & 
@@ -173,7 +187,7 @@ static UCS_CLASS_INIT_FUNC(uct_self_iface_t, uct_md_h md, uct_worker_h worker,
                               UCS_STATS_ARG(UCT_SELF_NAME));
 
     self->id          = ucs_generate_uuid((uintptr_t)self);
-    self->send_size   = tl_config->max_bcopy;
+    self->send_size   = config->seg_size;
 
     status = ucs_mpool_init(&self->msg_mp, 0, self->send_size, 0,
                             UCS_SYS_CACHE_LINE_SIZE,
@@ -195,33 +209,20 @@ static UCS_CLASS_CLEANUP_FUNC(uct_self_iface_t)
 }
 
 UCS_CLASS_DEFINE(uct_self_iface_t, uct_base_iface_t);
+
+static UCS_CLASS_DEFINE_DELETE_FUNC(uct_self_iface_t, uct_iface_t);
+
 static UCS_CLASS_DEFINE_NEW_FUNC(uct_self_iface_t, uct_iface_t, uct_md_h,
                                  uct_worker_h, const uct_iface_params_t*,
                                  const uct_iface_config_t*);
 
-static ucs_status_t uct_self_query_tl_resources(uct_md_h md,
-                                                uct_tl_resource_desc_t **resource_p,
-                                                unsigned *num_resources_p)
+static ucs_status_t
+uct_self_query_tl_devices(uct_md_h md, uct_tl_device_resource_t **tl_devices_p,
+                          unsigned *num_tl_devices_p)
 {
-    uct_tl_resource_desc_t *resource = 0;
-
-    ucs_trace_func("md=%p", md);
-
-    resource = ucs_calloc(1, sizeof(*resource), "resource desc");
-    if (NULL == resource) {
-        ucs_error("Failed to allocate memory");
-        return UCS_ERR_NO_MEMORY;
-    }
-
-    ucs_snprintf_zero(resource->tl_name, sizeof(resource->tl_name), "%s",
-                      UCT_SELF_NAME);
-    ucs_snprintf_zero(resource->dev_name, sizeof(resource->dev_name), "%s",
-                      UCT_SELF_NAME);
-    resource->dev_type = UCT_DEVICE_TYPE_SELF;
-
-    *num_resources_p = 1;
-    *resource_p      = resource;
-    return UCS_OK;
+    return uct_single_device_resource(md, UCT_SM_DEVICE_NAME,
+                                      UCT_DEVICE_TYPE_SELF,
+                                      tl_devices_p, num_tl_devices_p);
 }
 
 static UCS_CLASS_INIT_FUNC(uct_self_ep_t, const uct_ep_params_t *params)
@@ -255,8 +256,7 @@ ucs_status_t uct_self_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t header,
     UCT_CHECK_LENGTH(total_length, 0, iface->send_size, "am_short");
 
     send_buffer = UCT_SELF_IFACE_SEND_BUFFER_GET(iface);
-    *(uint64_t*)send_buffer = header;
-    memcpy(send_buffer + sizeof(uint64_t), payload, length);
+    uct_am_short_fill_data(send_buffer, header, payload, length);
 
     UCT_TL_EP_STAT_OP(&ep->super, AM, SHORT, total_length);
     uct_self_iface_sendrecv_am(iface, id, send_buffer, total_length, "SHORT");
@@ -315,30 +315,23 @@ static uct_iface_ops_t uct_self_iface_ops = {
     .iface_is_reachable       = uct_self_iface_is_reachable
 };
 
-UCT_TL_COMPONENT_DEFINE(uct_self_tl, uct_self_query_tl_resources, uct_self_iface_t,
-                        UCT_SELF_NAME, "SELF_", uct_iface_config_table, uct_iface_config_t);
-UCT_MD_REGISTER_TL(&uct_self_md, &uct_self_tl);
+UCT_TL_DEFINE(&uct_self_component, self, uct_self_query_tl_devices, uct_self_iface_t,
+              "SELF_", uct_self_iface_config_table, uct_self_iface_config_t);
 
 static ucs_status_t uct_self_md_query(uct_md_h md, uct_md_attr_t *attr)
 {
     /* Dummy memory registration provided. No real memory handling exists */
-    attr->cap.flags         = UCT_MD_FLAG_REG |
-                              UCT_MD_FLAG_NEED_RKEY; /* TODO ignore rkey in rma/amo ops */
-    attr->cap.reg_mem_types = UCS_BIT(UCT_MD_MEM_TYPE_HOST);
-    attr->cap.mem_type      = UCT_MD_MEM_TYPE_HOST;
-    attr->cap.max_alloc     = 0;
-    attr->cap.max_reg       = ULONG_MAX;
-    attr->rkey_packed_size  = 0; /* uct_md_query adds UCT_MD_COMPONENT_NAME_MAX to this */
-    attr->reg_cost.overhead = 0;
-    attr->reg_cost.growth   = 0;
+    attr->cap.flags            = UCT_MD_FLAG_REG |
+                                 UCT_MD_FLAG_NEED_RKEY; /* TODO ignore rkey in rma/amo ops */
+    attr->cap.reg_mem_types    = UCS_MEMORY_TYPES_CPU_ACCESSIBLE;
+    attr->cap.detect_mem_types = 0;
+    attr->cap.access_mem_type  = UCS_MEMORY_TYPE_HOST;
+    attr->cap.max_alloc        = 0;
+    attr->cap.max_reg          = ULONG_MAX;
+    attr->rkey_packed_size     = 0; /* uct_md_query adds UCT_COMPONENT_NAME_MAX to this */
+    attr->reg_cost             = ucs_linear_func_make(0, 0);
     memset(&attr->local_cpus, 0xff, sizeof(attr->local_cpus));
     return UCS_OK;
-}
-
-static ucs_status_t uct_self_query_md_resources(uct_md_resource_desc_t **resources_p,
-                                                unsigned *num_resources_p)
-{
-    return uct_single_md_resource(&uct_self_md, resources_p, num_resources_p);
 }
 
 static ucs_status_t uct_self_mem_reg(uct_md_h md, void *address, size_t length,
@@ -349,27 +342,27 @@ static ucs_status_t uct_self_mem_reg(uct_md_h md, void *address, size_t length,
     return UCS_OK;
 }
 
-static ucs_status_t uct_self_md_open(const char *md_name, const uct_md_config_t *md_config,
-                                     uct_md_h *md_p)
+static ucs_status_t uct_self_md_open(uct_component_t *component, const char *md_name,
+                                     const uct_md_config_t *config, uct_md_h *md_p)
 {
     static uct_md_ops_t md_ops = {
-        .close        = (void*)ucs_empty_function,
-        .query        = uct_self_md_query,
-        .mkey_pack    = ucs_empty_function_return_success,
-        .mem_reg      = uct_self_mem_reg,
-        .mem_dereg    = ucs_empty_function_return_success,
-        .is_mem_type_owned = (void *)ucs_empty_function_return_zero,
+        .close              = ucs_empty_function,
+        .query              = uct_self_md_query,
+        .mkey_pack          = ucs_empty_function_return_success,
+        .mem_reg            = uct_self_mem_reg,
+        .mem_dereg          = ucs_empty_function_return_success,
+        .detect_memory_type = ucs_empty_function_return_unsupported
     };
     static uct_md_t md = {
         .ops          = &md_ops,
-        .component    = &uct_self_md
+        .component    = &uct_self_component
     };
 
     *md_p = &md;
     return UCS_OK;
 }
 
-static ucs_status_t uct_self_md_rkey_unpack(uct_md_component_t *mdc,
+static ucs_status_t uct_self_md_rkey_unpack(uct_component_t *component,
                                             const void *rkey_buffer, uct_rkey_t *rkey_p,
                                             void **handle_p)
 {
@@ -382,8 +375,17 @@ static ucs_status_t uct_self_md_rkey_unpack(uct_md_component_t *mdc,
     return UCS_OK;
 }
 
-static UCT_MD_COMPONENT_DEFINE(uct_self_md, UCT_SELF_NAME,
-                               uct_self_query_md_resources, uct_self_md_open, NULL,
-                               uct_self_md_rkey_unpack,
-                               ucs_empty_function_return_success, "SELF_",
-                               uct_md_config_table, uct_md_config_t);
+static uct_component_t uct_self_component = {
+    .query_md_resources = uct_md_query_single_md_resource,
+    .md_open            = uct_self_md_open,
+    .cm_open            = ucs_empty_function_return_unsupported,
+    .rkey_unpack        = uct_self_md_rkey_unpack,
+    .rkey_ptr           = ucs_empty_function_return_unsupported,
+    .rkey_release       = ucs_empty_function_return_success,
+    .name               = UCT_SELF_NAME,
+    .md_config          = UCT_MD_DEFAULT_CONFIG_INITIALIZER,
+    .cm_config          = UCS_CONFIG_EMPTY_GLOBAL_LIST_ENTRY,
+    .tl_list            = UCT_COMPONENT_TL_LIST_INITIALIZER(&uct_self_component),
+    .flags              = 0
+};
+UCT_COMPONENT_REGISTER(&uct_self_component);

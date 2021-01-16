@@ -8,14 +8,33 @@
 #define UCS_STRING_H_
 
 #include "compiler_def.h"
+#include <ucs/type/status.h>
+#include <ucs/sys/math.h>
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/socket.h>
 
 BEGIN_C_DECLS
 
 /** @file string.h */
+
+/* value which specifies "infinity" for a numeric variable */
+#define UCS_NUMERIC_INF_STR "inf"
+
+/* value which specifies "auto" for a variable */
+#define UCS_VALUE_AUTO_STR "auto"
+
+/* the numeric value of "infinity" */
+#define UCS_MEMUNITS_INF    ((size_t)-1)
+#define UCS_ULUNITS_INF     ((unsigned long)-1)
+
+/* value which specifies "auto" for a numeric variable */
+#define UCS_MEMUNITS_AUTO   ((size_t)-2)
+#define UCS_ULUNITS_AUTO    ((unsigned long)-2)
+#define UCS_HEXUNITS_AUTO   ((uint16_t)-2)
+
 
 /**
  * Expand a partial path to full path.
@@ -71,8 +90,41 @@ uint64_t ucs_string_to_id(const char *str);
  * @param value  Value to convert.
  * @param buf    Buffer to place the string.
  * @param max    Maximal length of the buffer.
+ *
+ * @return Pointer to 'buf', which holds the resulting string.
  */
-void ucs_memunits_to_str(size_t value, char *buf, size_t max);
+char *ucs_memunits_to_str(size_t value, char *buf, size_t max);
+
+
+/**
+ * Convert a string holding memory units to a numeric value.
+ *
+ *  @param buf   String to convert
+ *  @param dest  Numeric value of the string
+ *
+ *  @return UCS_OK if successful, or error code otherwise.
+ */
+ucs_status_t ucs_str_to_memunits(const char *buf, void *dest);
+
+
+/**
+ *  Return the numeric value of the memunits prefix.
+ *  For example:
+ *  'M' -> 1048576
+ */
+size_t ucs_string_quantity_prefix_value(char prefix);
+
+
+/**
+ * Format a string to a buffer of given size, and guarantee that the last char
+ * in the buffer is '\0'.
+ *
+ * @param buf  Buffer to format the string to.
+ * @param size Buffer size.
+ * @param fmt  Format string.
+ */
+void ucs_snprintf_safe(char *buf, size_t size, const char *fmt, ...)
+    UCS_F_PRINTF(3, 4);
 
 
 /**
@@ -96,6 +148,71 @@ char* ucs_strncpy_safe(char *dst, const char *src, size_t len);
  * @return Pointer to the new string, with leading/trailing whitespaces removed.
  */
 char *ucs_strtrim(char *str);
+
+
+/**
+ * Get pointer to file name in path, same as basename but do not
+ * modify source string.
+ *
+ * @param path Path to parse.
+ * 
+ * @return file name
+ */
+static UCS_F_ALWAYS_INLINE const char* ucs_basename(const char *path)
+{
+    const char *name = strrchr(path, '/');
+
+    return (name == NULL) ? path : name + 1;
+}
+
+
+/**
+ * Dump binary array into string in hex format. Destination string is
+ * always ended by '\0'.
+ *
+ * @param data     Source array to dump.
+ * @param length   Length of source array in bytes.
+ * @param buf      Destination string.
+ * @param max      Max length of destination string including terminating
+ *                 '\0' byte.
+ * @param per_line Number of bytes in source array to print per line
+ *                 or SIZE_MAX for single line.
+ * 
+ * @return address of destination buffer
+ */
+const char *ucs_str_dump_hex(const void* data, size_t length, char *buf,
+                             size_t max, size_t per_line);
+
+
+/**
+ * Convert the given flags to a string that represents them.
+ *
+ * @param  str            String to hold the flags string values.
+ * @param  max            Size of the string.
+ * @param  flags          Flags to be converted.
+ * @param  str_table      Conversion table - from flag value to a string.
+ *
+ * @return String that holds the representation of the given flags.
+ */
+const char* ucs_flags_str(char *str, size_t max,
+                          uint64_t flags, const char **str_table);
+
+
+/**
+ * Get estimated number of segments different in the two paths. Segments are
+ * separated by `/`.
+ *
+ * @param  path1  String pointing to first path
+ * @param  path2  String pointing to second path
+ *
+ * @return if either of the paths are invalid, UINT_MAX; if paths are the same 0
+ *         is returned; otherwise in between
+ */
+ssize_t ucs_path_calc_distance(const char *path1, const char *path2);
+
+
+/** Quantifier suffixes for memory units ("K", "M", "G", etc) */
+extern const char *ucs_memunits_suffixes[];
 
 
 END_C_DECLS

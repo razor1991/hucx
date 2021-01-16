@@ -7,6 +7,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ugni_device.h"
 #include "ugni_md.h"
 #include "ugni_iface.h"
@@ -36,26 +40,25 @@ static uct_ugni_job_info_t job_info = {
 
 uint32_t ugni_domain_counter = 0;
 
-void uct_ugni_device_get_resource(const char *tl_name, uct_ugni_device_t *dev,
-                                  uct_tl_resource_desc_t *resource)
+void uct_ugni_device_get_resource(uct_ugni_device_t *dev,
+                                  uct_tl_device_resource_t *tl_device)
 {
-    ucs_snprintf_zero(resource->tl_name,  sizeof(resource->tl_name), "%s", tl_name);
-    ucs_snprintf_zero(resource->dev_name, sizeof(resource->dev_name), "%s", dev->fname);
-    resource->dev_type = UCT_DEVICE_TYPE_NET;
+    ucs_snprintf_zero(tl_device->name, sizeof(tl_device->name), "%s", dev->fname);
+    tl_device->type = UCT_DEVICE_TYPE_NET;
 }
 
-ucs_status_t uct_ugni_query_tl_resources(uct_md_h md, const char *tl_name,
-                                         uct_tl_resource_desc_t **resource_p,
-                                         unsigned *num_resources_p)
+ucs_status_t uct_ugni_query_devices(uct_md_h md,
+                                    uct_tl_device_resource_t **tl_devices_p,
+                                    unsigned *num_tl_devices_p)
 {
-    uct_tl_resource_desc_t *resources;
+    uct_tl_device_resource_t *resources;
     int num_devices = job_info.num_devices;
     uct_ugni_device_t *devs = job_info.devices;
     int i;
     ucs_status_t status = UCS_OK;
 
-    resources = ucs_calloc(job_info.num_devices, sizeof(uct_tl_resource_desc_t),
-                          "resource desc");
+    resources = ucs_calloc(job_info.num_devices, sizeof(*resources),
+                           "resource desc");
     if (NULL == resources) {
       ucs_error("Failed to allocate memory");
       num_devices = 0;
@@ -65,12 +68,12 @@ ucs_status_t uct_ugni_query_tl_resources(uct_md_h md, const char *tl_name,
     }
 
     for (i = 0; i < job_info.num_devices; i++) {
-        uct_ugni_device_get_resource(tl_name, &devs[i], &resources[i]);
+        uct_ugni_device_get_resource(&devs[i], &resources[i]);
     }
 
 error:
-    *num_resources_p = num_devices;
-    *resource_p      = resources;
+    *num_tl_devices_p = num_devices;
+    *tl_devices_p     = resources;
 
     return status;
 }
@@ -324,7 +327,7 @@ static ucs_status_t get_nic_address(uct_ugni_device_t *dev_p)
     return UCS_OK;
 }
 
-ucs_status_t uct_ugni_device_create(int dev_id, int index, uct_ugni_device_t *dev_p)
+ucs_status_t uct_ugni_device_create(int dev_id, int idx, uct_ugni_device_t *dev_p)
 {
     ucs_status_t status;
     gni_return_t ugni_rc;
@@ -359,7 +362,7 @@ ucs_status_t uct_ugni_device_create(int dev_id, int index, uct_ugni_device_t *de
     }
 
     ucs_snprintf_zero(dev_p->fname, sizeof(dev_p->fname), "%s:%d",
-                      dev_p->type_name, index);
+                      dev_p->type_name, idx);
 
     return UCS_OK;
 }
@@ -403,21 +406,23 @@ static int uct_ugni_next_power_of_two_inclusive (int value)
 
 ucs_status_t uct_ugni_create_cdm(uct_ugni_cdm_t *cdm, uct_ugni_device_t *device, ucs_thread_mode_t thread_mode)
 {
-    uct_ugni_job_info_t *job_info;
+    uct_ugni_job_info_t *j_info;
     int modes;
     gni_return_t ugni_rc;
     ucs_status_t status = UCS_OK;
     int pid_max = 32768, free_bits;
     FILE *fh;
 
-    job_info = uct_ugni_get_job_info();
-    if (NULL == job_info) {
+    j_info = uct_ugni_get_job_info();
+    if (NULL == j_info) {
         return UCS_ERR_IO_ERROR;
     }
 
     fh = fopen ("/proc/sys/kernel/pid_max", "r");
     if (NULL != fh) {
-        fscanf (fh, "%d", &pid_max);
+        if (fscanf (fh, "%d", &pid_max) != 1) {
+            ucs_debug("cound not read pid_max, using default");
+        }
         fclose (fh);
     }
 
@@ -433,7 +438,7 @@ ucs_status_t uct_ugni_create_cdm(uct_ugni_cdm_t *cdm, uct_ugni_device_t *device,
               cdm->domain_id, getpid (), free_bits, ugni_domain_counter);
     modes = GNI_CDM_MODE_FORK_FULLCOPY | GNI_CDM_MODE_CACHED_AMO_ENABLED |
         GNI_CDM_MODE_ERR_NO_KILL | GNI_CDM_MODE_FAST_DATAGRAM_POLL | GNI_CDM_MODE_FMA_SHARED;
-    ugni_rc = GNI_CdmCreate(cdm->domain_id, job_info->ptag, job_info->cookie,
+    ugni_rc = GNI_CdmCreate(cdm->domain_id, j_info->ptag, j_info->cookie,
                             modes, &cdm->cdm_handle);
     if (GNI_RC_SUCCESS != ugni_rc) {
         ucs_error("GNI_CdmCreate failed, Error status: %s %d",

@@ -20,6 +20,9 @@ BEGIN_C_DECLS
 
 /** @file async.h */
 
+#define UCS_ASYNC_EVENT_DUMMY   0
+
+
 /**
  * Async event context. Manages timer and fd notifications.
  */
@@ -53,7 +56,8 @@ void ucs_async_global_cleanup();
  * This can be used to ensure safe event delivery.
  *
  * @param async           Event context to initialize.
- * @param mode            Either to use signals or epoll threads to wait.
+ * @param mode            Indicates whether to use signals or polling threads
+ *                        for waiting.
  *
  * @return Error code as defined by @ref ucs_status_t.
  */
@@ -97,7 +101,7 @@ static inline int ucs_async_check_miss(ucs_async_context_t *async)
 #define UCS_ASYNC_BLOCK(_async) \
     do { \
         if ((_async)->mode == UCS_ASYNC_MODE_THREAD_SPINLOCK) { \
-            ucs_spin_lock(&(_async)->thread.spinlock); \
+            ucs_recursive_spin_lock(&(_async)->thread.spinlock); \
         } else if ((_async)->mode == UCS_ASYNC_MODE_THREAD_MUTEX) { \
             (void)pthread_mutex_lock(&(_async)->thread.mutex); \
         } else if ((_async)->mode == UCS_ASYNC_MODE_SIGNAL) { \
@@ -116,7 +120,7 @@ static inline int ucs_async_check_miss(ucs_async_context_t *async)
 #define UCS_ASYNC_UNBLOCK(_async) \
     do { \
         if ((_async)->mode == UCS_ASYNC_MODE_THREAD_SPINLOCK) { \
-            ucs_spin_unlock(&(_async)->thread.spinlock); \
+            ucs_recursive_spin_unlock(&(_async)->thread.spinlock); \
         } else if ((_async)->mode == UCS_ASYNC_MODE_THREAD_MUTEX) { \
             (void)pthread_mutex_unlock(&(_async)->thread.mutex); \
         } else if ((_async)->mode == UCS_ASYNC_MODE_SIGNAL) { \

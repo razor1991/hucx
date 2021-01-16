@@ -33,7 +33,7 @@ public:
     void send_am_messages(entity *e, int wnd, ucs_status_t expected,
                           uint8_t am_id = 0, int ep_idx = 0) {
         for (int i = 0; i < wnd; i++) {
-            EXPECT_EQ(expected, send_am_message(e, wnd, am_id, ep_idx));
+            EXPECT_EQ(expected, send_am_message(e, am_id, ep_idx));
         }
     }
 
@@ -41,7 +41,7 @@ public:
         uct_test::short_progress_loop(delta_ms);
     }
 
-    void test_iface_ops();
+    void test_iface_ops(int cq_len);
 
     static ucs_status_t am_dummy_handler(void *arg, void *data, size_t length,
                                          unsigned flags) {
@@ -141,7 +141,7 @@ protected:
 };
 
 
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
 class test_rc_flow_control_stats : public test_rc_flow_control {
 public:
     void init() {
@@ -157,5 +157,20 @@ public:
     void test_general(int wnd, int s_thresh, int h_thresh);
 };
 #endif
+
+
+class test_rc_iface_attrs : public test_uct_iface_attrs {
+public:
+    test_rc_iface_attrs() {
+        ucs_status_t status = uct_config_modify(m_iface_config,
+                                                "RC_TM_ENABLE", "y");
+        EXPECT_TRUE((status == UCS_OK) || (status == UCS_ERR_NO_ELEM));
+    }
+
+    attr_map_t get_num_iov_mlx5_common(size_t av_size);
+
+    attr_map_t get_num_iov();
+};
+
 
 #endif

@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "memtrack.h"
 
 #include <ucs/datastruct/khash.h>
@@ -11,11 +15,10 @@
 #include <ucs/stats/stats.h>
 #include <ucs/sys/sys.h>
 #include <ucs/sys/math.h>
-#include <malloc.h>
 #include <stdio.h>
 
 
-#if ENABLE_MEMTRACK
+#ifdef ENABLE_MEMTRACK
 
 #define UCS_MEMTRACK_FORMAT_STRING    ("%22s: size: %9lu / %9lu\tcount: %9u / %9u\n")
 
@@ -34,18 +37,17 @@ typedef struct ucs_memtrack_context {
     ucs_memtrack_entry_t             total;
     khash_t(ucs_memtrack_ptr_hash)   ptrs;
     khash_t(ucs_memtrack_entry_hash) entries;
-    UCS_STATS_NODE_DECLARE(stats);
+    UCS_STATS_NODE_DECLARE(stats)
 } ucs_memtrack_context_t;
 
 
 /* Global context for tracking allocated memory */
 static ucs_memtrack_context_t ucs_memtrack_context = {
     .enabled = 0,
-    .lock    = PTHREAD_MUTEX_INITIALIZER,
-    .total   = {0}
+    .lock    = PTHREAD_MUTEX_INITIALIZER
 };
 
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
 static ucs_stats_class_t ucs_memtrack_stats_class = {
     .name = "memtrack",
     .num_counters = UCS_MEMTRACK_STAT_LAST,
@@ -197,11 +199,19 @@ void *ucs_realloc(void *ptr, size_t size, const char *name)
     return ptr;
 }
 
-void *ucs_memalign(size_t boundary, size_t size, const char *name)
+int ucs_posix_memalign(void **ptr, size_t boundary, size_t size, const char *name)
 {
-    void *ptr = memalign(boundary, size);
-    ucs_memtrack_allocated(ptr, size, name);
-    return ptr;
+    int ret;
+
+#if HAVE_POSIX_MEMALIGN
+    ret = posix_memalign(ptr, boundary, size);
+#else
+#error "Port me"
+#endif
+    if (ret == 0) {
+        ucs_memtrack_allocated(*ptr, size, name);
+    }
+    return ret;
 }
 
 void ucs_free(void *ptr)
@@ -310,7 +320,7 @@ static void ucs_memtrack_generate_report()
 
     status = ucs_open_output_stream(ucs_global_opts.memtrack_dest,
                                     UCS_LOG_LEVEL_ERROR, &output_stream,
-                                    &need_close, &next_token);
+                                    &need_close, &next_token, NULL);
     if (status != UCS_OK) {
         return;
     }
@@ -357,8 +367,6 @@ void ucs_memtrack_cleanup()
         return;
     }
 
-    pthread_mutex_lock(&ucs_memtrack_context.lock);
-
     ucs_memtrack_generate_report();
 
     /* disable before releasing the stats node */
@@ -373,8 +381,6 @@ void ucs_memtrack_cleanup()
     /* destroy hash tables */
     kh_destroy_inplace(ucs_memtrack_entry_hash, &ucs_memtrack_context.entries);
     kh_destroy_inplace(ucs_memtrack_ptr_hash, &ucs_memtrack_context.ptrs);
-
-    pthread_mutex_unlock(&ucs_memtrack_context.lock);
 }
 
 int ucs_memtrack_is_enabled()

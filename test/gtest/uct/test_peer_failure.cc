@@ -56,15 +56,33 @@ public:
         return UCS_OK;
     }
 
+    typedef struct {
+        uct_pending_req_t    uct;
+        uct_ep_h             ep;
+    } pending_send_request_t;
+
     static ucs_status_t pending_cb(uct_pending_req_t *self)
     {
-        m_req_count++;
-        return UCS_OK;
+        const uint64_t send_data    = 0;
+        pending_send_request_t *req = ucs_container_of(self,
+                                                       pending_send_request_t,
+                                                       uct);
+
+        ucs_status_t status;
+        do {
+            /* Block in the pending handler (sending AM Short to fill UCT
+             * resources) to keep the pending requests in pending queue
+             * to purge them */
+            status = uct_ep_am_short(req->ep, 0, 0, &send_data,
+                                     sizeof(send_data));
+        } while (status == UCS_OK);
+
+        return status;
     }
 
     static void purge_cb(uct_pending_req_t *self, void *arg)
     {
-        m_req_count++;
+        m_req_purge_count++;
     }
 
     static ucs_status_t err_cb(void *arg, uct_ep_h ep, ucs_status_t status)
@@ -91,11 +109,6 @@ public:
         m_entities.push_back(m_receivers.back());
         m_sender->connect(m_receivers.size() - 1, *m_receivers.back(), 0);
 
-        m_entities.back()->check_caps(UCT_IFACE_FLAG_AM_SHORT   |
-                                      UCT_IFACE_FLAG_PENDING    |
-                                      UCT_IFACE_FLAG_CB_SYNC    |
-                                      UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE);
-
         am_handler_setter(this)(m_receivers.back());
         /* Make sure that TL is up and has resources */
         send_recv_am(m_receivers.size() - 1);
@@ -103,7 +116,7 @@ public:
 
     void set_am_handlers()
     {
-        check_caps(UCT_IFACE_FLAG_CB_SYNC);
+        check_caps_skip(UCT_IFACE_FLAG_CB_SYNC);
         std::for_each(m_receivers.begin(), m_receivers.end(),
                       am_handler_setter(this));
     }
@@ -175,24 +188,27 @@ protected:
     size_t                m_tx_window;
     size_t                m_err_count;
     size_t                m_am_count;
-    static size_t         m_req_count;
+    static size_t         m_req_purge_count;
+    static const uint64_t m_required_caps;
 };
 
-size_t test_uct_peer_failure::m_req_count = 0ul;
+size_t test_uct_peer_failure::m_req_purge_count       = 0ul;
+const uint64_t test_uct_peer_failure::m_required_caps = UCT_IFACE_FLAG_AM_SHORT  |
+                                                        UCT_IFACE_FLAG_PENDING   |
+                                                        UCT_IFACE_FLAG_CB_SYNC   |
+                                                        UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE;
 
 void test_uct_peer_failure::init()
 {
     uct_test::init();
 
+    reduce_tl_send_queues();
+
     /* To reduce test execution time decrease retransmition timeouts
      * where it is relevant */
-    if (GetParam()->tl_name == "rc" || GetParam()->tl_name == "rc_mlx5" ||
-        GetParam()->tl_name == "dc" || GetParam()->tl_name == "dc_mlx5") {
-        set_config("RC_TIMEOUT=100us"); /* 100 us should be enough */
-        set_config("RC_RETRY_COUNT=4");
-    } else if (GetParam()->tl_name == "ud" || GetParam()->tl_name == "ud_mlx5") {
-        set_config("UD_TIMEOUT=3s");
-    }
+    set_config("RC_TIMEOUT?=100us"); /* 100 us should be enough */
+    set_config("RC_RETRY_COUNT?=4");
+    set_config("UD_TIMEOUT?=3s");
 
     uct_iface_params_t p = entity_params();
     p.field_mask |= UCT_IFACE_PARAM_FIELD_OPEN_MODE;
@@ -200,19 +216,20 @@ void test_uct_peer_failure::init()
     m_sender = uct_test::create_entity(p);
     m_entities.push_back(m_sender);
 
+    check_skip_test();
     for (size_t i = 0; i < 2; ++i) {
         new_receiver();
     }
 
-    m_err_count = 0;
-    m_req_count = 0;
-    m_am_count  = 0;
+    m_err_count       = 0;
+    m_req_purge_count = 0;
+    m_am_count        = 0;
 }
 
-UCS_TEST_P(test_uct_peer_failure, peer_failure)
+UCS_TEST_SKIP_COND_P(test_uct_peer_failure, peer_failure,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT |
+                                 m_required_caps))
 {
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
-
     {
         scoped_log_handler slh(wrap_errors_logger);
 
@@ -249,52 +266,61 @@ UCS_TEST_P(test_uct_peer_failure, peer_failure)
               UCS_ERR_ENDPOINT_TIMEOUT);
     EXPECT_EQ(uct_ep_flush(ep0(), 0, NULL), UCS_ERR_ENDPOINT_TIMEOUT);
     EXPECT_EQ(uct_ep_get_address(ep0(), NULL), UCS_ERR_ENDPOINT_TIMEOUT);
-    EXPECT_EQ(uct_ep_pending_add(ep0(), NULL, 0), UCS_ERR_ENDPOINT_TIMEOUT);
+    EXPECT_EQ(uct_ep_pending_add(ep0(), NULL, 0), UCS_ERR_BUSY);
     EXPECT_EQ(uct_ep_connect_to_ep(ep0(), NULL, NULL), UCS_ERR_ENDPOINT_TIMEOUT);
 
     EXPECT_GT(m_err_count, 0ul);
 }
 
-UCS_TEST_P(test_uct_peer_failure, purge_failed_peer)
+UCS_TEST_SKIP_COND_P(test_uct_peer_failure, purge_failed_peer,
+                     !check_caps(m_required_caps))
 {
-    check_caps(UCT_IFACE_FLAG_AM_SHORT | UCT_IFACE_FLAG_PENDING);
-
     set_am_handlers();
 
     send_recv_am(0);
     send_recv_am(1);
 
-    const size_t num_pend_sends = 3ul;
-    uct_pending_req_t reqs[num_pend_sends];
+    const ucs_time_t loop_end_limit = ucs::get_deadline();
+    const size_t num_pend_sends     = 64ul;
+    const uint64_t send_data        = 0;
+    std::vector<pending_send_request_t> reqs(num_pend_sends);
+
     {
         scoped_log_handler slh(wrap_errors_logger);
 
-        kill_receiver();
-
         ucs_status_t status;
         do {
-            status = uct_ep_am_short(ep0(), 0, 0, NULL, 0);
-        } while (status == UCS_OK);
+            status = uct_ep_am_short(ep0(), 0, 0, &send_data,
+                                     sizeof(send_data));
+        } while ((status == UCS_OK) && (ucs_get_time() < loop_end_limit));
+
+        if (status == UCS_OK) {
+            UCS_TEST_SKIP_R("unable to fill the UCT resources");
+        } else if (status != UCS_ERR_NO_RESOURCE) {
+            UCS_TEST_ABORT("AM Short failed with " << ucs_status_string(status));
+        }
+
+        kill_receiver();
 
         for (size_t i = 0; i < num_pend_sends; i ++) {
-            reqs[i].func = pending_cb;
-            EXPECT_EQ(uct_ep_pending_add(ep0(), &reqs[i], 0), UCS_OK);
+            reqs[i].ep       = ep0();
+            reqs[i].uct.func = pending_cb;
+            EXPECT_EQ(UCS_OK, uct_ep_pending_add(ep0(), &reqs[i].uct, 0));
         }
 
         flush();
     }
 
-    EXPECT_EQ(uct_ep_am_short(ep0(), 0, 0, NULL, 0), UCS_ERR_ENDPOINT_TIMEOUT);
+    EXPECT_EQ(UCS_ERR_ENDPOINT_TIMEOUT, uct_ep_am_short(ep0(), 0, 0, NULL, 0));
 
     uct_ep_pending_purge(ep0(), purge_cb, NULL);
-    EXPECT_EQ(num_pend_sends, m_req_count);
+    EXPECT_EQ(num_pend_sends, m_req_purge_count);
     EXPECT_GE(m_err_count, 0ul);
 }
 
-UCS_TEST_P(test_uct_peer_failure, two_pairs_send)
+UCS_TEST_SKIP_COND_P(test_uct_peer_failure, two_pairs_send,
+                     !check_caps(m_required_caps))
 {
-    check_caps(UCT_IFACE_FLAG_AM_SHORT | UCT_IFACE_FLAG_PENDING);
-
     set_am_handlers();
 
     /* queue sends on 1st pair */
@@ -325,10 +351,9 @@ UCS_TEST_P(test_uct_peer_failure, two_pairs_send)
 }
 
 
-UCS_TEST_P(test_uct_peer_failure, two_pairs_send_after)
+UCS_TEST_SKIP_COND_P(test_uct_peer_failure, two_pairs_send_after,
+                     !check_caps(m_required_caps))
 {
-    check_caps(UCT_IFACE_FLAG_AM_SHORT | UCT_IFACE_FLAG_PENDING);
-
     set_am_handlers();
 
     {
@@ -367,10 +392,10 @@ public:
     }
 };
 
-UCS_TEST_P(test_uct_peer_failure_cb, desproy_ep_cb)
+UCS_TEST_SKIP_COND_P(test_uct_peer_failure_cb, desproy_ep_cb,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT |
+                                 m_required_caps))
 {
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
-
     scoped_log_handler slh(wrap_errors_logger);
     kill_receiver();
     EXPECT_EQ(uct_ep_put_short(ep0(), NULL, 0, 0, 0), UCS_OK);
@@ -390,11 +415,6 @@ protected:
 
 void test_uct_peer_failure_multiple::init()
 {
-    if (RUNNING_ON_VALGRIND) {
-        /* See https://bugs.kde.org/show_bug.cgi?id=352742 */
-        UCS_TEST_SKIP_R("skipping on valgrind because \"brk segment overflow\"");
-    }
-
     size_t tx_queue_len = get_tx_queue_len();
 
     if (ucs_get_page_size() > 4096) {
@@ -416,17 +436,18 @@ void test_uct_peer_failure_multiple::init()
 
 size_t test_uct_peer_failure_multiple::get_tx_queue_len() const
 {
-    const std::string   &tl_name = GetParam()->tl_name;
-    std::string         name, val;
-    size_t              tx_queue_len;
+    bool        set = true;
+    std::string name, val;
+    size_t      tx_queue_len;
 
-    if ((tl_name == "rc") || (tl_name == "rc_mlx5")) {
-        name = "RC_IB_TX_QUEUE_LEN";
-    } else if ((tl_name == "dc") || (tl_name == "dc_mlx5")) {
+    if (has_rc()) {
+        name = "RC_RC_IB_TX_QUEUE_LEN";
+    } else if (has_transport("dc_mlx5")) {
         name = "DC_RC_IB_TX_QUEUE_LEN";
-    } else if ((tl_name == "ud") || (tl_name == "ud_mlx5")) {
+    } else if (has_ud()) {
         name = "UD_IB_TX_QUEUE_LEN";
     } else {
+        set  = false;
         name = "TX_QUEUE_LEN";
     }
 
@@ -437,12 +458,21 @@ size_t test_uct_peer_failure_multiple::get_tx_queue_len() const
         tx_queue_len = 256;
         UCS_TEST_MESSAGE << name << " setting not found, "
                          << "taken test default value: " << tx_queue_len;
+        if (set) {
+            UCS_TEST_ABORT(name + " config name must be found for %s transport" +
+                           GetParam()->tl_name);
+        }
     }
 
     return tx_queue_len;
 }
 
-UCS_TEST_P(test_uct_peer_failure_multiple, test, "RC_TM_ENABLE?=n")
+/* Skip under valgrind due to brk segment overflow.
+ * See https://bugs.kde.org/show_bug.cgi?id=352742 */
+UCS_TEST_SKIP_COND_P(test_uct_peer_failure_multiple, test,
+                     (RUNNING_ON_VALGRIND ||
+                      !check_caps(m_required_caps)),
+                     "RC_TM_ENABLE?=n")
 {
     ucs_time_t timeout  = ucs_get_time() +
                           ucs_time_from_sec(200 * ucs::test_time_multiplier());

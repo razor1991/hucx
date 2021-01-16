@@ -88,26 +88,17 @@
 
 
 enum {
-    UCT_RC_IFACE_ADDR_TYPE_BASIC,
-
-    /* Tag Matching address. It additionaly contains QP number which
-     * is used for hardware offloads. */
-    UCT_RC_IFACE_ADDR_TYPE_TM,
-    UCT_RC_IFACE_ADDR_TYPE_LAST
-};
-
-
-enum {
     UCT_RC_IFACE_STAT_RX_COMPLETION,
     UCT_RC_IFACE_STAT_TX_COMPLETION,
     UCT_RC_IFACE_STAT_NO_CQE,
+    UCT_RC_IFACE_STAT_NO_READS,
     UCT_RC_IFACE_STAT_LAST
 };
 
 
 /* flags for uct_rc_iface_send_op_t */
 enum {
-#if ENABLE_ASSERT
+#if UCS_ENABLE_ASSERT
     UCT_RC_IFACE_SEND_OP_FLAG_ZCOPY = UCS_BIT(13), /* zcopy */
     UCT_RC_IFACE_SEND_OP_FLAG_IFACE = UCS_BIT(14), /* belongs to iface ops buffer */
     UCT_RC_IFACE_SEND_OP_FLAG_INUSE = UCS_BIT(15)  /* queued on a txqp */
@@ -136,23 +127,31 @@ typedef struct uct_rc_fc_request {
 } uct_rc_fc_request_t;
 
 
-typedef struct uct_rc_fc_config {
-    double            soft_thresh;
-} uct_rc_fc_config_t;
+/**
+ * RC fence type.
+ */
+typedef enum uct_rc_fence_mode {
+    UCT_RC_FENCE_MODE_NONE,
+    UCT_RC_FENCE_MODE_WEAK,
+    UCT_RC_FENCE_MODE_AUTO,
+    UCT_RC_FENCE_MODE_LAST
+} uct_rc_fence_mode_t;
 
 
-struct uct_rc_iface_config {
+/* Common configuration used for rc verbs, rcx and dc transports */
+typedef struct uct_rc_iface_common_config {
     uct_ib_iface_config_t    super;
-    uct_ib_mtu_t             path_mtu;
     unsigned                 max_rd_atomic;
     int                      ooo_rw; /* Enable out-of-order RDMA data placement */
+    int                      fence_mode;
 
     struct {
         double               timeout;
         unsigned             retry_count;
         double               rnr_timeout;
         unsigned             rnr_retry_count;
-        unsigned             cq_len;
+        size_t               max_get_zcopy;
+        size_t               max_get_bytes;
     } tx;
 
     struct {
@@ -160,13 +159,24 @@ struct uct_rc_iface_config {
         double               hard_thresh;
         unsigned             wnd_size;
     } fc;
+} uct_rc_iface_common_config_t;
+
+
+/* RC specific configuration used for rc verbs and rcx transports only */
+struct uct_rc_iface_config {
+    uct_rc_iface_common_config_t   super;
+    double                         soft_thresh;
+    unsigned                       tx_cq_moderation; /* How many TX messages are
+                                                        batched to one CQE */
+    unsigned                       tx_cq_len;
 };
 
 
 typedef struct uct_rc_iface_ops {
     uct_ib_iface_ops_t   super;
     ucs_status_t         (*init_rx)(uct_rc_iface_t *iface,
-                                    const uct_rc_iface_config_t *config);
+                                    const uct_rc_iface_common_config_t *config);
+    void                 (*cleanup_rx)(uct_rc_iface_t *iface);
     ucs_status_t         (*fc_ctrl)(uct_ep_t *ep, unsigned op,
                                     uct_rc_fc_request_t *req);
     ucs_status_t         (*fc_handler)(uct_rc_iface_t *iface, unsigned qp_num,
@@ -177,7 +187,6 @@ typedef struct uct_rc_iface_ops {
 
 
 typedef struct uct_rc_srq {
-    struct ibv_srq           *srq;
     unsigned                 available;
     unsigned                 quota;
 } uct_rc_srq_t;
@@ -196,9 +205,11 @@ struct uct_rc_iface {
          * In case of verbs TL we use QWE number, so 1 post always takes 1
          * credit */
         signed                  cq_available;
+        ssize_t                 reads_available;
         uct_rc_iface_send_op_t  *free_ops; /* stack of free send operations */
         ucs_arbiter_t           arbiter;
         uct_rc_iface_send_op_t  *ops_buffer;
+        uct_ib_fence_info_t     fi;
     } tx;
 
     struct {
@@ -211,7 +222,6 @@ struct uct_rc_iface {
         unsigned             tx_min_sge;
         unsigned             tx_min_inline;
         unsigned             tx_ops_count;
-        unsigned             rx_inline;
         uint16_t             tx_moderation;
 
         /* Threshold to send "soft" FC credit request. The peer will try to
@@ -230,12 +240,14 @@ struct uct_rc_iface {
         uint8_t              rnr_retry;
         uint8_t              retry_cnt;
         uint8_t              max_rd_atomic;
-        enum ibv_mtu         path_mtu;
         /* Enable out-of-order RDMA data placement */
         uint8_t              ooo_rw;
-#if ENABLE_ASSERT
+#if UCS_ENABLE_ASSERT
         int                  tx_cq_len;
 #endif
+        uct_rc_fence_mode_t  fence_mode;
+        unsigned             exp_backoff;
+        size_t               max_get_zcopy;
 
         /* Atomic callbacks */
         uct_rc_send_handler_t  atomic64_handler;      /* 64bit ib-spec */
@@ -243,7 +255,7 @@ struct uct_rc_iface {
         uct_rc_send_handler_t  atomic64_ext_handler;  /* 64bit extended */
     } config;
 
-    UCS_STATS_NODE_DECLARE(stats);
+    UCS_STATS_NODE_DECLARE(stats)
 
     uct_rc_ep_t              **eps[UCT_RC_QP_TABLE_SIZE];
     ucs_list_link_t          ep_list;
@@ -252,7 +264,7 @@ struct uct_rc_iface {
     ucs_callback_t           progress;
 };
 UCS_CLASS_DECLARE(uct_rc_iface_t, uct_rc_iface_ops_t*, uct_md_h, uct_worker_h,
-                  const uct_iface_params_t*, const uct_rc_iface_config_t*,
+                  const uct_iface_params_t*, const uct_rc_iface_common_config_t*,
                   uct_ib_iface_init_attr_t*);
 
 
@@ -266,9 +278,10 @@ struct uct_rc_iface_send_op {
     uint16_t                      flags;
     unsigned                      length;
     union {
-        void                      *buffer;        /* atomics / desc */
-        void                      *unpack_arg;    /* get_bcopy / desc */
-        uct_rc_iface_t            *iface;         /* zcopy / op */
+        void                      *buffer;     /* atomics / desc */
+        void                      *unpack_arg; /* get_bcopy / desc */
+        uct_rc_iface_t            *iface;      /* should not be used with
+                                                  get_bcopy completions */
     };
     uct_completion_t              *user_comp;
 };
@@ -291,7 +304,7 @@ typedef struct uct_rc_am_short_hdr {
 
 
 extern ucs_config_field_t uct_rc_iface_config_table[];
-extern ucs_config_field_t uct_rc_fc_config_table[];
+extern ucs_config_field_t uct_rc_iface_common_config_table[];
 
 unsigned uct_rc_iface_do_progress(uct_iface_h tl_iface);
 
@@ -299,14 +312,7 @@ ucs_status_t uct_rc_iface_query(uct_rc_iface_t *iface,
                                 uct_iface_attr_t *iface_attr,
                                 size_t put_max_short, size_t max_inline,
                                 size_t am_max_hdr, size_t am_max_iov,
-                                size_t tag_max_iov, size_t tag_min_hdr);
-
-ucs_status_t uct_rc_iface_get_address(uct_iface_h tl_iface,
-                                      uct_iface_addr_t *addr);
-
-int uct_rc_iface_is_reachable(const uct_iface_h tl_iface,
-                              const uct_device_addr_t *dev_addr,
-                              const uct_iface_addr_t *iface_addr);
+                                size_t am_min_hdr, size_t rma_max_iov);
 
 void uct_rc_iface_add_qp(uct_rc_iface_t *iface, uct_rc_ep_t *ep,
                          unsigned qp_num);
@@ -321,23 +327,29 @@ void uct_rc_iface_send_desc_init(uct_iface_h tl_iface, void *obj, uct_mem_h memh
 void uct_rc_ep_am_zcopy_handler(uct_rc_iface_send_op_t *op, const void *resp);
 
 /**
- * Creates an RC or DCI QP and fills 'cap' with QP capabilities;
+ * Creates an RC or DCI QP
  */
 ucs_status_t uct_rc_iface_qp_create(uct_rc_iface_t *iface, struct ibv_qp **qp_p,
-                                    struct ibv_qp_cap *cap, unsigned max_send_wr);
+                                    uct_ib_qp_attr_t *attr, unsigned max_send_wr,
+                                    struct ibv_srq *srq);
+
+void uct_rc_iface_fill_attr(uct_rc_iface_t *iface,
+                            uct_ib_qp_attr_t *qp_init_attr,
+                            unsigned max_send_wr,
+                            struct ibv_srq *srq);
 
 ucs_status_t uct_rc_iface_qp_init(uct_rc_iface_t *iface, struct ibv_qp *qp);
 
 ucs_status_t uct_rc_iface_qp_connect(uct_rc_iface_t *iface, struct ibv_qp *qp,
                                      const uint32_t qp_num,
-                                     struct ibv_ah_attr *ah_attr);
+                                     struct ibv_ah_attr *ah_attr,
+                                     enum ibv_mtu path_mtu);
 
 ucs_status_t uct_rc_iface_fc_handler(uct_rc_iface_t *iface, unsigned qp_num,
                                      uct_rc_hdr_t *hdr, unsigned length,
                                      uint32_t imm_data, uint16_t lid, unsigned flags);
 
-ucs_status_t uct_rc_init_fc_thresh(uct_rc_fc_config_t *fc_cfg,
-                                   uct_rc_iface_config_t *rc_cfg,
+ucs_status_t uct_rc_init_fc_thresh(uct_rc_iface_config_t *rc_cfg,
                                    uct_rc_iface_t *iface);
 
 ucs_status_t uct_rc_iface_event_arm(uct_iface_h tl_iface, unsigned events);
@@ -346,7 +358,10 @@ ucs_status_t uct_rc_iface_common_event_arm(uct_iface_h tl_iface,
                                            unsigned events, int force_rx_all);
 
 ucs_status_t uct_rc_iface_init_rx(uct_rc_iface_t *iface,
-                                  const uct_rc_iface_config_t *config);
+                                  const uct_rc_iface_common_config_t *config,
+                                  struct ibv_srq **p_srq);
+
+ucs_status_t uct_rc_iface_fence(uct_iface_h tl_iface, unsigned flags);
 
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_rc_fc_ctrl(uct_ep_t *ep, unsigned op, uct_rc_fc_request_t *req)
@@ -421,7 +436,8 @@ static inline void uct_rc_zcopy_desc_set_header(uct_rc_hdr_t *rch,
 static inline int uct_rc_iface_has_tx_resources(uct_rc_iface_t *iface)
 {
     return uct_rc_iface_have_tx_cqe_avail(iface) &&
-           !ucs_mpool_is_empty(&iface->tx.mp);
+           !ucs_mpool_is_empty(&iface->tx.mp) &&
+           (iface->tx.reads_available > 0);
 }
 
 static UCS_F_ALWAYS_INLINE uct_rc_send_handler_t
@@ -438,4 +454,18 @@ uct_rc_iface_atomic_handler(uct_rc_iface_t *iface, int ext, unsigned length)
     return NULL;
 }
 
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_rc_iface_fence_relaxed_order(uct_iface_h tl_iface)
+{
+    uct_base_iface_t *iface = ucs_derived_of(tl_iface, uct_base_iface_t);
+    uct_ib_md_t *md         = ucs_derived_of(iface->md, uct_ib_md_t);
+
+    ucs_assert(tl_iface->ops.iface_fence == uct_rc_iface_fence);
+
+    if (!md->relaxed_order) {
+        return UCS_OK;
+    }
+
+    return uct_rc_iface_fence(tl_iface, 0);
+}
 #endif

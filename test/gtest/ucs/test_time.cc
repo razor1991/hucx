@@ -18,18 +18,15 @@ class test_time : public ucs::test {
 UCS_TEST_F(test_time, time_calc) {
     double value = ucs::rand() % UCS_USEC_PER_SEC;
 
-    EXPECT_NEAR(value * 1000, ucs_time_to_msec(ucs_time_from_sec (value)), 0.000001);
-    EXPECT_NEAR(value * 1000, ucs_time_to_usec(ucs_time_from_msec(value)), 0.001);
-    EXPECT_NEAR(value * 1000, ucs_time_to_nsec(ucs_time_from_usec(value)), 10.0);
+    EXPECT_NEAR(value * 1000ull, ucs_time_to_msec(ucs_time_from_sec (value)), 0.000001);
+    EXPECT_NEAR(value * 1000ull, ucs_time_to_usec(ucs_time_from_msec(value)), 0.01);
+    EXPECT_NEAR(value * 1000ull, ucs_time_to_nsec(ucs_time_from_usec(value)), 20.0);
 }
 
 /* This test is only useful when used with high-precision timers */
 #if HAVE_HW_TIMER
-UCS_TEST_F(test_time, get_time) {
-    if (ucs::test_time_multiplier() > 1) {
-        UCS_TEST_SKIP;
-    }
-
+UCS_TEST_SKIP_COND_F(test_time, get_time,
+                     (ucs::test_time_multiplier() > 1)) {
     ucs_time_t time1 = ucs_get_time();
     ucs_time_t time2 = ucs_get_time();
     EXPECT_GE(time2, time1);
@@ -63,7 +60,6 @@ UCS_TEST_F(test_time, timerq) {
     ucs_timer_queue_t timerq;
     ucs_status_t status;
 
-    ::srand(::time(NULL));
     for (unsigned test_count = 0; test_count < 500; ++test_count) {
 
         const ucs_time_t interval1 = (ucs::rand() % 20) + 1;

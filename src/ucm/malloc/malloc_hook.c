@@ -10,7 +10,12 @@
 
 #include "malloc_hook.h"
 
+#ifdef HAVE_MALLOC_H
 #include <malloc.h>
+#endif
+#ifdef HAVE_MALLOC_NP_H
+#include <malloc_np.h>
+#endif
 #undef M_TRIM_THRESHOLD
 #undef M_MMAP_THRESHOLD
 #include "allocator.h" /* have to be included after malloc.h */
@@ -26,6 +31,7 @@
 #include <ucs/sys/math.h>
 #include <ucs/sys/checker.h>
 #include <ucs/sys/sys.h>
+#include <ucs/type/spinlock.h>
 
 
 /* make khash allocate memory directly from operating system */
@@ -68,44 +74,48 @@ KHASH_INIT(mmap_ptrs, void*, char, 0, ucm_mmap_ptr_hash, ucm_mmap_ptr_equal)
 /* Pointer to memory release function */
 typedef void (*ucm_release_func_t)(void *ptr);
 
+/* Pointer to get usable size function */
+typedef size_t (*ucm_usable_size_func_t)(void *ptr);
+
 
 typedef struct ucm_malloc_hook_state {
     /*
      * State of hook installment
      */
-    pthread_mutex_t       install_mutex; /* Protect hooks installation */
-    int                   install_state; /* State of hook installation */
-    int                   installed_events; /* Which events are working */
-    int                   mmap_thresh_set; /* mmap threshold set by user */
-    int                   trim_thresh_set; /* trim threshold set by user */
-    int                   hook_called; /* Our malloc hook was called */
-    size_t                max_freed_size; /* Maximal size released so far */
-    size_t                (*usable_size)(void*); /* function pointer to get usable size */
+    pthread_mutex_t          install_mutex; /* Protect hooks installation */
+    int                      install_state; /* State of hook installation */
+    int                      installed_events; /* Which events are working */
+    int                      mmap_thresh_set; /* mmap threshold set by user */
+    int                      trim_thresh_set; /* trim threshold set by user */
+    int                      hook_called; /* Our malloc hook was called */
+    size_t                   max_freed_size; /* Maximal size released so far */
 
-    ucm_release_func_t    free; /* function pointer to release memory */
+    ucm_usable_size_func_t   usable_size; /* function pointer to get usable size */
+
+    ucm_release_func_t       free; /* function pointer to release memory */
 
     /*
      * Track record of which pointers are ours
      */
-    pthread_spinlock_t    lock;       /* Protect heap counters.
+    ucs_recursive_spinlock_t lock; /* Protect heap counters.
                                          Note: Cannot modify events when this lock
                                          is held - may deadlock */
     /* Our heap address range. Used to identify whether a released pointer is ours,
      * or was allocated by the previous heap manager. */
-    void                  *heap_start;
-    void                  *heap_end;
+    void                     *heap_start;
+    void                     *heap_end;
 
     /* Save the pointers that we have allocated with mmap, so when they are
      * released we would know they are ours, despite the fact they are not in the
      * heap address range. */
-    khash_t(mmap_ptrs)   ptrs;
+    khash_t(mmap_ptrs)      ptrs;
 
     /**
      * Save the environment strings we've allocated
      */
-    pthread_mutex_t      env_lock;
-    char                 **env_strs;
-    unsigned             num_env_strs;
+    pthread_mutex_t         env_lock;
+    char                    **env_strs;
+    unsigned                num_env_strs;
 } ucm_malloc_hook_state_t;
 
 
@@ -117,8 +127,8 @@ static ucm_malloc_hook_state_t ucm_malloc_hook_state = {
     .trim_thresh_set  = 0,
     .hook_called      = 0,
     .max_freed_size   = 0,
-    .usable_size      = malloc_usable_size,
-    .free             = free,
+    .usable_size      = NULL,
+    .free             = NULL,
     .heap_start       = (void*)-1,
     .heap_end         = (void*)-1,
     .ptrs             = {0},
@@ -134,14 +144,14 @@ static void ucm_malloc_mmaped_ptr_add(void *ptr)
     int hash_extra_status;
     khiter_t hash_it;
 
-    pthread_spin_lock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_lock(&ucm_malloc_hook_state.lock);
 
     hash_it = kh_put(mmap_ptrs, &ucm_malloc_hook_state.ptrs, ptr,
                      &hash_extra_status);
     ucs_assert_always(hash_extra_status >= 0);
     ucs_assert_always(hash_it != kh_end(&ucm_malloc_hook_state.ptrs));
 
-    pthread_spin_unlock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_unlock(&ucm_malloc_hook_state.lock);
 }
 
 static int ucm_malloc_mmaped_ptr_remove_if_exists(void *ptr)
@@ -149,7 +159,7 @@ static int ucm_malloc_mmaped_ptr_remove_if_exists(void *ptr)
     khiter_t hash_it;
     int found;
 
-    pthread_spin_lock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_lock(&ucm_malloc_hook_state.lock);
 
     hash_it = kh_get(mmap_ptrs, &ucm_malloc_hook_state.ptrs, ptr);
     if (hash_it == kh_end(&ucm_malloc_hook_state.ptrs)) {
@@ -159,7 +169,7 @@ static int ucm_malloc_mmaped_ptr_remove_if_exists(void *ptr)
         kh_del(mmap_ptrs, &ucm_malloc_hook_state.ptrs, hash_it);
     }
 
-    pthread_spin_unlock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_unlock(&ucm_malloc_hook_state.lock);
     return found;
 }
 
@@ -167,10 +177,10 @@ static int ucm_malloc_is_address_in_heap(void *ptr)
 {
     int in_heap;
 
-    pthread_spin_lock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_lock(&ucm_malloc_hook_state.lock);
     in_heap = (ptr >= ucm_malloc_hook_state.heap_start) &&
               (ptr < ucm_malloc_hook_state.heap_end);
-    pthread_spin_unlock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_unlock(&ucm_malloc_hook_state.lock);
     return in_heap;
 }
 
@@ -298,6 +308,12 @@ static void *ucm_malloc(size_t size, const void *caller)
     return ucm_malloc_impl(size, "malloc");
 }
 
+static size_t ucm_malloc_usable_size_common(void *mem, int foreign)
+{
+    return foreign ? ucm_malloc_hook_state.usable_size(mem) :
+                     dlmalloc_usable_size(mem);
+}
+
 static void *ucm_realloc(void *oldptr, size_t size, const void *caller)
 {
     void *newptr;
@@ -316,7 +332,7 @@ static void *ucm_realloc(void *oldptr, size_t size, const void *caller)
             newptr = ucm_dlmalloc(size);
             ucm_malloc_allocated(newptr, size, "realloc");
 
-            oldsz = ucm_malloc_hook_state.usable_size(oldptr);
+            oldsz = ucm_malloc_usable_size_common(oldptr, foreign);
             memcpy(newptr, oldptr, ucs_min(size, oldsz));
 
             if (foreign) {
@@ -335,7 +351,7 @@ static void *ucm_realloc(void *oldptr, size_t size, const void *caller)
 
 static void ucm_free(void *ptr, const void *caller)
 {
-    return ucm_free_impl(ptr, ucm_malloc_hook_state.free, "free");
+    ucm_free_impl(ptr, ucm_malloc_hook_state.free, "free");
 }
 
 static void *ucm_memalign(size_t alignment, size_t size, const void *caller)
@@ -383,8 +399,9 @@ static void ucm_operator_delete(void* ptr)
 {
     static ucm_release_func_t orig_delete = NULL;
     if (orig_delete == NULL) {
-        orig_delete = ucm_reloc_get_orig(UCM_OPERATOR_DELETE_SYMBOL,
-                                         ucm_operator_delete);
+        orig_delete =
+            (ucm_release_func_t)ucm_reloc_get_orig(UCM_OPERATOR_DELETE_SYMBOL,
+                                                   ucm_operator_delete);
     }
     ucm_free_impl(ptr, orig_delete, "operator delete");
 }
@@ -398,8 +415,9 @@ static void ucm_operator_vec_delete(void* ptr)
 {
     static ucm_release_func_t orig_vec_delete = NULL;
     if (orig_vec_delete == NULL) {
-        orig_vec_delete = ucm_reloc_get_orig(UCM_OPERATOR_VEC_DELETE_SYMBOL,
-                                             ucm_operator_vec_delete);
+        orig_vec_delete =
+            (ucm_release_func_t)ucm_reloc_get_orig(UCM_OPERATOR_VEC_DELETE_SYMBOL,
+                                                   ucm_operator_vec_delete);
     }
     ucm_free_impl(ptr, orig_vec_delete, "operator delete[]");
 }
@@ -451,7 +469,7 @@ static int ucm_asprintf(char **strp, const char *fmt, ...)
 static int ucm_add_to_environ(char *env_str)
 {
     char *saved_env_str;
-    unsigned index;
+    unsigned idx;
     size_t len;
     char *p;
 
@@ -464,19 +482,19 @@ static int ucm_add_to_environ(char *env_str)
     }
 
     /* Check if we already have variable with same name */
-    index = 0;
-    while (index < ucm_malloc_hook_state.num_env_strs) {
-        saved_env_str = ucm_malloc_hook_state.env_strs[index];
+    idx = 0;
+    while (idx < ucm_malloc_hook_state.num_env_strs) {
+        saved_env_str = ucm_malloc_hook_state.env_strs[idx];
         if ((strlen(saved_env_str) >= len) && !strncmp(env_str, saved_env_str, len)) {
             ucm_trace("replace `%s' with `%s'", saved_env_str, env_str);
             ucm_free(saved_env_str, NULL);
             goto out_insert;
         }
-        ++index;
+        ++idx;
     }
 
     /* Not found - enlarge array by one */
-    index = ucm_malloc_hook_state.num_env_strs;
+    idx = ucm_malloc_hook_state.num_env_strs;
     ++ucm_malloc_hook_state.num_env_strs;
     ucm_malloc_hook_state.env_strs =
                     ucm_realloc(ucm_malloc_hook_state.env_strs,
@@ -484,7 +502,7 @@ static int ucm_add_to_environ(char *env_str)
                                 NULL);
 
 out_insert:
-    ucm_malloc_hook_state.env_strs[index] = env_str;
+    ucm_malloc_hook_state.env_strs[idx] = env_str;
     return 0;
 }
 
@@ -533,7 +551,7 @@ out:
 static void ucm_malloc_sbrk(ucm_event_type_t event_type,
                             ucm_event_t *event, void *arg)
 {
-    pthread_spin_lock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_lock(&ucm_malloc_hook_state.lock);
 
     /* Copy return value from call. We assume the event handler uses a lock. */
     if (ucm_malloc_hook_state.heap_start == (void*)-1) {
@@ -545,19 +563,25 @@ static void ucm_malloc_sbrk(ucm_event_type_t event_type,
               event->sbrk.increment, event->sbrk.result,
               ucm_malloc_hook_state.heap_start, ucm_malloc_hook_state.heap_end);
 
-    pthread_spin_unlock(&ucm_malloc_hook_state.lock);
+    ucs_recursive_spin_unlock(&ucm_malloc_hook_state.lock);
 }
 
-static int ucs_malloc_is_ready(int events)
+static int ucs_malloc_is_ready(int events, const char *title)
 {
     /*
-     * If malloc hooks are installed - we're good here.
+     * In RELOC mode, if malloc hooks are installed - we're good here.
      * Otherwise, we have to make sure all events are indeed working - because
      *  we can't be sure what the existing implementation is doing.
      * The implication of this is that in some cases (e.g infinite mmap threshold)
-     *  we will install out memory hooks, even though it may not be required.
+     *  we will install our memory hooks, even though it may not be required.
      */
-    return ucm_malloc_hook_state.hook_called ||
+    ucm_debug("ucs_malloc_is_ready(%s): have 0x%x/0x%x events;"
+              " mmap_mode=%d hook_called=%d",
+              title, ucm_malloc_hook_state.installed_events, events,
+              ucm_mmap_hook_mode(), ucm_malloc_hook_state.hook_called);
+
+    return ((ucm_mmap_hook_mode() == UCM_MMAP_HOOK_RELOC) &&
+            ucm_malloc_hook_state.hook_called) ||
            ucs_test_all_flags(ucm_malloc_hook_state.installed_events, events);
 }
 
@@ -627,7 +651,7 @@ static void ucm_malloc_test(int events)
 
 static void ucm_malloc_populate_glibc_cache()
 {
-    char hostname[NAME_MAX];
+    char hostname[HOST_NAME_MAX];
 
     /* Trigger NSS initialization before we install malloc hooks.
      * This is needed because NSS could allocate strings with our malloc(), but
@@ -641,9 +665,31 @@ static void ucm_malloc_populate_glibc_cache()
 static void ucm_malloc_install_symbols(ucm_reloc_patch_t *patches)
 {
     ucm_reloc_patch_t *patch;
+
     for (patch = patches; patch->symbol != NULL; ++patch) {
         ucm_reloc_modify(patch);
     }
+}
+
+static void* ucm_malloc_patchlist_prev_value(const ucm_reloc_patch_t *patches,
+                                             const char *symbol)
+{
+    const ucm_reloc_patch_t *patch;
+    for (patch = patches; patch->symbol != NULL; ++patch) {
+        if (!strcmp(patch->symbol, symbol)) {
+            ucm_debug("previous function pointer for '%s' is %p", symbol,
+                      patch->prev_value);
+            if (patch->prev_value == NULL) {
+                goto not_found;
+            }
+
+            return patch->prev_value;
+        }
+    }
+
+not_found:
+    ucm_fatal("could not find the previous value of '%s'", symbol);
+    return NULL;
 }
 
 static int ucm_malloc_mallopt(int param_number, int value)
@@ -662,6 +708,12 @@ static int ucm_malloc_mallopt(int param_number, int value)
         }
     }
     return success;
+}
+
+static size_t ucm_malloc_usable_size(void *mem)
+{
+    return ucm_malloc_usable_size_common(mem,
+                                         !ucm_malloc_is_address_in_heap(mem));
 }
 
 static char *ucm_malloc_blacklist[] = {
@@ -693,7 +745,7 @@ static ucm_reloc_patch_t ucm_malloc_optional_symbol_patches[] = {
     { "mallinfo", ucm_dlmallinfo },
     { "malloc_stats", ucm_dlmalloc_stats },
     { "malloc_trim", ucm_dlmalloc_trim },
-    { "malloc_usable_size", ucm_dlmalloc_usable_size },
+    { "malloc_usable_size", ucm_malloc_usable_size },
     { NULL, NULL }
 };
 
@@ -701,6 +753,10 @@ static void ucm_malloc_install_optional_symbols()
 {
     if (!(ucm_malloc_hook_state.install_state & UCM_MALLOC_INSTALLED_OPT_SYMS)) {
         ucm_malloc_install_symbols(ucm_malloc_optional_symbol_patches);
+        ucm_malloc_hook_state.usable_size    =
+            (ucm_usable_size_func_t)ucm_malloc_patchlist_prev_value(
+                                        ucm_malloc_optional_symbol_patches,
+                                        "malloc_usable_size");
         ucm_malloc_hook_state.install_state |= UCM_MALLOC_INSTALLED_OPT_SYMS;
     }
 }
@@ -725,6 +781,23 @@ static void ucm_malloc_set_env_mallopt()
     }
 }
 
+static void ucm_malloc_init_orig_funcs()
+{
+    /* We cannot use global initializer for these variables; if we do it,
+     * GCC makes them part of .got, and patching .got actually changes the
+     * values of these global variables. As a workaround, we initialize
+     * them here.
+     * NOTE This also makes sure that libucm.so has a reference to these symbols,
+     * so patching the relocation tables would find their previous value by libucm
+     */
+    if (ucm_malloc_hook_state.usable_size == NULL) {
+        ucm_malloc_hook_state.usable_size = (size_t (*)(void *))malloc_usable_size;
+    }
+    if ( ucm_malloc_hook_state.free == NULL) {
+        ucm_malloc_hook_state.free = free;
+    }
+}
+
 ucs_status_t ucm_malloc_install(int events)
 {
     static ucm_event_handler_t sbrk_handler = {
@@ -736,18 +809,22 @@ ucs_status_t ucm_malloc_install(int events)
 
     pthread_mutex_lock(&ucm_malloc_hook_state.install_mutex);
 
-    if (ucs_malloc_is_ready(events)) {
+    ucm_malloc_init_orig_funcs();
+
+    if (ucs_malloc_is_ready(events, "before test")) {
         goto out_succ;
     }
 
     ucm_malloc_test(events);
-    if (ucs_malloc_is_ready(events)) {
+    if (ucs_malloc_is_ready(events, "after test")) {
         goto out_succ;
     }
 
     if (!ucm_malloc_hook_state.hook_called) {
+#ifdef HAVE_MALLOC_TRIM
         /* Try to leak less memory from original malloc */
         malloc_trim(0);
+#endif
     }
 
     if (!(ucm_malloc_hook_state.install_state & UCM_MALLOC_INSTALLED_SBRK_EVH)) {
@@ -792,8 +869,9 @@ ucs_status_t ucm_malloc_install(int events)
             ucm_debug("installing malloc relocations");
             ucm_malloc_populate_glibc_cache();
             ucm_malloc_install_symbols(ucm_malloc_symbol_patches);
-            ucs_assert(ucm_malloc_symbol_patches[0].value == ucm_free);
-            ucm_malloc_hook_state.free           = ucm_malloc_symbol_patches[0].prev_value;
+            ucm_malloc_hook_state.free           =
+                (ucm_release_func_t)ucm_malloc_patchlist_prev_value(
+                                        ucm_malloc_symbol_patches, "free");
             ucm_malloc_hook_state.install_state |= UCM_MALLOC_INSTALLED_MALL_SYMS;
         }
     } else {
@@ -802,7 +880,7 @@ ucs_status_t ucm_malloc_install(int events)
 
     /* Just installed the symbols, test again */
     ucm_malloc_test(events);
-    if (ucm_malloc_hook_state.hook_called) {
+    if (ucs_malloc_is_ready(events, "after install")) {
         goto out_install_opt_syms;
     }
 
@@ -828,6 +906,6 @@ void ucm_malloc_state_reset(int default_mmap_thresh, int default_trim_thresh)
 }
 
 UCS_STATIC_INIT {
-    pthread_spin_init(&ucm_malloc_hook_state.lock, 0);
+    ucs_recursive_spinlock_init(&ucm_malloc_hook_state.lock, 0);
     kh_init_inplace(mmap_ptrs, &ucm_malloc_hook_state.ptrs);
 }

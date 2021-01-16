@@ -4,7 +4,13 @@
  * See file LICENSE for terms.
  */
 
-#define _GNU_SOURCE /* for dladdr(3) */
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE /* for dladdr(3) */
+#endif
 
 #include "module.h"
 
@@ -12,6 +18,7 @@
 #include <ucs/debug/memtrack.h>
 #include <ucs/debug/assert.h>
 #include <ucs/debug/log.h>
+#include <ucs/sys/string.h>
 #include <ucs/sys/math.h>
 #include <string.h>
 #include <limits.h>
@@ -36,7 +43,7 @@ static struct {
     unsigned         srchpath_cnt;
     char             *srch_path[UCS_MODULE_SRCH_PATH_MAX];
 } ucs_module_loader_state = {
-    .init         = UCS_INIT_ONCE_INIITIALIZER,
+    .init         = UCS_INIT_ONCE_INITIALIZER,
     .module_ext   = ".so", /* default extension */
     .srchpath_cnt = 0,
     .srch_path    = { NULL, NULL}
@@ -116,12 +123,6 @@ static void ucs_module_loader_init_paths()
     }
 }
 
-static const char *ucs_module_short_path(const char *path)
-{
-    const char *p = strrchr(path, '/');
-    return (p == NULL) ? path : p + 1;
-}
-
 /* Perform shallow search for a symbol */
 static void *ucs_module_dlsym_shallow(const char *module_path, void *dl,
                                       const char *symbol)
@@ -133,7 +134,6 @@ static void *ucs_module_dlsym_shallow(const char *module_path, void *dl,
 
     addr = dlsym(dl, symbol);
     if (addr == NULL) {
-        ucs_module_trace("could not find symbol '%s' in %s", symbol, module_path);
         return NULL;
     }
 
@@ -156,8 +156,8 @@ static void *ucs_module_dlsym_shallow(const char *module_path, void *dl,
      */
     if (lm_entry->l_addr != (uintptr_t)dl_info.dli_fbase) {
         ucs_module_debug("ignoring '%s' (%p) from %s (%p), expected in %s (%lx)",
-                         symbol, addr, ucs_module_short_path(dl_info.dli_fname),
-                         dl_info.dli_fbase, ucs_module_short_path(module_path),
+                         symbol, addr, ucs_basename(dl_info.dli_fname),
+                         dl_info.dli_fbase, ucs_basename(module_path),
                          lm_entry->l_addr);
         return NULL;
     }
@@ -167,17 +167,22 @@ static void *ucs_module_dlsym_shallow(const char *module_path, void *dl,
 
 static void ucs_module_init(const char *module_path, void *dl)
 {
+    typedef ucs_status_t (*init_func_t)();
+
     const char *module_init_name =
                     UCS_PP_MAKE_STRING(UCS_MODULE_CONSTRUCTOR_NAME);
     char *fullpath, buffer[PATH_MAX];
-    ucs_status_t (*init_func)();
+    init_func_t init_func;
     ucs_status_t status;
 
     fullpath = realpath(module_path, buffer);
     ucs_module_trace("loaded %s [%p]", fullpath, dl);
 
-    init_func = ucs_module_dlsym_shallow(module_path, dl, module_init_name);
+    init_func = (init_func_t)ucs_module_dlsym_shallow(module_path, dl,
+                                                      module_init_name);
     if (init_func == NULL) {
+        ucs_module_trace("not calling constructor '%s' in %s", module_init_name,
+                         module_path);
         return;
     }
 

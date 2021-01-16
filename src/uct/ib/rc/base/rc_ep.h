@@ -76,36 +76,47 @@ enum {
 /*
  * Check for send resources
  */
-#define UCT_RC_CHECK_CQE_RET(_iface, _ep, _txqp, _ret) \
+#define UCT_RC_CHECK_CQE_RET(_iface, _ep, _ret) \
     /* tx_moderation == 0 for TLs which don't support it */ \
     if (ucs_unlikely((_iface)->tx.cq_available <= \
         (signed)(_iface)->config.tx_moderation)) { \
-        if (!uct_rc_iface_have_tx_cqe_avail(_iface)) { \
-            UCS_STATS_UPDATE_COUNTER((_iface)->stats, UCT_RC_IFACE_STAT_NO_CQE, 1); \
-            UCS_STATS_UPDATE_COUNTER((_ep)->super.stats, UCT_EP_STAT_NO_RES, 1); \
+        if (uct_rc_ep_check_cqe(_iface, _ep) != UCS_OK) { \
             return _ret; \
-        } \
-        /* if unsignaled == RC_UNSIGNALED_INF this value was already saved and \
-           next operation will be defenitly signaled */ \
-        if ((_txqp)->unsignaled != RC_UNSIGNALED_INF) { \
-            (_txqp)->unsignaled_store_count++; \
-            (_txqp)->unsignaled_store += (_txqp)->unsignaled; \
-            (_txqp)->unsignaled        = RC_UNSIGNALED_INF; \
         } \
     }
 
-#define UCT_RC_CHECK_TXQP_RET(_iface, _ep, _txqp, _ret) \
-    if (uct_rc_txqp_available(_txqp) <= 0) { \
-        UCS_STATS_UPDATE_COUNTER((_txqp)->stats, UCT_RC_TXQP_STAT_QP_FULL, 1); \
+#define UCT_RC_CHECK_TXQP_RET(_iface, _ep, _ret) \
+    if (uct_rc_txqp_available(&(_ep)->txqp) <= 0) { \
+        UCS_STATS_UPDATE_COUNTER((_ep)->txqp.stats, UCT_RC_TXQP_STAT_QP_FULL, 1); \
         UCS_STATS_UPDATE_COUNTER((_ep)->super.stats, UCT_EP_STAT_NO_RES, 1); \
         return _ret; \
     }
 
-#define UCT_RC_CHECK_CQE(_iface, _ep, _txqp) \
-    UCT_RC_CHECK_CQE_RET(_iface, _ep, _txqp, UCS_ERR_NO_RESOURCE)
+#define UCT_RC_CHECK_NUM_RDMA_READ(_iface) \
+    if (ucs_unlikely((_iface)->tx.reads_available <= 0)) { \
+        UCS_STATS_UPDATE_COUNTER((_iface)->stats, \
+                                 UCT_RC_IFACE_STAT_NO_READS, 1); \
+        return UCS_ERR_NO_RESOURCE; \
+    }
 
-#define UCT_RC_CHECK_TXQP(_iface, _ep, _txqp) \
-    UCT_RC_CHECK_TXQP_RET(_iface, _ep, _txqp, UCS_ERR_NO_RESOURCE) \
+#define UCT_RC_RDMA_READ_POSTED(_iface, _length) \
+    { \
+        ucs_assert((_iface)->tx.reads_available > 0); \
+        (_iface)->tx.reads_available -= (_length); \
+    }
+
+#define UCT_RC_CHECK_RES(_iface, _ep) \
+    UCT_RC_CHECK_CQE_RET(_iface, _ep, UCS_ERR_NO_RESOURCE) \
+    UCT_RC_CHECK_TXQP_RET(_iface, _ep, UCS_ERR_NO_RESOURCE)
+
+/**
+ * All RMA and AMO operations are not allowed if no RDMA_READ credits.
+ * Otherwise operations ordering can be broken (which fence operation
+ * relies on).
+ */
+#define UCT_RC_CHECK_RMA_RES(_iface, _ep) \
+    UCT_RC_CHECK_RES(_iface, _ep) \
+    UCT_RC_CHECK_NUM_RDMA_READ(_iface)
 
 /*
  * check for FC credits and add FC protocol bits (if any)
@@ -159,14 +170,9 @@ enum {
         UCT_RC_UPDATE_FC_WND(_iface, &(_ep)->fc) \
     }
 
-#define UCT_RC_CHECK_RES(_iface, _ep) \
-    UCT_RC_CHECK_CQE(_iface, (_ep), &(_ep)->txqp) \
-    UCT_RC_CHECK_TXQP(_iface, (_ep), &(_ep)->txqp);
-
 
 /* this is a common type for all rc and dc transports */
 struct uct_rc_txqp {
-    struct ibv_qp       *qp;
     ucs_queue_head_t    outstanding;
     /* RC_UNSIGNALED_INF value forces signaled in moderation logic when
      * CQ credits are close to zero (less tx_moderation value) */
@@ -179,7 +185,7 @@ struct uct_rc_txqp {
      * exact value on each signaled completion */
     uint16_t            unsignaled_store_count;
     int16_t             available;
-    UCS_STATS_NODE_DECLARE(stats);
+    UCS_STATS_NODE_DECLARE(stats)
 };
 
 typedef struct uct_rc_fc {
@@ -187,32 +193,21 @@ typedef struct uct_rc_fc {
     int16_t             fc_wnd;
     /* used only for FC protocol at this point (3 higher bits) */
     uint8_t             flags;
-    UCS_STATS_NODE_DECLARE(stats);
+    UCS_STATS_NODE_DECLARE(stats)
 } uct_rc_fc_t;
 
 struct uct_rc_ep {
     uct_base_ep_t       super;
     uct_rc_txqp_t       txqp;
-    uint16_t            atomic_mr_offset;
-    uint8_t             sl;
-    uint8_t             path_bits;
     ucs_list_link_t     list;
     ucs_arbiter_group_t arb_group;
     uct_rc_fc_t         fc;
+    uint16_t            atomic_mr_offset;
+    uint8_t             path_index;
 };
 
-UCS_CLASS_DECLARE(uct_rc_ep_t, uct_rc_iface_t*);
+UCS_CLASS_DECLARE(uct_rc_ep_t, uct_rc_iface_t*, uint32_t, const uct_ep_params_t*);
 
-
-typedef struct uct_rc_ep_address {
-    uct_ib_uint24_t  qp_num;
-    uint8_t          atomic_mr_id;
-} UCS_S_PACKED uct_rc_ep_address_t;
-
-ucs_status_t uct_rc_ep_get_address(uct_ep_h tl_ep, uct_ep_addr_t *addr);
-
-ucs_status_t uct_rc_ep_connect_to_ep(uct_ep_h tl_ep, const uct_device_addr_t *dev_addr,
-                                     const uct_ep_addr_t *ep_addr);
 
 void uct_rc_ep_packet_dump(uct_base_iface_t *iface, uct_am_trace_type_t type,
                            void *data, size_t length, size_t valid_length,
@@ -222,6 +217,9 @@ void uct_rc_ep_get_bcopy_handler(uct_rc_iface_send_op_t *op, const void *resp);
 
 void uct_rc_ep_get_bcopy_handler_no_completion(uct_rc_iface_send_op_t *op,
                                                const void *resp);
+
+void uct_rc_ep_get_zcopy_completion_handler(uct_rc_iface_send_op_t *op,
+                                            const void *resp);
 
 void uct_rc_ep_send_op_completion_handler(uct_rc_iface_send_op_t *op,
                                           const void *resp);
@@ -236,6 +234,7 @@ void uct_rc_ep_pending_purge(uct_ep_h ep, uct_pending_purge_callback_t cb,
                              void*arg);
 
 ucs_arbiter_cb_result_t uct_rc_ep_process_pending(ucs_arbiter_t *arbiter,
+                                                  ucs_arbiter_group_t *group,
                                                   ucs_arbiter_elem_t *elem,
                                                   void *arg);
 
@@ -251,6 +250,8 @@ void uct_rc_txqp_purge_outstanding(uct_rc_txqp_t *txqp, ucs_status_t status,
 ucs_status_t uct_rc_ep_flush(uct_rc_ep_t *ep, int16_t max_available,
                              unsigned flags);
 
+ucs_status_t uct_rc_ep_check_cqe(uct_rc_iface_t *iface, uct_rc_ep_t *ep);
+
 void UCT_RC_DEFINE_ATOMIC_HANDLER_FUNC_NAME(32, 0)(uct_rc_iface_send_op_t *op,
                                                    const void *resp);
 void UCT_RC_DEFINE_ATOMIC_HANDLER_FUNC_NAME(32, 1)(uct_rc_iface_send_op_t *op,
@@ -261,7 +262,7 @@ void UCT_RC_DEFINE_ATOMIC_HANDLER_FUNC_NAME(64, 1)(uct_rc_iface_send_op_t *op,
                                                    const void *resp);
 
 ucs_status_t uct_rc_txqp_init(uct_rc_txqp_t *txqp, uct_rc_iface_t *iface,
-                              struct ibv_qp_cap *cap
+                              uint32_t qp_num
                               UCS_STATS_ARG(ucs_stats_node_t* stats_parent));
 void uct_rc_txqp_cleanup(uct_rc_txqp_t *txqp);
 
@@ -283,12 +284,6 @@ static inline void uct_rc_txqp_available_set(uct_rc_txqp_t *txqp, int16_t val)
 static inline uint16_t uct_rc_txqp_unsignaled(uct_rc_txqp_t *txqp)
 {
     return txqp->unsignaled;
-}
-
-static UCS_F_ALWAYS_INLINE void uct_rc_txqp_check(uct_rc_txqp_t *txqp)
-{
-    ucs_assertv(txqp->qp->state == IBV_QPS_RTS, "QP 0x%x state is %d",
-                txqp->qp->qp_num, txqp->qp->state);
 }
 
 static UCS_F_ALWAYS_INLINE
@@ -331,7 +326,8 @@ uct_rc_txqp_add_send_op_sn(uct_rc_txqp_t *txqp, uct_rc_iface_send_op_t *op, uint
 
 static UCS_F_ALWAYS_INLINE void
 uct_rc_txqp_add_send_comp(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp,
-                          uct_completion_t *comp, uint16_t sn, uint16_t flags)
+                          uct_rc_send_handler_t handler, uct_completion_t *comp,
+                          uint16_t sn, uint16_t flags, size_t length)
 {
     uct_rc_iface_send_op_t *op;
 
@@ -340,8 +336,10 @@ uct_rc_txqp_add_send_comp(uct_rc_iface_t *iface, uct_rc_txqp_t *txqp,
     }
 
     op            = uct_rc_iface_get_send_op(iface);
+    op->handler   = handler;
     op->user_comp = comp;
     op->flags    |= flags;
+    op->length    = length;
     uct_rc_txqp_add_send_op_sn(txqp, op, sn);
 }
 
@@ -443,6 +441,45 @@ uct_rc_fc_req_moderation(uct_rc_fc_t *fc, uct_rc_iface_t *iface)
             UCT_RC_EP_FC_FLAG_HARD_REQ :
            (fc->fc_wnd == iface->config.fc_soft_thresh) ?
             UCT_RC_EP_FC_FLAG_SOFT_REQ : 0;
+}
+
+static UCS_F_ALWAYS_INLINE int
+uct_rc_ep_fm(uct_rc_iface_t *iface, uct_ib_fence_info_t* fi, int flag)
+{
+    int fence;
+
+    /* a call to iface_fence increases beat, so if endpoint beat is not in
+     * sync with iface beat it means the endpoint did not post any WQE with
+     * fence flag yet */
+    fence          = (fi->fence_beat != iface->tx.fi.fence_beat) ? flag : 0;
+    fi->fence_beat = iface->tx.fi.fence_beat;
+    return fence;
+}
+
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_rc_ep_fence(uct_ep_h tl_ep, uct_ib_fence_info_t* fi, int fence)
+{
+    uct_rc_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_rc_iface_t);
+
+    /* in case if fence is requested and enabled by configuration
+     * we need to schedule fence for next RDMA operation */
+    if (fence && (iface->config.fence_mode != UCT_RC_FENCE_MODE_NONE)) {
+        fi->fence_beat = iface->tx.fi.fence_beat - 1;
+    }
+
+    UCT_TL_EP_STAT_FENCE(ucs_derived_of(tl_ep, uct_base_ep_t));
+    return UCS_OK;
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_rc_ep_fence_put(uct_rc_iface_t *iface, uct_ib_fence_info_t *fi,
+                    uct_rkey_t *rkey, uint64_t *addr, uint16_t offset)
+{
+    if (uct_rc_ep_fm(iface, fi, 1)) {
+        *rkey = uct_ib_resolve_atomic_rkey(*rkey, offset, addr);
+    } else {
+        *rkey = uct_ib_md_direct_rkey(*rkey);
+    }
 }
 
 #endif

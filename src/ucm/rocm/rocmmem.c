@@ -34,7 +34,7 @@ UCM_OVERRIDE_FUNC(hsa_amd_memory_pool_free, hsa_status_t)
 #endif
 
 static UCS_F_ALWAYS_INLINE void
-ucm_dispatch_mem_type_alloc(void *addr, size_t length, ucm_mem_type_t mem_type)
+ucm_dispatch_mem_type_alloc(void *addr, size_t length, ucs_memory_type_t mem_type)
 {
     ucm_event_t event;
 
@@ -45,7 +45,7 @@ ucm_dispatch_mem_type_alloc(void *addr, size_t length, ucm_mem_type_t mem_type)
 }
 
 static UCS_F_ALWAYS_INLINE void
-ucm_dispatch_mem_type_free(void *addr, size_t length, ucm_mem_type_t mem_type)
+ucm_dispatch_mem_type_free(void *addr, size_t length, ucs_memory_type_t mem_type)
 {
     ucm_event_t event;
 
@@ -60,7 +60,7 @@ static void ucm_hsa_amd_memory_pool_free_dispatch_events(void *ptr)
     size_t size;
     hsa_status_t status;
     hsa_device_type_t dev_type;
-    int mem_type = UCM_MEM_TYPE_ROCM;
+    ucs_memory_type_t mem_type = UCS_MEMORY_TYPE_ROCM;
     hsa_amd_pointer_info_t info = {
         .size = sizeof(hsa_amd_pointer_info_t),
     };
@@ -86,7 +86,7 @@ static void ucm_hsa_amd_memory_pool_free_dispatch_events(void *ptr)
         }
 
         if (dev_type != HSA_DEVICE_TYPE_GPU) {
-            mem_type= UCM_MEM_TYPE_ROCM_MANAGED;
+            mem_type = UCS_MEMORY_TYPE_ROCM_MANAGED;
         }
     }
 
@@ -113,16 +113,16 @@ hsa_status_t ucm_hsa_amd_memory_pool_allocate(
     hsa_amd_memory_pool_t memory_pool, size_t size,
     uint32_t flags, void** ptr)
 {
+    ucs_memory_type_t type = UCS_MEMORY_TYPE_ROCM;
+    uint32_t pool_flags    = 0;
     hsa_status_t status;
-    uint32_t pool_flags = 0;
-    int type = UCM_MEM_TYPE_ROCM;
 
     status = hsa_amd_memory_pool_get_info(memory_pool,
                                           HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
                                           &pool_flags);
     if (status == HSA_STATUS_SUCCESS &&
         !(pool_flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)) {
-        type = UCM_MEM_TYPE_ROCM_MANAGED;
+        type = UCS_MEMORY_TYPE_ROCM_MANAGED;
     }
 
     ucm_event_enter();
@@ -181,9 +181,20 @@ out:
     return status;
 }
 
+static void ucm_rocmmem_get_existing_alloc(ucm_event_handler_t *handler)
+{
+}
+
+static ucm_event_installer_t ucm_rocm_initializer = {
+    .install                          = ucm_rocmmem_install,
+    .get_existing_alloc               = ucm_rocmmem_get_existing_alloc,
+    .get_mem_type_current_device_info = NULL
+};
+
 UCS_STATIC_INIT {
-    static ucm_event_installer_t rocm_initializer = {
-        .func = ucm_rocmmem_install
-    };
-    ucs_list_add_tail(&ucm_event_installer_list, &rocm_initializer.list);
+    ucs_list_add_tail(&ucm_event_installer_list, &ucm_rocm_initializer.list);
+}
+
+UCS_STATIC_CLEANUP {
+    ucs_list_del(&ucm_rocm_initializer.list);
 }

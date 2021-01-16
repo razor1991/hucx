@@ -1,7 +1,7 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2013.  ALL RIGHTS RESERVED.
 * Copyright (C) ARM Ltd. 2016-2017.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -11,12 +11,14 @@
 #define UCS_PPC64_CPU_H_
 
 #include <ucs/sys/compiler.h>
+#include <ucs/type/status.h>
 #ifdef HAVE_SYS_PLATFORM_PPC_H
 #  include <sys/platform/ppc.h>
 #endif
 #include <ucs/sys/compiler_def.h>
 #include <ucs/arch/generic/cpu.h>
 #include <stdint.h>
+#include <string.h>
 
 BEGIN_C_DECLS
 
@@ -28,7 +30,7 @@ BEGIN_C_DECLS
 #define ucs_memory_bus_fence()        asm volatile ("sync"::: "memory")
 #define ucs_memory_bus_store_fence()  ucs_memory_bus_fence()
 #define ucs_memory_bus_load_fence()   ucs_memory_bus_fence()
-#define ucs_memory_bus_wc_flush()
+#define ucs_memory_bus_cacheline_wc_flush()
 #define ucs_memory_cpu_fence()        ucs_memory_bus_fence()
 #define ucs_memory_cpu_store_fence()  asm volatile ("lwsync \n" \
                                                     ::: "memory")
@@ -54,9 +56,18 @@ static inline ucs_cpu_model_t ucs_arch_get_cpu_model()
     return UCS_CPU_MODEL_UNKNOWN;
 }
 
+static inline ucs_cpu_vendor_t ucs_arch_get_cpu_vendor()
+{
+    return UCS_CPU_VENDOR_GENERIC_PPC;
+}
+
 static inline int ucs_arch_get_cpu_flag()
 {
     return UCS_CPU_FLAG_UNKNOWN;
+}
+
+static inline void ucs_cpu_init()
+{
 }
 
 double ucs_arch_get_clocks_per_sec();
@@ -73,6 +84,22 @@ static inline void ucs_arch_clear_cache(void *start, void *end)
 static inline void ucs_arch_writeback_cache(void *start, void *end)
 {
     ucs_memory_cpu_fence();
+}
+
+static inline void *ucs_memcpy_relaxed(void *dst, const void *src, size_t len)
+{
+    return memcpy(dst, src, len);
+}
+
+static UCS_F_ALWAYS_INLINE void
+ucs_memcpy_nontemporal(void *dst, const void *src, size_t len)
+{
+    memcpy(dst, src, len);
+}
+
+static inline ucs_status_t ucs_arch_get_cache_size(size_t *cache_sizes)
+{
+    return UCS_ERR_UNSUPPORTED;
 }
 
 END_C_DECLS

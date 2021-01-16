@@ -4,13 +4,18 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ugni_udt_iface.h"
 #include "ugni_udt_ep.h"
 #include <uct/ugni/base/ugni_device.h>
 #include <uct/ugni/base/ugni_md.h>
 #include <poll.h>
 
-#define UCT_UGNI_UDT_TL_NAME "ugni_udt"
+
+extern ucs_class_t UCS_CLASS_DECL_NAME(uct_ugni_udt_iface_t);
 
 static ucs_config_field_t uct_ugni_udt_iface_config_table[] = {
     {"", "ALLOC=huge,thp,mmap,heap", NULL,
@@ -155,19 +160,12 @@ static void uct_ugni_udt_iface_release_desc(uct_recv_desc_t *self, void *desc)
     ucs_mpool_put(ugni_desc);
 }
 
-static ucs_status_t uct_ugni_udt_query_tl_resources(uct_md_h md,
-                                                    uct_tl_resource_desc_t **resource_p,
-                                                    unsigned *num_resources_p)
-{
-    return uct_ugni_query_tl_resources(md, UCT_UGNI_UDT_TL_NAME,
-                                       resource_p, num_resources_p);
-}
-
 static ucs_status_t uct_ugni_udt_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 {
     uct_ugni_udt_iface_t *iface = ucs_derived_of(tl_iface, uct_ugni_udt_iface_t);
 
-    memset(iface_attr, 0, sizeof(uct_iface_attr_t));
+    uct_base_iface_query(&iface->super.super, iface_attr);
+
     iface_attr->cap.am.max_short       = iface->config.udt_seg_size -
                                          sizeof(uct_ugni_udt_header_t);
     iface_attr->cap.am.max_bcopy       = iface->config.udt_seg_size -
@@ -185,14 +183,15 @@ static ucs_status_t uct_ugni_udt_iface_query(uct_iface_h tl_iface, uct_iface_att
                                          UCT_IFACE_FLAG_CB_ASYNC;
 
     iface_attr->overhead               = 1e-6;  /* 1 usec */
-    iface_attr->latency.overhead       = 40e-6; /* 40 usec */
-    iface_attr->latency.growth         = 0;
-    iface_attr->bandwidth              = pow(1024, 2); /* bytes */
+    iface_attr->latency                = ucs_linear_func_make(40e-6, 0); /* 40 usec */
+    iface_attr->bandwidth.dedicated    = 1.0 * UCS_MBYTE; /* bytes */
+    iface_attr->bandwidth.shared       = 0;
     iface_attr->priority               = 0;
+
     return UCS_OK;
 }
 
-void uct_ugni_proccess_datagram_pipe(int event_id, void *arg) {
+void uct_ugni_proccess_datagram_pipe(int event_id, int events, void *arg) {
     uct_ugni_udt_iface_t *iface = (uct_ugni_udt_iface_t *)arg;
     uct_ugni_udt_ep_t *ep;
     uct_ugni_udt_desc_t *datagram;
@@ -337,7 +336,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ugni_udt_iface_t)
     uct_ugni_udt_clean_wildcard(self);
     ucs_async_remove_handler(ucs_async_pipe_rfd(&self->event_pipe),1);
     if (self->events_ready) {
-        uct_ugni_proccess_datagram_pipe(ucs_async_pipe_rfd(&self->event_pipe),self);
+        uct_ugni_proccess_datagram_pipe(ucs_async_pipe_rfd(&self->event_pipe),
+                                        UCS_EVENT_SET_EVREAD, self);
     }
     uct_ugni_udt_terminate_thread(self);
     pthread_join(self->event_thread, &dummy);
@@ -441,7 +441,7 @@ static UCS_CLASS_INIT_FUNC(uct_ugni_udt_iface_t, uct_md_h md, uct_worker_h worke
 
     status = ucs_async_set_event_handler(self->super.super.worker->async->mode,
                                          ucs_async_pipe_rfd(&self->event_pipe),
-                                         POLLIN,
+                                         UCS_EVENT_SET_EVREAD,
                                          uct_ugni_proccess_datagram_pipe,
                                          self, self->super.super.worker->async);
                                  
@@ -487,12 +487,6 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_ugni_udt_iface_t, uct_iface_t, uct_md_h,
                           uct_worker_h, const uct_iface_params_t*,
                           const uct_iface_config_t*);
 
-UCT_TL_COMPONENT_DEFINE(uct_ugni_udt_tl_component,
-                        uct_ugni_udt_query_tl_resources,
-                        uct_ugni_udt_iface_t,
-                        UCT_UGNI_UDT_TL_NAME,
-                        "UGNI_UDT",
-                        uct_ugni_udt_iface_config_table,
-                        uct_ugni_iface_config_t);
-
-UCT_MD_REGISTER_TL(&uct_ugni_md_component, &uct_ugni_udt_tl_component);
+UCT_TL_DEFINE(&uct_ugni_component, ugni_udt, uct_ugni_query_devices,
+              uct_ugni_udt_iface_t, "UGNI_UDT_",
+              uct_ugni_udt_iface_config_table, uct_ugni_iface_config_t);

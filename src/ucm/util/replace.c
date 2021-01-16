@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 
 #include <ucm/event/event.h>
@@ -20,15 +21,31 @@
 #include <ucs/sys/compiler.h>
 #include <ucs/sys/preprocessor.h>
 
-
+#ifndef MAP_FAILED
 #define MAP_FAILED ((void*)-1)
+#endif
 
+#ifdef PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
 pthread_mutex_t ucm_reloc_get_orig_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
-pthread_t volatile ucm_reloc_get_orig_thread = -1;
+#else
+pthread_mutex_t ucm_reloc_get_orig_lock;
+static void ucm_reloc_get_orig_lock_init(void) __attribute__((constructor(101)));
+static void ucm_reloc_get_orig_lock_init(void)
+{
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&ucm_reloc_get_orig_lock, &attr);
+}
+#endif
+pthread_t volatile ucm_reloc_get_orig_thread = (pthread_t)-1;
 
 UCM_DEFINE_REPLACE_FUNC(mmap,    void*, MAP_FAILED, void*, size_t, int, int, int, off_t)
 UCM_DEFINE_REPLACE_FUNC(munmap,  int,   -1,         void*, size_t)
+#if HAVE_MREMAP
 UCM_DEFINE_REPLACE_FUNC(mremap,  void*, MAP_FAILED, void*, size_t, size_t, int)
+#endif
 UCM_DEFINE_REPLACE_FUNC(shmat,   void*, MAP_FAILED, int, const void*, int)
 UCM_DEFINE_REPLACE_FUNC(shmdt,   int,   -1,         const void*)
 UCM_DEFINE_REPLACE_FUNC(sbrk,    void*, MAP_FAILED, intptr_t)
@@ -37,7 +54,9 @@ UCM_DEFINE_REPLACE_FUNC(madvise, int,   -1,         void*, size_t, int)
 
 UCM_DEFINE_SELECT_FUNC(mmap, void*, MAP_FAILED, SYS_mmap, void*, size_t, int, int, int, off_t)
 UCM_DEFINE_SELECT_FUNC(munmap, int, -1, SYS_munmap, void*, size_t)
+#if HAVE_MREMAP
 UCM_DEFINE_SELECT_FUNC(mremap, void*, MAP_FAILED, SYS_mremap, void*, size_t, size_t, int)
+#endif
 UCM_DEFINE_SELECT_FUNC(madvise, int, -1, SYS_madvise, void*, size_t, int)
 
 #if UCM_BISTRO_HOOKS
@@ -133,7 +152,7 @@ void *ucm_orig_sbrk(intptr_t increment)
         return ucm_orig_dlsym_sbrk(increment);
     } else {
         prev = ucm_brk_syscall(0);
-        return ucm_orig_brk(prev + increment) ? (void*)-1 : prev;
+        return ucm_orig_brk(UCS_PTR_BYTE_OFFSET(prev, increment)) ? (void*)-1 : prev;
     }
 }
 

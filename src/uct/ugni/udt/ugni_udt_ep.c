@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ugni_udt_ep.h"
 #include "ugni_udt_iface.h"
 #include <uct/ugni/base/ugni_device.h>
@@ -31,29 +35,35 @@ ucs_status_t uct_ugni_udt_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n,
 }
 
 ucs_arbiter_cb_result_t uct_ugni_udt_ep_process_pending(ucs_arbiter_t *arbiter,
+                                                        ucs_arbiter_group_t *group,
                                                         ucs_arbiter_elem_t *elem,
                                                         void *arg)
 {
+    uct_ugni_ep_t *ep       = ucs_container_of(group, uct_ugni_ep_t,
+                                               arb_group);
+    uct_ugni_iface_t *iface = ucs_derived_of(ep->super.super.iface,
+                                             uct_ugni_iface_t);
     ucs_arbiter_cb_result_t result;
-    uct_ugni_ep_t *ep = ucs_container_of(ucs_arbiter_elem_group(elem), uct_ugni_ep_t, arb_group);
-    uct_ugni_iface_t *iface = ucs_derived_of(ep->super.super.iface, uct_ugni_iface_t);
 
-    result = uct_ugni_ep_process_pending(arbiter, elem, arg);
+    result = uct_ugni_ep_process_pending(arbiter, group, elem, arg);
     if (UCS_ARBITER_CB_RESULT_REMOVE_ELEM == result) {
         uct_worker_progress_remove(iface->super.worker, &iface->super.prog);
     }
     return result;
 }
 
-static ucs_arbiter_cb_result_t uct_ugni_udt_ep_abriter_purge_cb(ucs_arbiter_t *arbiter,
-                                                                ucs_arbiter_elem_t *elem,
-                                                                void *arg)
+static ucs_arbiter_cb_result_t
+uct_ugni_udt_ep_abriter_purge_cb(ucs_arbiter_t *arbiter,
+                                 ucs_arbiter_group_t *group,
+                                 ucs_arbiter_elem_t *elem, void *arg)
 {
-    uct_ugni_ep_t *ep = ucs_container_of(ucs_arbiter_elem_group(elem), uct_ugni_ep_t, arb_group);
-    uct_ugni_iface_t *iface = ucs_derived_of(ep->super.super.iface, uct_ugni_iface_t);
+    uct_ugni_ep_t *ep       = ucs_container_of(group, uct_ugni_ep_t,
+                                               arb_group);
+    uct_ugni_iface_t *iface = ucs_derived_of(ep->super.super.iface,
+                                             uct_ugni_iface_t);
     ucs_arbiter_cb_result_t result;
 
-    result = uct_ugni_ep_abriter_purge_cb(arbiter, elem, arg);
+    result = uct_ugni_ep_abriter_purge_cb(arbiter, group, elem, arg);
     if (UCS_ARBITER_CB_RESULT_REMOVE_ELEM == result) {
         uct_worker_progress_remove(iface->super.worker, &iface->super.prog);
     }
@@ -171,17 +181,16 @@ uct_ugni_udt_ep_am_common_send(const unsigned is_short, uct_ugni_udt_ep_t *ep, u
     sheader = uct_ugni_udt_get_sheader(desc, iface);
 
     if (is_short) {
-        uint64_t *hdr = (uint64_t *)uct_ugni_udt_get_spayload(desc, iface);
-        *hdr = header;
-        memcpy((void*)(hdr + 1), payload, length);
+        uct_am_short_fill_data(uct_ugni_udt_get_spayload(desc, iface),
+                               header, payload, length);
         sheader->length = length + sizeof(header);
-        msg_length = sheader->length + sizeof(*sheader);
+        msg_length      = sheader->length + sizeof(*sheader);
         UCT_TL_EP_STAT_OP(ucs_derived_of(ep, uct_base_ep_t), AM, SHORT, sizeof(header) + length);
     } else {
-        packed_length = pack_cb((void *)uct_ugni_udt_get_spayload(desc, iface),
-                                arg);
+        packed_length   = pack_cb((void *)uct_ugni_udt_get_spayload(desc, iface),
+                                  arg);
         sheader->length = packed_length;
-        msg_length = sheader->length + sizeof(*sheader);
+        msg_length      = sheader->length + sizeof(*sheader);
         UCT_TL_EP_STAT_OP(ucs_derived_of(ep, uct_base_ep_t), AM, BCOPY, packed_length);
     }
 
@@ -190,7 +199,7 @@ uct_ugni_udt_ep_am_common_send(const unsigned is_short, uct_ugni_udt_ep_t *ep, u
                        is_short ? "TX: AM_SHORT" : "TX: AM_BCOPY");
 
     sheader->am_id = am_id;
-    sheader->type = UCT_UGNI_UDT_PAYLOAD;
+    sheader->type  = UCT_UGNI_UDT_PAYLOAD;
 
     ucs_assertv(msg_length <= GNI_DATAGRAM_MAXSIZE, "msg_length=%u", msg_length);
 

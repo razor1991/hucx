@@ -4,10 +4,15 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "log.h"
 #include "sys.h"
 
 #include <ucs/sys/compiler.h>
+#include <ucs/sys/string.h>
 #include <sys/time.h>
 #include <string.h>
 #include <stdlib.h>
@@ -17,17 +22,18 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 
+#define UCM_LOG_BUG_SIZE   512
 
-#define UCM_LOG_BUG_SIZE   256
-
-static int  ucm_log_fileno = 1; /* stdout */
-static char ucm_log_hostname[40] = {0};
+static int  ucm_log_fileno                  = 1; /* stdout */
+static char ucm_log_hostname[HOST_NAME_MAX] = {0};
 
 const char *ucm_log_level_names[] = {
     [UCS_LOG_LEVEL_FATAL] = "FATAL",
     [UCS_LOG_LEVEL_ERROR] = "ERROR",
     [UCS_LOG_LEVEL_WARN]  = "WARN",
+    [UCS_LOG_LEVEL_DIAG]  = "DIAG",
     [UCS_LOG_LEVEL_INFO]  = "INFO",
     [UCS_LOG_LEVEL_DEBUG] = "DEBUG",
     [UCS_LOG_LEVEL_TRACE] = "TRACE",
@@ -59,7 +65,7 @@ static char *ucm_log_ltoa(char *p, char *end, long n, int base, int flags,
                           int pad)
 {
     static const char digits[] = "0123456789abcdef";
-    long div;
+    long divider;
 
     if (((n < 0) || (flags & UCM_LOG_LTOA_FLAG_SIGN)) && (p < end)) {
         *(p++) = (n < 0 ) ? '-' : '+';
@@ -74,9 +80,9 @@ static char *ucm_log_ltoa(char *p, char *end, long n, int base, int flags,
 
     n = labs(n);
 
-    div = 1;
-    while ((n / div) != 0) {
-        div *= base;
+    divider = 1;
+    while ((n / divider) != 0) {
+        divider *= base;
         --pad;
     }
 
@@ -85,10 +91,10 @@ static char *ucm_log_ltoa(char *p, char *end, long n, int base, int flags,
                                 (flags & UCM_LOG_LTOA_FLAG_PAD0) ? '0' : ' ');
     }
 
-    div /= base;
-    while ((p < end) && (div > 0)) {
-        *(p++) = digits[(n / div + base) % base];
-        div /= base;
+    divider /= base;
+    while ((p < end) && (divider > 0)) {
+        *(p++) = digits[(n / divider + base) % base];
+        divider /= base;
     }
 
     if (flags & UCM_LOG_LTOA_PAD_LEFT) {
@@ -258,7 +264,7 @@ void __ucm_log(const char *file, unsigned line, const char *function,
     gettimeofday(&tv, NULL);
     ucm_log_snprintf(buf, UCM_LOG_BUG_SIZE - 1, "[%lu.%06lu] [%s:%d] %18s:%-4d UCX  %s ",
                      tv.tv_sec, tv.tv_usec, ucm_log_hostname, getpid(),
-                     basename(file), line, ucm_log_level_names[level]);
+                     ucs_basename(file), line, ucm_log_level_names[level]);
     buf[UCM_LOG_BUG_SIZE - 1] = '\0';
 
     length = strlen(buf);

@@ -8,6 +8,7 @@
 extern "C" {
 #include <ucp/core/ucp_context.h>
 #include <ucp/core/ucp_mm.h>
+#include <ucp/core/ucp_ep.inl>
 }
 
 class test_ucp_mmap : public test_ucp_memheap {
@@ -24,6 +25,11 @@ public:
         } else {
             return UCP_MEM_MAP_NONBLOCK;
         }
+    }
+
+    virtual void init() {
+        ucs::skip_on_address_sanitizer();
+        test_ucp_memheap::init();
     }
 
 protected:
@@ -76,10 +82,13 @@ bool test_ucp_mmap::resolve_amo(entity *e, ucp_rkey_h rkey)
 
 bool test_ucp_mmap::resolve_rma_bw(entity *e, ucp_rkey_h rkey)
 {
+    ucp_ep_config_t *ep_config = ucp_ep_config(e->ep());
     ucp_lane_index_t lane;
     uct_rkey_t uct_rkey;
 
-    lane = ucp_rkey_get_rma_bw_lane(rkey, e->ep(), UCT_MD_MEM_TYPE_HOST, &uct_rkey, 0);
+    lane = ucp_rkey_find_rma_lane(e->ucph(), ep_config, UCS_MEMORY_TYPE_HOST,
+                                  ep_config->tag.rndv.get_zcopy_lanes, rkey, 0,
+                                  &uct_rkey);
     if (lane != UCP_NULL_LANE) {
         return true;
     } else {
@@ -112,6 +121,9 @@ void test_ucp_mmap::test_rkey_management(entity *e, ucp_mem_h memh, bool is_dumm
         return;
     }
     ASSERT_UCS_OK(status);
+
+    /* Test ucp_rkey_packed_md_map() */
+    EXPECT_EQ(rkey->md_map, ucp_rkey_packed_md_map(rkey_buffer));
 
     bool have_rma    = resolve_rma(e, rkey);
     bool have_amo    = resolve_amo(e, rkey);
@@ -153,7 +165,7 @@ UCS_TEST_P(test_ucp_mmap, alloc) {
     sender().connect(&sender(), get_ep_params());
 
     for (int i = 0; i < 1000 / ucs::test_time_multiplier(); ++i) {
-        size_t size = ucs::rand() % (1024 * 1024);
+        size_t size = ucs::rand() % (UCS_MBYTE);
 
         ucp_mem_h memh;
         ucp_mem_map_params_t params;
@@ -184,7 +196,7 @@ UCS_TEST_P(test_ucp_mmap, reg) {
     sender().connect(&sender(), get_ep_params());
 
     for (int i = 0; i < 1000 / ucs::test_time_multiplier(); ++i) {
-        size_t size = ucs::rand() % (1024 * 1024);
+        size_t size = ucs::rand() % (UCS_MBYTE);
 
         void *ptr = malloc(size);
         ucs::fill_random(ptr, size);
@@ -261,7 +273,7 @@ UCS_TEST_P(test_ucp_mmap, alloc_advise) {
 
     sender().connect(&sender(), get_ep_params());
 
-    size_t size = 128 * (1024 * 1024);
+    size_t size = 128 * UCS_MBYTE;
 
     ucp_mem_h memh;
     ucp_mem_map_params_t params;
@@ -306,7 +318,7 @@ UCS_TEST_P(test_ucp_mmap, reg_advise) {
 
     sender().connect(&sender(), get_ep_params());
 
-    size_t size = 128 * 1024 * 1024;
+    size_t size = 128 * UCS_MBYTE;
 
     void *ptr = malloc(size);
     ucs::fill_random(ptr, size);

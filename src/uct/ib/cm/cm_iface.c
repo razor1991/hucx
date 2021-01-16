@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "cm.h"
 
 #include <uct/api/uct.h>
@@ -16,7 +20,7 @@
 
 
 static ucs_config_field_t uct_cm_iface_config_table[] = {
-  {"IB_", "RX_INLINE=0", NULL,
+  {UCT_IB_CONFIG_PREFIX, "RX_INLINE=0", NULL,
    ucs_offsetof(uct_cm_iface_config_t, super), UCS_CONFIG_TYPE_TABLE(uct_ib_iface_config_table)},
 
   {"TIMEOUT", "300ms", "Timeout for MAD layer",
@@ -191,7 +195,7 @@ static void uct_cm_iface_outstanding_purge(uct_cm_iface_t *iface)
     iface->num_outstanding = 0;
 }
 
-static void uct_cm_iface_event_handler(int fd, void *arg)
+static void uct_cm_iface_event_handler(int fd, int events, void *arg)
 {
     uct_cm_iface_t *iface = arg;
     struct ib_cm_event *event;
@@ -260,7 +264,8 @@ static void uct_cm_iface_event_handler(int fd, void *arg)
 static void uct_cm_iface_release_desc(uct_recv_desc_t *self, void *desc)
 {
     uct_ib_iface_t *iface = ucs_container_of(self, uct_ib_iface_t, release_desc);
-    ucs_free(desc - iface->config.rx_headroom_offset);
+    /* Don't use UCS_PTR_BYTE_OFFSET here due to coverity false positive report */
+    ucs_free((char*)desc - iface->config.rx_headroom_offset);
 }
 
 static UCS_CLASS_INIT_FUNC(uct_cm_iface_t, uct_md_h md, uct_worker_h worker,
@@ -274,10 +279,10 @@ static UCS_CLASS_INIT_FUNC(uct_cm_iface_t, uct_md_h md, uct_worker_h worker,
 
     ucs_trace_func("");
 
-    init_attr.tx_cq_len      = 1;
-    init_attr.rx_cq_len      = config->super.rx.queue_len;
-    init_attr.seg_size       = ucs_min(IB_CM_SIDR_REQ_PRIVATE_DATA_SIZE,
-                                       config->super.super.max_bcopy);
+    init_attr.cq_len[UCT_IB_DIR_TX] = 1;
+    init_attr.cq_len[UCT_IB_DIR_RX] = config->super.rx.queue_len;
+    init_attr.seg_size              = ucs_min(IB_CM_SIDR_REQ_PRIVATE_DATA_SIZE,
+                                              config->super.seg_size);
 
     UCS_CLASS_CALL_SUPER_INIT(uct_ib_iface_t, &uct_cm_iface_ops, md, worker,
                               params, &config->super, &init_attr);
@@ -346,7 +351,7 @@ static UCS_CLASS_INIT_FUNC(uct_cm_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     status = ucs_async_set_event_handler(self->super.super.worker->async->mode,
-                                         self->cmdev->fd, POLLIN,
+                                         self->cmdev->fd, UCS_EVENT_SET_EVREAD,
                                          uct_cm_iface_event_handler, self,
                                          self->super.super.worker->async);
     if (status != UCS_OK) {
@@ -450,20 +455,18 @@ static uct_ib_iface_ops_t uct_cm_iface_ops = {
     .iface_is_reachable       = uct_ib_iface_is_reachable
     },
     .create_cq                = uct_ib_verbs_create_cq,
-    .arm_cq                   = (void*)ucs_empty_function_return_success,
-    .init_res_domain          = (void*)ucs_empty_function_return_success,
-    .cleanup_res_domain       = (void*)ucs_empty_function,
+    .arm_cq                   = ucs_empty_function_return_success,
 };
 
-static int uct_cm_is_module_loaded(uct_md_h md)
+static int uct_cm_is_module_loaded(uct_ib_md_t *ib_md)
 {
     struct ib_cm_device *cmdev = NULL;
 
-    cmdev = ib_cm_open_device(ucs_derived_of(md, uct_ib_md_t)->dev.ibv_context);
+    cmdev = ib_cm_open_device(ib_md->dev.ibv_context);
     if (cmdev == NULL) {
         ucs_debug("ib_cm_open_device() for %s failed: %m. "
                   "Check if ib_ucm.ko module is loaded.",
-                  uct_ib_device_name(&ucs_derived_of(md, uct_ib_md_t)->dev));
+                  uct_ib_device_name(&ib_md->dev));
         return 0;
     }
 
@@ -471,26 +474,21 @@ static int uct_cm_is_module_loaded(uct_md_h md)
     return 1;
 }
 
-static ucs_status_t uct_cm_query_resources(uct_md_h md,
-                                           uct_tl_resource_desc_t **resources_p,
-                                           unsigned *num_resources_p)
+static ucs_status_t
+uct_cm_query_tl_devices(uct_md_h md, uct_tl_device_resource_t **tl_devices_p,
+                        unsigned *num_tl_devices_p)
 {
-    if (uct_cm_is_module_loaded(md)) {
-        return uct_ib_device_query_tl_resources(&ucs_derived_of(md, uct_ib_md_t)->dev,
-                                                "cm", UCT_IB_DEVICE_FLAG_LINK_IB,
-                                                resources_p, num_resources_p);
-    } else {
-        *num_resources_p = 0;
-        *resources_p     = NULL;
+    uct_ib_md_t *ib_md = ucs_derived_of(md, uct_ib_md_t);
+
+    if (!uct_cm_is_module_loaded(ib_md)) {
+        *num_tl_devices_p = 0;
+        *tl_devices_p     = NULL;
         return UCS_OK;
     }
+
+   return uct_ib_device_query_ports(&ib_md->dev, UCT_IB_DEVICE_FLAG_LINK_IB,
+                                    tl_devices_p, num_tl_devices_p);
 }
 
-UCT_TL_COMPONENT_DEFINE(uct_cm_tl,
-                        uct_cm_query_resources,
-                        uct_cm_iface_t,
-                        "cm",
-                        "CM_",
-                        uct_cm_iface_config_table,
-                        uct_cm_iface_config_t);
-UCT_MD_REGISTER_TL(&uct_ib_mdc, &uct_cm_tl);
+UCT_TL_DEFINE(&uct_ib_component, cm, uct_cm_query_tl_devices, uct_cm_iface_t,
+              "CM_", uct_cm_iface_config_table, uct_cm_iface_config_t);

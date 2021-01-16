@@ -13,12 +13,11 @@ AS_IF([test "x$with_xpmem" != "xno"],
       [AS_IF([test ! -d "$with_xpmem"],
              [
               AC_MSG_NOTICE([XPMEM - failed to open the requested location ($with_xpmem), guessing ...])
-              PKG_CHECK_MODULES(
-                  [CRAY_XPMEM], [cray-xpmem],
+              AS_IF([$PKG_CONFIG --exists cray-xpmem],
                   [
                    xpmem_happy=yes
-                   AC_SUBST(XPMEM_CPPFLAGS, "$CRAY_XPMEM_CFLAGS")
-                   AC_SUBST(XPMEM_LDFLAGS,  "$CRAY_XPMEM_LIBS")
+                   AC_SUBST(XPMEM_CFLAGS, [`$PKG_CONFIG --cflags cray-xpmem`])
+                   AC_SUBST(XPMEM_LIBS,   [`$PKG_CONFIG --libs   cray-xpmem`])
                   ],
                   [
                    # If cray-xpmem module not found in pkg-config, try to search
@@ -29,15 +28,29 @@ AS_IF([test "x$with_xpmem" != "xno"],
               ])
        ])
 
-# Verify XPMEM header file
+# Verify XPMEM lib and header files
 AS_IF([test "x$xpmem_happy" = "xno" -a -d "$with_xpmem"],
-      [AC_CHECK_HEADER([$with_xpmem/include/xpmem.h],
-                       [AC_SUBST(XPMEM_CPPFLAGS, "-I$with_xpmem/include")
-                        AC_SUBST(XPMEM_LDFLAGS,  "-L$with_xpmem/lib -lxpmem")
+      [
+       save_LDFLAGS="$LDFLAGS"
+       save_CPPFLAGS="$CPPFLAGS"
+       LDFLAGS="$LDFLAGS -L$with_xpmem/lib -lxpmem"
+       CPPFLAGS="$CPPFLAGS -I$with_xpmem/include"
+       AC_CHECK_LIB([xpmem],
+                    [xpmem_init],
+                    [AC_CHECK_HEADER([xpmem.h],
+                       [AC_SUBST(XPMEM_CFLAGS, "-I$with_xpmem/include")
+                        AC_SUBST(XPMEM_LIBS,   "-L$with_xpmem/lib -lxpmem")
                         xpmem_happy="yes"],
-                       [AC_MSG_WARN([cray-xpmem header was not found in $with_xpmem])])
-       ])
+                       [AC_MSG_WARN([cray-xpmem header was not found in $with_xpmem])]
+                      )
+                    ],
+                    [AC_MSG_WARN([cray-xpmem lib was not found in $with_xpmem])]
+                   )
+       LDFLAGS="$save_LDFLAGS"
+       CPPFLAGS="$save_CPPFLAGS"
+      ]
+     )
 
-AS_IF([test "x$xpmem_happy" = "xyes"], [uct_modules+=":xpmem"])
+AS_IF([test "x$xpmem_happy" = "xyes"], [uct_modules="${uct_modules}:xpmem"])
 AM_CONDITIONAL([HAVE_XPMEM], [test "x$xpmem_happy" != "xno"])
 AC_CONFIG_FILES([src/uct/sm/mm/xpmem/Makefile])

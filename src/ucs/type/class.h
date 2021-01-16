@@ -34,6 +34,8 @@ struct ucs_class {
 /*
  * Helper: Define names of class-related identifiers.
  */
+#define UCS_CLASS_DECL_NAME(_type) \
+    _UCS_CLASS_DECL_NAME(_type)
 #define _UCS_CLASS_DECL_NAME(_type) \
     UCS_PP_TOKENPASTE(_type, _class)
 #define _UCS_CLASS_INIT_NAME(_type) \
@@ -91,19 +93,18 @@ struct ucs_class {
  */
 #define UCS_CLASS_INIT(_type, _obj, ...) \
     ({ \
-        extern ucs_class_t _UCS_CLASS_DECL_NAME(_type); \
-        ucs_class_t *cls = &_UCS_CLASS_DECL_NAME(_type); \
-        int init_count = 1; \
-        ucs_status_t status; \
+        ucs_class_t *_cls = &_UCS_CLASS_DECL_NAME(_type); \
+        int _init_counter = 1; \
+        ucs_status_t __status; \
         \
-        status = _UCS_CLASS_INIT_NAME(_type)((_type*)(_obj), cls, &init_count, \
-                                             ## __VA_ARGS__); \
-        if ((status != UCS_OK) && (status != UCS_INPROGRESS)) { \
+        __status = _UCS_CLASS_INIT_NAME(_type)((_type*)(_obj), _cls, \
+                                             &_init_counter, ## __VA_ARGS__); \
+        if (__status != UCS_OK) { \
             ucs_class_call_cleanup_chain(&_UCS_CLASS_DECL_NAME(_type), \
-                                         (_obj), init_count); \
+                                         (_obj), _init_counter); \
         } \
         \
-        (status); \
+        (__status); \
     })
 
 
@@ -125,7 +126,6 @@ struct ucs_class {
  */
 #define UCS_CLASS_CLEANUP(_type, _obj) \
     { \
-        extern ucs_class_t _UCS_CLASS_DECL_NAME(_type); \
         UCS_CLASS_CLEANUP_CALL(&_UCS_CLASS_DECL_NAME(_type), _obj); \
     }
 
@@ -143,24 +143,23 @@ struct ucs_class {
     _UCS_CLASS_NEW (_type, _obj, ## __VA_ARGS__)
 #define _UCS_CLASS_NEW(_type, _obj, ...) \
     ({ \
-        extern ucs_class_t _UCS_CLASS_DECL_NAME(_type); \
         ucs_class_t *cls = &_UCS_CLASS_DECL_NAME(_type); \
-        ucs_status_t status; \
+        ucs_status_t _status; \
         void *obj; \
         \
         obj = ucs_class_malloc(cls); \
         if (obj != NULL) { \
-            status = UCS_CLASS_INIT(_type, obj, ## __VA_ARGS__); \
-            if (status == UCS_OK) { \
+            _status = UCS_CLASS_INIT(_type, obj, ## __VA_ARGS__); \
+            if (_status == UCS_OK) { \
                 *(_obj) = (typeof(*(_obj)))obj; /* Success - assign pointer */ \
             } else { \
                 ucs_class_free(obj); /* Initialization failure */ \
             } \
         } else { \
-            status = UCS_ERR_NO_MEMORY; /* Allocation failure */ \
+            _status = UCS_ERR_NO_MEMORY; /* Allocation failure */ \
         } \
         \
-        (status); \
+        (_status); \
     })
 
 
@@ -187,10 +186,10 @@ struct ucs_class {
 #define UCS_CLASS_CALL_SUPER_INIT(_superclass, ...) \
     { \
         { \
-            ucs_status_t status = _UCS_CLASS_INIT_NAME(_superclass)\
+            ucs_status_t _status = _UCS_CLASS_INIT_NAME(_superclass)\
                     (&self->super, _myclass->superclass, _init_count, ## __VA_ARGS__); \
-            if (status != UCS_OK) { \
-                return status; \
+            if (_status != UCS_OK) { \
+                return _status; \
             } \
             if (_myclass->superclass != &_UCS_CLASS_DECL_NAME(void)) { \
                 ++(*_init_count); \
@@ -221,9 +220,15 @@ struct ucs_class {
                                       _argtype **obj_p)
 #define UCS_CLASS_DEFINE_NAMED_NEW_FUNC(_name, _type, _argtype, ...) \
     UCS_CLASS_DECLARE_NAMED_NEW_FUNC(_name, _argtype, ## __VA_ARGS__) { \
-        return UCS_CLASS_NEW(_type, obj_p \
-                             UCS_PP_FOREACH(_UCS_CLASS_INIT_ARG_PASS, _, \
-                                            UCS_PP_SEQ(UCS_PP_NUM_ARGS(__VA_ARGS__)))); \
+        ucs_status_t status; \
+        \
+        *obj_p = NULL; \
+        \
+        status = UCS_CLASS_NEW(_type, obj_p \
+                               UCS_PP_FOREACH(_UCS_CLASS_INIT_ARG_PASS, _, \
+                                              UCS_PP_SEQ(UCS_PP_NUM_ARGS(__VA_ARGS__)))); \
+        ucs_class_check_new_func_result(status, *obj_p); \
+        return status; \
     }
 #define UCS_CLASS_DECLARE_NEW_FUNC(_type, _argtype, ...) \
     UCS_CLASS_DECLARE_NAMED_NEW_FUNC(UCS_CLASS_NEW_FUNC_NAME(_type), _argtype, ## __VA_ARGS__)
@@ -293,10 +298,14 @@ void ucs_class_call_cleanup_chain(ucs_class_t *cls, void *obj, int limit);
 
 
 /*
- * Helpers: Allocate/release objects.
+ * Helpers:
  */
+/* Allocate objects */
 void *ucs_class_malloc(ucs_class_t *cls);
+/* Release objects */
 void ucs_class_free(void *obj);
+/* Check new function result */
+void ucs_class_check_new_func_result(ucs_status_t status, void *obj);
 
 
 /**

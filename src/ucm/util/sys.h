@@ -9,6 +9,8 @@
 #define UCM_UTIL_SYS_H_
 
 #include <stddef.h>
+#include <ucs/sys/topo.h>
+#include <ucs/memory/memory_type.h>
 
 
 /*
@@ -29,10 +31,12 @@ void *ucm_sys_realloc(void *oldptr, size_t newsize);
  * @param [in] addr     Mapping start address.
  * @param [in] length   Mapping length.
  * @param [in] prot     Mapping memory protection flags (PROT_xx).
+ * @param [in] path     Backing file path, or NULL for anonymous mapping.
  *
  * @return 0 to continue iteration, nonzero - stop iteration.
  */
-typedef int (*ucm_proc_maps_cb_t)(void *arg, void *addr, size_t length, int prot);
+typedef int (*ucm_proc_maps_cb_t)(void *arg, void *addr, size_t length,
+                                  int prot, const char *path);
 
 
 /**
@@ -72,5 +76,28 @@ void ucm_strerror(int eno, char *buf, size_t max);
 
 void ucm_prevent_dl_unload();
 
+
+/*
+ * Concatenate directory and file names into full path.
+ *
+ * @param buffer        Filled with the result path.
+ * @param max           Maximal buffer size.
+ * @param dir           Directory name.
+ * @param file          File name.
+ *
+ * @return Result buffer.
+ */
+char *ucm_concat_path(char *buffer, size_t max, const char *dir, const char *file);
+
+
+/*
+ * Get device information associated with memory type
+ *
+ * @param [in]  memtype       Memory type.
+ * @param [out] bus_id        Bus ID.
+ *
+ * @return Status code
+ */
+ucs_status_t ucm_get_mem_type_current_device_info(ucs_memory_type_t memtype, ucs_sys_bus_id_t *bus_id);
 
 #endif

@@ -12,20 +12,26 @@
 #include <uct/cuda/base/cuda_iface.h>
 
 
-#define UCT_CUDA_IPC_MD_NAME      "cuda_ipc"
-#define UCT_CUDA_IPC_MAX_ALLOC_SZ (1 << 30)
-
-
-extern uct_md_component_t uct_cuda_ipc_md_component;
-
-
 /**
  * @brief cuda ipc MD descriptor
  */
 typedef struct uct_cuda_ipc_md {
     struct uct_md super;   /**< Domain info */
+    CUuuid*       uuid_map;
+    char*         peer_accessible_cache;
+    int           uuid_map_size;
+    int           uuid_map_capacity;
 } uct_cuda_ipc_md_t;
 
+/**
+ * @brief cuda ipc component extension
+ */
+typedef struct uct_cuda_ipc_component {
+    uct_component_t    super;
+    uct_cuda_ipc_md_t* md;
+} uct_cuda_ipc_component_t;
+
+extern uct_cuda_ipc_component_t uct_cuda_ipc_component;
 
 /**
  * @brief cuda ipc domain configuration.
@@ -43,12 +49,23 @@ typedef struct uct_cuda_ipc_key {
     CUdeviceptr    d_bptr;       /* Allocation base address */
     size_t         b_len;        /* Allocation size */
     int            dev_num;      /* GPU Device number */
+    CUuuid         uuid;         /* GPU Device UUID */
 } uct_cuda_ipc_key_t;
 
 
-#define UCT_CUDA_IPC_GET_DEVICE(_cu_device)                             \
+#define UCT_CUDA_IPC_GET_DEVICE(_cu_device)                          \
+    do {                                                             \
+        if (UCS_OK !=                                                \
+            UCT_CUDADRV_FUNC_LOG_ERR(cuCtxGetDevice(&_cu_device))) { \
+            return UCS_ERR_IO_ERROR;                                 \
+        }                                                            \
+    } while(0);
+
+
+#define UCT_CUDA_IPC_DEVICE_GET_COUNT(_num_device)                      \
     do {                                                                \
-        if (UCS_OK != UCT_CUDADRV_FUNC(cuCtxGetDevice(&_cu_device))) {  \
+        if (UCS_OK !=                                                   \
+            UCT_CUDADRV_FUNC_LOG_ERR(cuDeviceGetCount(&_num_device))) { \
             return UCS_ERR_IO_ERROR;                                    \
         }                                                               \
     } while(0);

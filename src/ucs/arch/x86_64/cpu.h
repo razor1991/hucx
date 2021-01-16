@@ -1,7 +1,7 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2013.  ALL RIGHTS RESERVED.
 * Copyright (C) ARM Ltd. 2016-2017.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -13,8 +13,10 @@
 #include <ucs/arch/generic/cpu.h>
 #include <ucs/sys/compiler_def.h>
 #include <ucs/config/types.h>
+#include <ucs/config/global_opts.h>
 #include <ucs/sys/math.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __SSE4_1__
 #  include <smmintrin.h>
@@ -36,7 +38,7 @@ BEGIN_C_DECLS
 #define ucs_memory_bus_fence()        asm volatile ("mfence"::: "memory")
 #define ucs_memory_bus_store_fence()  asm volatile ("sfence" ::: "memory")
 #define ucs_memory_bus_load_fence()   asm volatile ("lfence" ::: "memory")
-#define ucs_memory_bus_wc_flush()
+#define ucs_memory_bus_cacheline_wc_flush()
 #define ucs_memory_cpu_fence()        ucs_compiler_fence()
 #define ucs_memory_cpu_store_fence()  ucs_compiler_fence()
 #define ucs_memory_cpu_load_fence()   ucs_compiler_fence()
@@ -49,6 +51,10 @@ double ucs_x86_init_tsc_freq();
 
 ucs_cpu_model_t ucs_arch_get_cpu_model() UCS_F_NOOPTIMIZE;
 ucs_cpu_flag_t ucs_arch_get_cpu_flag() UCS_F_NOOPTIMIZE;
+ucs_cpu_vendor_t ucs_arch_get_cpu_vendor();
+void ucs_cpu_init();
+ucs_status_t ucs_arch_get_cache_size(size_t *cache_sizes);
+void ucs_x86_memcpy_sse_movntdqa(void *dst, const void *src, size_t len);
 
 static inline int ucs_arch_x86_rdtsc_enabled()
 {
@@ -94,6 +100,31 @@ static inline void ucs_arch_writeback_cache(void *start, void *end)
         _mm_clwb(start);
     }
 #endif
+}
+
+static inline void *ucs_memcpy_relaxed(void *dst, const void *src, size_t len)
+{
+#if ENABLE_BUILTIN_MEMCPY
+    if (ucs_unlikely((len > ucs_global_opts.arch.builtin_memcpy_min) &&
+                     (len < ucs_global_opts.arch.builtin_memcpy_max))) {
+        asm volatile ("rep movsb"
+                      : "=D" (dst),
+                      "=S" (src),
+                      "=c" (len)
+                      : "0" (dst),
+                      "1" (src),
+                      "2" (len)
+                      : "memory");
+        return dst;
+    }
+#endif
+    return memcpy(dst, src, len);
+}
+
+static UCS_F_ALWAYS_INLINE void
+ucs_memcpy_nontemporal(void *dst, const void *src, size_t len)
+{
+    ucs_x86_memcpy_sse_movntdqa(dst, src, len);
 }
 
 END_C_DECLS

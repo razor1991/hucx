@@ -8,17 +8,25 @@
 #ifndef UCT_TEST_MD
 #define UCT_TEST_MD
 
-#include <common/test.h>
-#include <uct/api/uct.h>
+#include "uct_test.h"
 
 
-class test_md : public testing::TestWithParam<std::string>,
-                public ucs::test_base
+struct test_md_param {
+    uct_component_h  component;
+    std::string      md_name;
+};
+
+static std::ostream& operator<<(std::ostream& os, const test_md_param& md_param) {
+    return os << md_param.md_name;
+}
+
+class test_md : public testing::TestWithParam<test_md_param>,
+                public uct_test_base
 {
 public:
     UCS_TEST_BASE_IMPL;
 
-    static std::vector<std::string> enum_mds(const std::string& mdc_name);
+    static std::vector<test_md_param> enum_mds(const std::string& cmpt_name);
 
     test_md();
 
@@ -27,10 +35,12 @@ protected:
     virtual void cleanup();
     virtual void modify_config(const std::string& name, const std::string& value,
                                bool optional);
-    void check_caps(uint64_t flags, const std::string& name);
-    void alloc_memory(void **address, size_t size, char *fill, int mem_type);
-    void check_memory(void *address, void *expect, size_t size, int mem_type);
-    void free_memory(void *address, int mem_type);
+    bool check_caps(uint64_t flags);
+    void alloc_memory(void **address, size_t size, char *fill,
+                      ucs_memory_type_t mem_type);
+    void check_memory(void *address, void *expect, size_t size,
+                      ucs_memory_type_t mem_type);
+    void free_memory(void *address, ucs_memory_type_t mem_type);
 
     void test_registration();
 
@@ -44,7 +54,6 @@ protected:
 
 
     static void* alloc_thread(void *arg);
-    static std::string const mem_types[];
 
 private:
     ucs::handle<uct_md_config_t*> m_md_config;
@@ -53,7 +62,7 @@ private:
 };
 
 
-#define _UCT_MD_INSTANTIATE_TEST_CASE(_test_case, _mdc_name) \
-    INSTANTIATE_TEST_CASE_P(_mdc_name, _test_case, \
-                            testing::ValuesIn(_test_case::enum_mds(#_mdc_name)));
+#define _UCT_MD_INSTANTIATE_TEST_CASE(_test_case, _cmpt_name) \
+    INSTANTIATE_TEST_CASE_P(_cmpt_name, _test_case, \
+                            testing::ValuesIn(_test_case::enum_mds(#_cmpt_name)));
 #endif

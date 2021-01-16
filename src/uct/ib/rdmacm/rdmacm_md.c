@@ -1,11 +1,16 @@
 /**
- * Copyright (C) Mellanox Technologies Ltd. 2017.  ALL RIGHTS RESERVED.
+ * Copyright (C) Mellanox Technologies Ltd. 2017-219.  ALL RIGHTS RESERVED.
+ * Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
  * See file LICENSE for terms.
  */
 
-#include "rdmacm_md.h"
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
-#define UCT_RDMACM_MD_PREFIX              "rdmacm"
+#include "rdmacm_md.h"
+#include "rdmacm_cm.h"
+
 
 static ucs_config_field_t uct_rdmacm_md_config_table[] = {
   {"", "", NULL,
@@ -21,10 +26,10 @@ static ucs_config_field_t uct_rdmacm_md_config_table[] = {
 static void uct_rdmacm_md_close(uct_md_h md);
 
 static uct_md_ops_t uct_rdmacm_md_ops = {
-    .close                  = uct_rdmacm_md_close,
-    .query                  = uct_rdmacm_md_query,
-    .is_sockaddr_accessible = uct_rdmacm_is_sockaddr_accessible,
-    .is_mem_type_owned      = (void *)ucs_empty_function_return_zero,
+    .close                   = uct_rdmacm_md_close,
+    .query                   = uct_rdmacm_md_query,
+    .is_sockaddr_accessible  = uct_rdmacm_is_sockaddr_accessible,
+    .detect_memory_type      = ucs_empty_function_return_unsupported,
 };
 
 static void uct_rdmacm_md_close(uct_md_h md)
@@ -35,28 +40,30 @@ static void uct_rdmacm_md_close(uct_md_h md)
 
 ucs_status_t uct_rdmacm_md_query(uct_md_h md, uct_md_attr_t *md_attr)
 {
-    md_attr->cap.flags         = UCT_MD_FLAG_SOCKADDR;
-    md_attr->cap.reg_mem_types = 0;
-    md_attr->cap.mem_type      = UCT_MD_MEM_TYPE_HOST;
-    md_attr->cap.max_alloc     = 0;
-    md_attr->cap.max_reg       = 0;
-    md_attr->rkey_packed_size  = 0;
-    md_attr->reg_cost.overhead = 0;
-    md_attr->reg_cost.growth   = 0;
+    md_attr->cap.flags            = UCT_MD_FLAG_SOCKADDR;
+    md_attr->cap.reg_mem_types    = 0;
+    md_attr->cap.access_mem_type  = UCS_MEMORY_TYPE_HOST;
+    md_attr->cap.detect_mem_types = 0;
+    md_attr->cap.max_alloc        = 0;
+    md_attr->cap.max_reg          = 0;
+    md_attr->rkey_packed_size     = 0;
+    md_attr->reg_cost             = ucs_linear_func_make(0, 0);
     memset(&md_attr->local_cpus, 0xff, sizeof(md_attr->local_cpus));
     return UCS_OK;
 }
 
-static int uct_rdmacm_get_event_type(struct rdma_event_channel *event_ch)
+static enum rdma_cm_event_type
+uct_rdmacm_get_event_type(struct rdma_event_channel *event_ch)
 {
+    enum rdma_cm_event_type event_type;
     struct rdma_cm_event *event;
-    int ret, event_type;
+    int ret;
 
     /* Fetch an event */
     ret = rdma_get_cm_event(event_ch, &event);
     if (ret) {
         ucs_warn("rdma_get_cm_event() failed: %m");
-        return 0;
+        return RDMA_CM_EVENT_ADDR_RESOLVED;
     }
 
     event_type = event->event;
@@ -73,8 +80,8 @@ static int uct_rdmacm_is_addr_route_resolved(struct rdma_cm_id *cm_id,
                                              int timeout_ms)
 {
     char ip_port_str[UCS_SOCKADDR_STRING_LEN];
+    enum rdma_cm_event_type event_type;
     ucs_status_t status;
-    int event_type;
 
     status = uct_rdmacm_resolve_addr(cm_id, addr, timeout_ms, UCS_LOG_LEVEL_DEBUG);
     if (status != UCS_OK) {
@@ -112,25 +119,6 @@ static int uct_rdmacm_is_addr_route_resolved(struct rdma_cm_id *cm_id,
     return 1;
 }
 
-static int uct_rdmacm_is_sockaddr_inaddr_any(struct sockaddr *addr)
-{
-    struct sockaddr_in6 *addr_in6;
-    struct sockaddr_in *addr_in;
-
-    switch (addr->sa_family) {
-    case AF_INET:
-        addr_in = (struct sockaddr_in *)addr;
-        return addr_in->sin_addr.s_addr == INADDR_ANY;
-    case AF_INET6:
-        addr_in6 = (struct sockaddr_in6 *)addr;
-        return !memcmp(&addr_in6->sin6_addr, &in6addr_any, sizeof(addr_in6->sin6_addr));
-    default:
-        ucs_debug("Invalid address family: %d", addr->sa_family);
-    }
-
-    return 0;
-}
-
 int uct_rdmacm_is_sockaddr_accessible(uct_md_h md, const ucs_sock_addr_t *sockaddr,
                                       uct_sockaddr_accessibility_t mode)
 {
@@ -165,7 +153,7 @@ int uct_rdmacm_is_sockaddr_accessible(uct_md_h md, const ucs_sock_addr_t *sockad
             goto out_destroy_id;
         }
 
-        if (uct_rdmacm_is_sockaddr_inaddr_any((struct sockaddr *)sockaddr->addr)) {
+        if (ucs_sockaddr_is_inaddr_any((struct sockaddr *)sockaddr->addr)) {
             is_accessible = 1;
             goto out_print;
         }
@@ -194,8 +182,10 @@ out:
     return is_accessible;
 }
 
-static ucs_status_t uct_rdmacm_query_md_resources(uct_md_resource_desc_t **resources_p,
-                                                  unsigned *num_resources_p)
+static ucs_status_t
+uct_rdmacm_query_md_resources(uct_component_t *component,
+                              uct_md_resource_desc_t **resources_p,
+                              unsigned *num_resources_p)
 {
     struct rdma_event_channel *event_ch = NULL;
 
@@ -204,21 +194,22 @@ static ucs_status_t uct_rdmacm_query_md_resources(uct_md_resource_desc_t **resou
     if (event_ch == NULL) {
         ucs_debug("could not create an RDMACM event channel. %m. "
                   "Disabling the RDMACM resource");
-        *resources_p     = NULL;
-        *num_resources_p = 0;
-        return UCS_OK;
+        return uct_md_query_empty_md_resource(resources_p, num_resources_p);
+
     }
 
     rdma_destroy_event_channel(event_ch);
 
-    return uct_single_md_resource(&uct_rdmacm_mdc, resources_p, num_resources_p);
+    return uct_md_query_single_md_resource(component, resources_p,
+                                           num_resources_p);
 }
 
 static ucs_status_t
-uct_rdmacm_md_open(const char *md_name, const uct_md_config_t *uct_md_config,
-                   uct_md_h *md_p)
+uct_rdmacm_md_open(uct_component_t *component, const char *md_name,
+                   const uct_md_config_t *uct_md_config, uct_md_h *md_p)
 {
-    uct_rdmacm_md_config_t *md_config = ucs_derived_of(uct_md_config, uct_rdmacm_md_config_t);
+    uct_rdmacm_md_config_t *md_config = ucs_derived_of(uct_md_config,
+                                                       uct_rdmacm_md_config_t);
     uct_rdmacm_md_t *md;
     ucs_status_t status;
 
@@ -229,9 +220,10 @@ uct_rdmacm_md_open(const char *md_name, const uct_md_config_t *uct_md_config,
     }
 
     md->super.ops            = &uct_rdmacm_md_ops;
-    md->super.component      = &uct_rdmacm_mdc;
+    md->super.component      = &uct_rdmacm_component;
     md->addr_resolve_timeout = md_config->addr_resolve_timeout;
 
+    /* cppcheck-suppress autoVariables */
     *md_p = &md->super;
     status = UCS_OK;
 
@@ -239,8 +231,35 @@ out:
     return status;
 }
 
-UCT_MD_COMPONENT_DEFINE(uct_rdmacm_mdc, UCT_RDMACM_MD_PREFIX,
-                        uct_rdmacm_query_md_resources, uct_rdmacm_md_open, NULL,
-                        ucs_empty_function_return_unsupported,
-                        (void*)ucs_empty_function_return_success,
-                        "RDMACM_", uct_rdmacm_md_config_table, uct_rdmacm_md_config_t);
+uct_component_t uct_rdmacm_component = {
+    .query_md_resources = uct_rdmacm_query_md_resources,
+    .md_open            = uct_rdmacm_md_open,
+#if HAVE_RDMACM_QP_LESS
+    .cm_open            = UCS_CLASS_NEW_FUNC_NAME(uct_rdmacm_cm_t),
+#else
+    .cm_open            = ucs_empty_function_return_unsupported,
+#endif
+    .rkey_unpack        = ucs_empty_function_return_unsupported,
+    .rkey_ptr           = ucs_empty_function_return_unsupported,
+    .rkey_release       = ucs_empty_function_return_success,
+    .name               = "rdmacm",
+    .md_config          = {
+        .name           = "RDMA-CM memory domain",
+        .prefix         = "RDMACM_",
+        .table          = uct_rdmacm_md_config_table,
+        .size           = sizeof(uct_rdmacm_md_config_t),
+    },
+    .cm_config          = {
+        .name           = "RDMA-CM connection manager",
+        .prefix         = "RDMACM_",
+        .table          = uct_cm_config_table,
+        .size           = sizeof(uct_cm_config_t),
+    },
+    .tl_list            = UCT_COMPONENT_TL_LIST_INITIALIZER(&uct_rdmacm_component),
+#if HAVE_RDMACM_QP_LESS
+    .flags              = UCT_COMPONENT_FLAG_CM
+#else
+    .flags              = 0
+#endif
+};
+UCT_COMPONENT_REGISTER(&uct_rdmacm_component)

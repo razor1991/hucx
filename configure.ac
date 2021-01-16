@@ -4,13 +4,13 @@
 # Copyright (C) The University of Tennessee and The University
 #               of Tennessee Research Foundation. 2016. ALL RIGHTS RESERVED.
 # Copyright (C) ARM Ltd. 2016-2019.  ALL RIGHTS RESERVED.
-# Copyright (C) Huawei Technologies Co.,Ltd. 2020. ALL RIGHTS RESERVED.
+# Copyright (C) Huawei Technologies Co.,Ltd. 2020-2021. ALL RIGHTS RESERVED.
 # See file LICENSE for terms.
 #
 AC_PREREQ([2.63])
 
 define([ucx_ver_major], 1)
-define([ucx_ver_minor], 6)
+define([ucx_ver_minor], 9)
 define([ucx_ver_patch], 0)
 define([ts], esyscmd([sh -c "date +%Y%m%d%H%M%S"]))
 
@@ -30,10 +30,13 @@ AC_USE_SYSTEM_EXTENSIONS
 AC_GNU_SOURCE
 AC_CONFIG_HEADERS([config.h])
 
-AC_CHECK_PROG(GITBIN,git,yes)
+AC_CHECK_PROG(GITBIN, git, yes)
 AS_IF([test x"${GITBIN}" = x"yes"],
-      [AC_SUBST(SCM_VERSION, esyscmd([sh -c 'git rev-parse --short=7 HEAD']))],
-      [AC_SUBST(SCM_VERSION, "0000000")])
+      [# remove preceding "refs/heads/" (11 characters) for symbolic ref
+       AC_SUBST(SCM_BRANCH,  esyscmd([sh -c 'git symbolic-ref --quiet   HEAD | sed "s/^.\{11\}//"']))
+       AC_SUBST(SCM_VERSION, esyscmd([sh -c 'git rev-parse    --short=7 HEAD']))],
+      [AC_SUBST(SCM_BRANCH,  "<unknown>")
+       AC_SUBST(SCM_VERSION, "0000000")])
 
 AH_TOP([
 #ifndef UCX_CONFIG_H
@@ -80,7 +83,14 @@ LT_LIB_M
 AC_C_RESTRICT
 AC_FUNC_STRERROR_R
 
-PKG_PROG_PKG_CONFIG
+AC_PATH_TOOL([PKG_CONFIG], [pkg-config], [pkg-config])
+
+
+#
+# Force link_all_deplibs=yes for libtool, otherwise it will not
+# link against dependency libs
+#
+link_all_deplibs=yes
 
 
 #
@@ -126,6 +136,8 @@ AC_DEFINE_UNQUOTED([UCX_MODULE_SUBDIR], ["${modulesubdir}"], [UCX module sub-dir
 #
 m4_include([config/m4/ax_prog_doxygen.m4])
 m4_include([config/m4/graphviz.m4])
+m4_include([config/m4/ucg.m4])
+
 AC_ARG_WITH([docs_only],
         AS_HELP_STRING([--with-docs-only],
                        [Compile only the docs and not the rest of UCX. [default=NO]]),
@@ -145,7 +157,7 @@ DX_PS_FEATURE(OFF)
 DX_HTML_FEATURE(ON)
 DX_MAN_FEATURE(ON)
 DX_PDF_FEATURE(ON)
-DX_INIT_DOXYGEN([UCX],[doc/doxygen/ucxdox],[doc/doxygen-doc])
+DX_INIT_DOXYGEN([UCX],[docs/doxygen/ucxdox],[docs/doxygen-doc])
 
 AS_IF([test "x$with_docs_only" = xyes],
     [AS_MESSAGE([Documents only requested])
@@ -164,22 +176,25 @@ AS_IF([test "x$with_docs_only" = xyes],
      AM_CONDITIONAL([HAVE_MLX5_HW], [false])
      AM_CONDITIONAL([HAVE_MLX5_HW_UD], [false])
      AM_CONDITIONAL([HAVE_MLX5_DV], [false])
+     AM_CONDITIONAL([HAVE_HNS_ROCE], [false])
+     AM_CONDITIONAL([HAVE_DEVX], [false])
+     AM_CONDITIONAL([HAVE_EXP], [false])
      AM_CONDITIONAL([HAVE_TL_RC], [false])
      AM_CONDITIONAL([HAVE_TL_DC], [false])
      AM_CONDITIONAL([HAVE_DC_DV], [false])
      AM_CONDITIONAL([HAVE_DC_EXP], [false])
      AM_CONDITIONAL([HAVE_TL_UD], [false])
      AM_CONDITIONAL([HAVE_TL_CM], [false])
-     AM_CONDITIONAL([HAVE_HNS_ROCE], [false])
-     AM_CONDITIONAL([HAVE_IBV_EX_HW_TM], [false])
      AM_CONDITIONAL([HAVE_CRAY_UGNI], [false])
      AM_CONDITIONAL([HAVE_CUDA], [false])
      AM_CONDITIONAL([HAVE_GDR_COPY], [false])
      AM_CONDITIONAL([HAVE_ROCM], [false])
+     AM_CONDITIONAL([HAVE_HIP], [false])
      AM_CONDITIONAL([HAVE_XPMEM], [false])
      AM_CONDITIONAL([HAVE_CMA], [false])
      AM_CONDITIONAL([HAVE_KNEM], [false])
      AM_CONDITIONAL([HAVE_RDMACM], [false])
+     AM_CONDITIONAL([HAVE_RDMACM_QP_LESS], [false])
      AM_CONDITIONAL([HAVE_MPI], [false])
      AM_CONDITIONAL([HAVE_MPIRUN], [false])
      AM_CONDITIONAL([HAVE_MPICC], [false])
@@ -187,15 +202,18 @@ AS_IF([test "x$with_docs_only" = xyes],
      AM_CONDITIONAL([HAVE_UCM_PTMALLOC286], [false])
      AM_CONDITIONAL([HAVE_JAVA], [false])
      AM_CONDITIONAL([HAVE_CXX11], [false])
+     AM_CONDITIONAL([HAVE_GNUXX11], [false])
+     AM_CONDITIONAL([HAVE_GLIBCXX_NOTHROW], [false])
      AM_CONDITIONAL([HAVE_TCMALLOC], [false])
      AM_CONDITIONAL([ENABLE_EXPERIMENTAL_API], [false])
      AM_CONDITIONAL([INSTALL_DEVEL_HEADERS], [false])
      AM_CONDITIONAL([HAVE_EXAMPLES], [false])
-     AM_CONDITIONAL([HAVE_UCG], [true]) # docs include UCG headers
+     AM_CONDITIONAL([HAVE_AARCH64_THUNDERX2], [false])
+     AM_CONDITIONAL([HAVE_AARCH64_THUNDERX1], [false])
+     AM_CONDITIONAL([HAVE_AARCH64_HI1620], [false])
     ],
     [
      AM_CONDITIONAL([DOCS_ONLY], [false])
-     AM_CONDITIONAL([HAVE_UCG], [true])
      m4_include([config/m4/compiler.m4])
      m4_include([config/m4/sysdep.m4])
      m4_include([config/m4/ucs.m4])
@@ -208,24 +226,8 @@ AS_IF([test "x$with_docs_only" = xyes],
      m4_include([config/m4/gdrcopy.m4])
      m4_include([src/ucm/configure.m4])
      m4_include([src/uct/configure.m4])
-     m4_include([src/ucg/configure.m4])
      m4_include([src/tools/perf/configure.m4])
      m4_include([test/gtest/configure.m4])
-
-     #
-     # Compile code with frame pointer. Optimizations usually omit the frame pointer,
-     # but if we are profiling the code with callgraph we need it.
-     # This option may affect perofrmance so it is off by default.
-     #
-     AC_ARG_ENABLE([frame-pointer],
-         AS_HELP_STRING([--enable-frame-pointer],
-                        [Compile with frame pointer, useful for profiling, default: NO]),
-         [],
-         [enable_frame_pointer=no])
-     AS_IF([test "x$enable_frame_pointer" = xyes],
-         [AS_MESSAGE([compiling with frame pointer])
-          BASE_CFLAGS="$BASE_CFLAGS -fno-omit-frame-pointer"],
-         [:])
 
 
      #
@@ -248,7 +250,7 @@ AS_IF([test "x$with_docs_only" = xyes],
      AC_ARG_ENABLE([params-check],
          AS_HELP_STRING([--disable-params-check],
                         [Disable checking user parameters passed to API, default: NO]),
-         [], 
+         [],
          [enable_params_check=yes])
      AS_IF([test "x$enable_params_check" = xyes],
            [AC_DEFINE([ENABLE_PARAMS_CHECK], [1], [Enable checking user parameters])],
@@ -260,7 +262,7 @@ AS_IF([test "x$with_docs_only" = xyes],
      AC_ARG_ENABLE([debug-data],
                    AS_HELP_STRING([--enable-debug-data],
                                   [Enable collecting data to ease debugging, default: NO]),
-		   [], 
+		   [],
 		   [enable_debug_data=no])
      AS_IF([test "x$enable_debug_data" = xyes],
            [AC_DEFINE([ENABLE_DEBUG_DATA], [1], [Enable collecting data])
@@ -280,9 +282,9 @@ AS_IF([test "x$with_docs_only" = xyes],
                    [enable_mt=no])
      AS_IF([test "x$enable_mt" = xyes],
            [AC_DEFINE([ENABLE_MT], [1], [Enable thread support in UCP and UCT])
-            mt_enable=Enabled],
+            mt_enable=enabled],
            [AC_DEFINE([ENABLE_MT], [0])
-            mt_enable=Disabled])
+            mt_enable=disabled])
 
 
      #
@@ -301,9 +303,9 @@ AS_IF([test "x$with_docs_only" = xyes],
      #
      AC_ARG_ENABLE([devel-headers],
                    AS_HELP_STRING([--enable-devel-headers],
-                                  [Enable installing development headers, default: NO])
+                                  [Enable installing development headers, default: NO]),
                     [],
-                    [enable_debug_headers=no])
+                    [enable_devel_headers=no])
      AM_CONDITIONAL([INSTALL_DEVEL_HEADERS], [test "x$enable_devel_headers" = "xyes"])
 
 
@@ -322,32 +324,26 @@ AS_IF([test "x$with_docs_only" = xyes],
                    [],
                    [enable_examples=no])
     AM_CONDITIONAL([HAVE_EXAMPLES], [test "x$enable_examples" = "xyes"])
-
-     #
-     # UCG - Group collective operations component (Always enabled in this version)
-     #
-     AC_DEFINE([ENABLE_UCG], [1], [Enable Groups and collective operations support (UCG)])
     ]) # Docs only
 
 #
-# Print which transports and group topologies are built
+# Print which transports are built
 #
 build_modules="${uct_modules}"
-build_modules+="${uct_ib_modules}"
-build_modules+="${uct_cuda_modules}"
-build_modules+="${ucm_modules}"
-build_modules+="${ucx_perftest_modules}"
-build_modules+="${uct_rocm_modules}"
-AS_IF([test "x$enable_ucg" != "xno"],
-      [AC_MSG_NOTICE([Supported group modules: $ucg_modules])
-       build_modules+="${ucg_modules}"],[])
+build_modules="${build_modules}${uct_ib_modules}"
+build_modules="${build_modules}${uct_cuda_modules}"
+build_modules="${build_modules}${ucm_modules}"
+build_modules="${build_modules}${ucx_perftest_modules}"
+build_modules="${build_modules}${uct_rocm_modules}"
+build_modules="${build_modules}${ucg_modules}"
 AC_SUBST([build_modules], [${build_modules}])
+AC_SUBST([build_bindings], [${build_bindings}])
 
 #
 # Final output
 #
 AC_CONFIG_FILES([Makefile
-                 doc/doxygen/header.tex
+                 docs/doxygen/header.tex
                  src/uct/api/version.h
                  ])
 AS_IF([test "x$with_docs_only" = xyes], [], [
@@ -367,15 +363,17 @@ AC_CONFIG_FILES([
                  src/ucp/Makefile
                  src/ucp/api/ucp_version.h
                  src/ucp/core/ucp_version.c
-                 src/ucg/api/ucg_version.h
-                 src/ucg/base/ucg_version.c
                  src/tools/info/Makefile
                  src/tools/profile/Makefile
                  test/apps/Makefile
+                 test/apps/iodemo/Makefile
                  test/apps/sockaddr/Makefile
-                 test/examples/Makefile
+                 test/apps/profiling/Makefile
                  test/mpi/Makefile
+                 bindings/java/Makefile
+                 bindings/java/pom.xml
                  bindings/java/src/main/native/Makefile
+                 examples/Makefile
                  ])
 
 AC_CONFIG_FILES([test/mpi/run_mpi.sh], [chmod a+x test/mpi/run_mpi.sh])
@@ -395,14 +393,21 @@ AC_MSG_NOTICE([Building documents only])
 ],
 [
 AC_MSG_NOTICE([UCX build configuration:])
+AC_MSG_NOTICE([      Build prefix:   ${prefix}])
+AC_MSG_NOTICE([Preprocessor flags:   ${BASE_CPPFLAGS}])
+AC_MSG_NOTICE([        C compiler:   ${CC} ${BASE_CFLAGS}])
+AC_MSG_NOTICE([      C++ compiler:   ${CXX} ${BASE_CXXFLAGS}])
 AC_MSG_NOTICE([      Multi-thread:   ${mt_enable}])
 AC_MSG_NOTICE([         MPI tests:   ${mpi_enable}])
 AC_MSG_NOTICE([     Devel headers:   ${enable_devel_headers}])
-AC_MSG_NOTICE([       UCT modules:   <$(echo $uct_modules|tr ':' ' ') >])
-AC_MSG_NOTICE([      CUDA modules:   <$(echo $uct_cuda_modules|tr ':' ' ') >])
-AC_MSG_NOTICE([      ROCM modules:   <$(echo $uct_rocm_modules|tr ':' ' ') >])
-AC_MSG_NOTICE([        IB modules:   <$(echo $uct_ib_modules|tr ':' ' ') >])
-AC_MSG_NOTICE([       UCM modules:   <$(echo $ucm_modules|tr ':' ' ') >])
-AC_MSG_NOTICE([      Perf modules:   <$(echo $ucx_perftest_modules|tr ':' ' ') >])
-AC_MSG_NOTICE([       UCG modules:   <$(echo $ucg_modules|tr ':' ' ') >])], [])
+AC_MSG_NOTICE([          Bindings:   <$(echo ${build_bindings}|tr ':' ' ') >])
+AC_MSG_NOTICE([       UCT modules:   <$(echo ${uct_modules}|tr ':' ' ') >])
+AC_MSG_NOTICE([      CUDA modules:   <$(echo ${uct_cuda_modules}|tr ':' ' ') >])
+AC_MSG_NOTICE([      ROCM modules:   <$(echo ${uct_rocm_modules}|tr ':' ' ') >])
+AC_MSG_NOTICE([        IB modules:   <$(echo ${uct_ib_modules}|tr ':' ' ') >])
+AC_MSG_NOTICE([       UCM modules:   <$(echo ${ucm_modules}|tr ':' ' ') >])
+AC_MSG_NOTICE([      Perf modules:   <$(echo ${ucx_perftest_modules}|tr ':' ' ') >])
+AS_IF([test "x$enable_ucg" != "xno"], [
+    AC_MSG_NOTICE([       UCG modules:   <$(echo ${ucg_modules}|tr ':' ' ') >])])
+])
 AC_MSG_NOTICE([=========================================================])

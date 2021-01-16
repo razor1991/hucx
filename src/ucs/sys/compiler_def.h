@@ -5,7 +5,6 @@
 * See file LICENSE for terms.
 */
 
-
 #ifndef UCS_COMPILER_DEF_H
 #define UCS_COMPILER_DEF_H
 
@@ -49,6 +48,9 @@
 /* Silence "defined but not used" error for static function */
 #define UCS_F_MAYBE_UNUSED __attribute__((used))
 
+/* Non-null return */
+#define UCS_F_NON_NULL __attribute__((nonnull))
+
 /* Always inline the function */
 #ifdef __GNUC__
 #define UCS_F_ALWAYS_INLINE      inline __attribute__ ((always_inline))
@@ -90,7 +92,16 @@
 
 /* Helper macro for address arithmetic in bytes */
 #define UCS_PTR_BYTE_OFFSET(_ptr, _offset) \
-    ((void *)((uintptr_t)(_ptr) + (_offset)))
+    ((void *)((intptr_t)(_ptr) + (intptr_t)(_offset)))
+
+/* Helper macro to calculate an address with offset equal to size of _type */
+#define UCS_PTR_TYPE_OFFSET(_ptr, _type) \
+    ((void *)((typeof(_type) *)(_ptr) + 1))
+
+/* Helper macro to calculate ptr difference (_end - _start) */
+#define UCS_PTR_BYTE_DIFF(_start, _end) \
+    ((ptrdiff_t)((uintptr_t)(_end) - (uintptr_t)(_start)))
+
 
 /**
  * Size of statically-declared array
@@ -100,6 +111,12 @@
         UCS_STATIC_ASSERT((void*)&(_array) == (void*)&((_array)[0])); \
         ( sizeof(_array) / sizeof((_array)[0]) ); \
     })
+
+/**
+ * @return count of elements in const-size array
+ */
+#define ucs_array_size(_array) \
+    (sizeof(_array) / sizeof((_array)[0]))
 
 /**
  * @return Offset of _member in _type. _type is a structure type.
@@ -132,10 +149,22 @@
     })
 
 /**
- * @return Size of _member in _type. _type is a structure type.
+ * @param _type   Structure type.
+ * @param _field  Field of structure.
+ *
+ * @return Size of _field in _type.
  */
 #define ucs_field_sizeof(_type, _field) \
     sizeof(((_type*)0)->_field)
+
+/**
+ * @param _type   Structure type.
+ * @param _field  Field of structure.
+ *
+ * @return Type of _field in _type.
+ */
+#define ucs_field_type(_type, _field) \
+    typeof(((_type*)0)->_field)
 
 /**
  * Prevent compiler from reordering instructions
@@ -153,5 +182,17 @@
 
 /* Check if an expression is a compile-time constant */
 #define ucs_is_constant(expr)      __builtin_constant_p(expr)
+
+/*
+ * Define code which runs at global constructor phase
+ */
+#define UCS_STATIC_INIT \
+    static void UCS_F_CTOR UCS_PP_APPEND_UNIQUE_ID(ucs_initializer_ctor)()
+
+/*
+ * Define code which runs at global destructor phase
+ */
+#define UCS_STATIC_CLEANUP \
+    static void UCS_F_DTOR UCS_PP_APPEND_UNIQUE_ID(ucs_initializer_dtor)()
 
 #endif /* UCS_COMPILER_DEF_H */

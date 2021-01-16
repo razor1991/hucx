@@ -1,6 +1,5 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2013.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -17,9 +16,12 @@
 #include <ucs/config/parser.h>
 #include <ucs/type/status.h>
 #include <ucs/sys/sys.h>
+#include <ucs/datastruct/khash.h>
 
 #include <sys/ioctl.h>
+#ifdef HAVE_LINUX_FUTEX_H
 #include <linux/futex.h>
+#endif
 
 const char *ucs_stats_formats_names[] = {
     [UCS_STATS_FULL]        = "full",
@@ -28,7 +30,7 @@ const char *ucs_stats_formats_names[] = {
     [UCS_STATS_LAST]        = NULL
 };
 
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
 
 enum {
     UCS_STATS_FLAG_ON_EXIT        = UCS_BIT(0),
@@ -45,6 +47,8 @@ enum {
     UCS_ROOT_STATS_RUNTIME,
     UCS_ROOT_STATS_LAST
 };
+
+KHASH_MAP_INIT_STR(ucs_stats_cls, ucs_stats_class_t*)
 
 typedef struct {
     volatile unsigned    flags;
@@ -64,7 +68,12 @@ typedef struct {
         double           interval;
     };
 
+    khash_t(ucs_stats_cls) cls;
+
     pthread_mutex_t      lock;
+#ifndef HAVE_LINUX_FUTEX_H
+    pthread_cond_t       cv;
+#endif
     pthread_t            thread;
 } ucs_stats_context_t;
 
@@ -73,7 +82,10 @@ static ucs_stats_context_t ucs_stats_context = {
     .root_node        = {},
     .root_filter_node = {},
     .lock             = PTHREAD_MUTEX_INITIALIZER,
-    .thread           = 0xfffffffful
+#ifndef HAVE_LINUX_FUTEX_H
+    .cv               = PTHREAD_COND_INITIALIZER,
+#endif
+    .thread           = (pthread_t)-1
 };
 
 static ucs_stats_class_t ucs_stats_root_node_class = {
@@ -85,12 +97,14 @@ static ucs_stats_class_t ucs_stats_root_node_class = {
 };
 
 
+#ifdef HAVE_LINUX_FUTEX_H
 static inline int
 ucs_sys_futex(volatile void *addr1, int op, int val1, struct timespec *timeout,
               void *uaddr2, int val3)
 {
     return syscall(SYS_futex, addr1, op, val1, timeout, uaddr2, val3);
 }
+#endif
 
 static void ucs_stats_clean_node(ucs_stats_node_t *node) {
     ucs_stats_filter_node_t * temp_filter_node;
@@ -113,34 +127,75 @@ static void ucs_stats_clean_node(ucs_stats_node_t *node) {
     ucs_list_del(&node->type_list);
 }
 
-static ucs_stats_class_t* ucs_stats_node_clone_cls(ucs_stats_class_t *orig_cls)
+static void ucs_stats_free_class(ucs_stats_class_t *cls)
 {
-    size_t i;
-    size_t size = sizeof(ucs_stats_class_t) + strlen(orig_cls->name) + 1;
-    for (i = 0; i < orig_cls->num_counters; i++) {
-        size += sizeof(char*) + strlen(orig_cls->counter_names[i]) + 1;
+    unsigned i;
+
+    for (i = 0; i < cls->num_counters; i++) {
+        ucs_free((void*)cls->counter_names[i]);
     }
 
-    ucs_stats_class_t *clone_cls = ucs_malloc(size, "stats_cls");
-    if (!clone_cls) {
+    ucs_free((void*)cls->name);
+    ucs_free(cls);
+}
+
+static ucs_stats_class_t *ucs_stats_dup_class(ucs_stats_class_t *cls)
+{
+    ucs_stats_class_t *class_dup;
+
+    class_dup = ucs_calloc(1, sizeof(*cls) + sizeof(*cls->counter_names) * cls->num_counters,
+                           "ucs_stats_class_dup");
+    if (!class_dup) {
+        ucs_error("failed to allocate statistics class");
+        goto err;
+    }
+
+    class_dup->name = ucs_strdup(cls->name, "ucs_stats_class_t name");
+    if (!class_dup->name) {
+        ucs_error("failed to allocate statistics class name");
+        goto err_free;
+    }
+
+    for (class_dup->num_counters = 0;
+         class_dup->num_counters < cls->num_counters;
+         class_dup->num_counters++) {
+        class_dup->counter_names[class_dup->num_counters] =
+            ucs_strdup(cls->counter_names[class_dup->num_counters],
+                       "ucs_stats_class_t counter");
+        if (!class_dup->counter_names[class_dup->num_counters]) {
+            ucs_error("failed to allocate statistics counter name");
+            goto err_free;
+        }
+    }
+
+    return class_dup;
+
+err_free:
+    ucs_stats_free_class(class_dup);
+err:
+    return NULL;
+}
+
+static ucs_stats_class_t *ucs_stats_get_class(ucs_stats_class_t *cls)
+{
+    ucs_stats_class_t *class_dup;
+    khiter_t iter;
+    int r;
+
+    iter = kh_get(ucs_stats_cls, &ucs_stats_context.cls, cls->name);
+    if (iter != kh_end(&ucs_stats_context.cls)) {
+        return kh_val(&ucs_stats_context.cls, iter);
+    }
+
+    class_dup = ucs_stats_dup_class(cls);
+    if (class_dup == NULL) {
         return NULL;
     }
 
-    char *write_iterator = (char*)clone_cls + sizeof(ucs_stats_class_t) +
-            (orig_cls->num_counters * sizeof(char*));
-    clone_cls->name = write_iterator;
-    strcpy(write_iterator, orig_cls->name);
-    write_iterator += strlen(orig_cls->name) + 1;
-
-    for (i = 0; i < orig_cls->num_counters; i++) {
-        clone_cls->counter_names[i] = write_iterator;
-        strcpy(write_iterator, orig_cls->counter_names[i]);
-        write_iterator += strlen(orig_cls->counter_names[i]) + 1;
-    }
-
-    clone_cls->num_counters = orig_cls->num_counters;
-    ucs_assert(write_iterator - size == (char*)clone_cls);
-    return clone_cls;
+    iter = kh_put(ucs_stats_cls, &ucs_stats_context.cls, class_dup->name, &r);
+    ucs_assert_always(r != 0); /* initialize a previously empty hash entry */
+    kh_val(&ucs_stats_context.cls, iter) = class_dup;
+    return class_dup;
 }
 
 static void ucs_stats_node_remove(ucs_stats_node_t *node, int make_inactive)
@@ -156,8 +211,14 @@ static void ucs_stats_node_remove(ucs_stats_node_t *node, int make_inactive)
 
     ucs_list_del(&node->list);
     if (make_inactive) {
-        ucs_list_add_tail(&node->parent->children[UCS_STATS_INACTIVE_CHILDREN], &node->list);
-        node->cls = ucs_stats_node_clone_cls(node->cls);
+        node->cls = ucs_stats_get_class(node->cls);
+        if (node->cls) {
+            ucs_list_add_tail(&node->parent->children[UCS_STATS_INACTIVE_CHILDREN], &node->list);
+        } else {
+            /* failed to allocate class duplicate - remove node */
+            ucs_stats_clean_node(node);
+            make_inactive = 0;
+        }
     } else {
         ucs_stats_clean_node(node); 
     }
@@ -167,10 +228,8 @@ static void ucs_stats_node_remove(ucs_stats_node_t *node, int make_inactive)
     if (!make_inactive) {
         if (!node->filter_node->type_list_len) {
             ucs_free(node->filter_node);
-            node->filter_node = NULL;
         }
         ucs_free(node);
-        node = NULL;
     }
 }   
 
@@ -313,9 +372,9 @@ static void ucs_stats_add_to_filter(ucs_stats_node_t *node,
     }
 }
 
-static int ucs_stats_node_add(ucs_stats_node_t *node,
-                              ucs_stats_node_t *parent,
-                              ucs_stats_filter_node_t *filter_node)
+static ucs_status_t ucs_stats_node_add(ucs_stats_node_t *node,
+                                       ucs_stats_node_t *parent,
+                                       ucs_stats_filter_node_t *filter_node)
 {
     ucs_assert(node != &ucs_stats_context.root_node);
     if (parent == NULL) {
@@ -450,6 +509,12 @@ static void* ucs_stats_thread_func(void *arg)
         ptime = NULL;
     }
 
+    /*
+     * TODO: Switch to use the condvar on all systems, eliminating
+     * futexes.  For now it is kept conditionally to not commit the
+     * change, runtime-untested on FreeBSD, to working Linux codebase.
+     */
+#ifdef HAVE_LINUX_FUTEX_H
     flags = ucs_stats_context.flags;
     while (flags & UCS_STATS_FLAG_ON_TIMER) {
         /* Wait for timeout/wakeup */
@@ -457,6 +522,18 @@ static void* ucs_stats_thread_func(void *arg)
         ucs_stats_dump();
         flags = ucs_stats_context.flags;
     }
+#else
+    pthread_mutex_lock(&ucs_stats_context.lock);
+    flags = ucs_stats_context.flags;
+    while (flags & UCS_STATS_FLAG_ON_TIMER) {
+        /* Wait for timeout/wakeup */
+        pthread_cond_timedwait(&ucs_stats_context.cv, &ucs_stats_context.lock,
+                               ptime);
+        __ucs_stats_dump(0);
+        flags = ucs_stats_context.flags;
+    }
+    pthread_mutex_unlock(&ucs_stats_context.lock);
+#endif
 
     return NULL;
 }
@@ -469,23 +546,29 @@ static void ucs_stats_open_dest()
     const char *next_token;
     int need_close;
 
+    copy_str = NULL;
     if (!strncmp(ucs_global_opts.stats_dest, "udp:", 4)) {
 
-        copy_str = strdupa(&ucs_global_opts.stats_dest[4]);
+        copy_str = ucs_strdup(&ucs_global_opts.stats_dest[4],
+                              "statistics dest");
+        if (copy_str == NULL) {
+            return;
+        }
+
         saveptr  = NULL;
         hostname = strtok_r(copy_str, ":", &saveptr);
         port_str = strtok_r(NULL,     ":", &saveptr);
 
         if (hostname == NULL) {
            ucs_error("Invalid statistics destination format (%s)", ucs_global_opts.stats_dest);
-           return;
+           goto out_free;
         }
 
         status = ucs_stats_client_init(hostname,
                                       port_str ? atoi(port_str) : UCS_STATS_DEFAULT_UDP_PORT,
                                       &ucs_stats_context.client);
         if (status != UCS_OK) {
-            return;
+            goto out_free;
         }
 
         ucs_stats_context.flags |= UCS_STATS_FLAG_SOCKET;
@@ -493,9 +576,9 @@ static void ucs_stats_open_dest()
         status = ucs_open_output_stream(ucs_global_opts.stats_dest,
                                         UCS_LOG_LEVEL_ERROR,
                                         &ucs_stats_context.stream,
-                                        &need_close, &next_token);
+                                        &need_close, &next_token, NULL);
         if (status != UCS_OK) {
-            return;
+            goto out_free;
         }
 
         /* File flags */
@@ -509,6 +592,9 @@ static void ucs_stats_open_dest()
             ucs_stats_context.flags |= UCS_STATS_FLAG_STREAM_BINARY;
         }
     }
+
+out_free:
+    ucs_free(copy_str);
 }
 
 static void ucs_stats_close_dest()
@@ -568,11 +654,23 @@ static void ucs_stats_unset_trigger()
 {
     void *result;
 
+#ifdef HAVE_LINUX_FUTEX_H
     if (ucs_stats_context.flags & UCS_STATS_FLAG_ON_TIMER) {
         ucs_stats_context.flags &= ~UCS_STATS_FLAG_ON_TIMER;
         ucs_sys_futex(&ucs_stats_context.flags, FUTEX_WAKE, 1, NULL, NULL, 0);
         pthread_join(ucs_stats_context.thread, &result);
     }
+#else
+    pthread_mutex_lock(&ucs_stats_context.lock);
+    if (ucs_stats_context.flags & UCS_STATS_FLAG_ON_TIMER) {
+        ucs_stats_context.flags &= ~UCS_STATS_FLAG_ON_TIMER;
+        pthread_cond_broadcast(&ucs_stats_context.cv);
+        pthread_mutex_unlock(&ucs_stats_context.lock);
+        pthread_join(ucs_stats_context.thread, &result);
+    } else {
+        pthread_mutex_unlock(&ucs_stats_context.lock);
+    }
+#endif
 
     if (ucs_stats_context.flags & UCS_STATS_FLAG_ON_EXIT) {
         ucs_debug("dumping stats");
@@ -597,7 +695,6 @@ static void ucs_stats_clean_node_recurs(ucs_stats_node_t *node)
 
     ucs_list_for_each_safe(child, tmp, &node->children[UCS_STATS_INACTIVE_CHILDREN], list) {
         ucs_stats_clean_node_recurs(child);
-        ucs_free(child->cls);
         ucs_stats_node_remove(child, 0);
     }
 }
@@ -615,6 +712,7 @@ void ucs_stats_init()
     UCS_STATS_START_TIME(ucs_stats_context.start_time);
     ucs_stats_node_init_root("%s:%d", ucs_get_host_name(), getpid());
     ucs_stats_set_trigger();
+    kh_init_inplace(ucs_stats_cls, &ucs_stats_context.cls);
 
     ucs_debug("statistics enabled, flags: %c%c%c%c%c%c%c",
               (ucs_stats_context.flags & UCS_STATS_FLAG_ON_TIMER)      ? 't' : '-',
@@ -628,6 +726,8 @@ void ucs_stats_init()
 
 void ucs_stats_cleanup()
 {
+    ucs_stats_class_t *cls;
+
     if (!ucs_stats_is_active()) {
         return;
     }
@@ -636,6 +736,12 @@ void ucs_stats_cleanup()
     ucs_stats_clean_node_recurs(&ucs_stats_context.root_node);
     ucs_stats_close_dest();
     ucs_assert(ucs_stats_context.flags == 0);
+
+    kh_foreach_value(&ucs_stats_context.cls, cls, {
+        ucs_stats_free_class(cls);
+    });
+
+    kh_destroy_inplace(ucs_stats_cls, &ucs_stats_context.cls);
 }
 
 void ucs_stats_dump()

@@ -3,6 +3,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "rdmacm_ep.h"
 
 
@@ -260,4 +264,5 @@ void uct_rdmacm_ep_invoke_completions(uct_rdmacm_ep_t *ep, ucs_status_t status)
         ucs_free(op);
         pthread_mutex_lock(&ep->ops_mutex);
     }
+    /* coverity[missing_unlock] */
 }

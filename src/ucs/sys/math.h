@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <math.h>
+#include <ucs/arch/bitops.h>
 
 BEGIN_C_DECLS
 
@@ -26,16 +27,16 @@ BEGIN_C_DECLS
 
 #define ucs_min(_a, _b) \
 ({ \
-    typeof(_a) a = (_a); \
-    typeof(_b) b = (_b); \
-    a < b ? a : b; \
+    typeof(_a) _min_a = (_a); \
+    typeof(_b) _min_b = (_b); \
+    (_min_a < _min_b) ? _min_a : _min_b; \
 })
 
 #define ucs_max(_a, _b) \
 ({ \
-    typeof(_a) a = (_a); \
-    typeof(_b) b = (_b); \
-    a > b ? a : b; \
+    typeof(_a) _max_a = (_a); \
+    typeof(_b) _max_b = (_b); \
+    (_max_a > _max_b) ? _max_a : _max_b; \
 })
 
 #define ucs_is_pow2_or_zero(_n) \
@@ -72,6 +73,14 @@ BEGIN_C_DECLS
         for (pow2 = 1; pow2 < (_n); pow2 <<= 1); \
         pow2; \
     })
+
+#define ucs_rounddown_pow2(_n) (ucs_roundup_pow2(_n + 1) / 2)
+
+#define ucs_signum(_n) \
+    (((_n) > (typeof(_n))0) - ((_n) < (typeof(_n))0))
+
+#define ucs_roundup_pow2_or0(_n) \
+    ( ((_n) == 0) ? 0 : ucs_roundup_pow2(_n) )
 
 /* Return values: 0 - aligned, non-0 - unaligned */
 #define ucs_check_if_align_pow2(_n, _p) ((_n) & ((_p) - 1))
@@ -126,7 +135,7 @@ static inline double ucs_log2(double x)
  * @param __a            First number
  * @param __op           Operator (e.g >=)
  * @param __b            Second number
- * @param _signed_type   Signed type of __a/__b (e.g int_32_t)
+ * @param _signed_type   Signed type of __a/__b (e.g int32_t)
  *
  * @return value of the expression "__a __op __b".
  */
@@ -138,18 +147,9 @@ static inline double ucs_log2(double x)
 #define UCS_CIRCULAR_COMPARE32(__a, __op, __b)  UCS_CIRCULAR_COMPARE(__a, __op, __b, int32_t)
 #define UCS_CIRCULAR_COMPARE64(__a, __op, __b)  UCS_CIRCULAR_COMPARE(__a, __op, __b, int64_t)
 
-/* on some arch ffs64(0) returns 0, on other -1, let's unify this */
-#define ucs_ffs64_safe(_val) ((_val) ? ucs_ffs64(_val) : 64)
-
 #define ucs_for_each_bit(_index, _map)                   \
     for ((_index) = ucs_ffs64_safe(_map); (_index) < 64; \
          (_index) = ucs_ffs64_safe((uint64_t)(_map) & (-2ull << (uint64_t)(_index))))
-
-
-/**
- * Calculate CRC32 of a buffer.
- */
-uint32_t ucs_calc_crc32(uint32_t crc, const void *buf, size_t size);
 
 
 /*

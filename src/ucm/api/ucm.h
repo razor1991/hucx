@@ -14,6 +14,7 @@
 BEGIN_C_DECLS
 
 #include <ucs/config/types.h>
+#include <ucs/memory/memory_type.h>
 #include <ucs/type/status.h>
 
 #include <sys/types.h>
@@ -26,6 +27,8 @@ BEGIN_C_DECLS
  * @brief Memory event types
  */
 typedef enum ucm_event_type {
+    /* Default initialization value */
+    UCM_EVENT_NONE            = 0,
     /* Native events */
     UCM_EVENT_MMAP            = UCS_BIT(0),
     UCM_EVENT_MUNMAP          = UCS_BIT(1),
@@ -43,23 +46,16 @@ typedef enum ucm_event_type {
     UCM_EVENT_MEM_TYPE_ALLOC  = UCS_BIT(20),
     UCM_EVENT_MEM_TYPE_FREE   = UCS_BIT(21),
 
-    /* Auxiliary flags */
-    UCM_EVENT_FLAG_NO_INSTALL = UCS_BIT(24)
+    /* Add event handler, but don't install new hooks */
+    UCM_EVENT_FLAG_NO_INSTALL = UCS_BIT(24),
+
+    /* When the event handler is added, generate approximated events for
+     * existing memory allocations.
+     * Currently implemented only for @ref UCM_EVENT_MEM_TYPE_ALLOC.
+     */
+    UCM_EVENT_FLAG_EXISTING_ALLOC = UCS_BIT(25)
 
 } ucm_event_type_t;
-
-
-/**
- * @brief Memory types for alloc and free events
- */
-typedef enum ucm_mem_type {
-    /*cuda memory */
-    UCM_MEM_TYPE_CUDA         = UCS_BIT(0),
-    UCM_MEM_TYPE_CUDA_MANAGED = UCS_BIT(1),
-    /* rocm memory */
-    UCM_MEM_TYPE_ROCM         = UCS_BIT(2),
-    UCM_MEM_TYPE_ROCM_MANAGED = UCS_BIT(3),
-} ucm_mem_type_t;
 
 
 /**
@@ -82,13 +78,13 @@ typedef union ucm_event {
      * callbacks: pre, post
      */
     struct {
-        void           *result;
-        void           *address;
-        size_t         size;
-        int            prot;
-        int            flags;
-        int            fd;
-        off_t          offset;
+        void               *result;
+        void               *address;
+        size_t             size;
+        int                prot;
+        int                flags;
+        int                fd;
+        off_t              offset;
     } mmap;
 
     /*
@@ -96,9 +92,9 @@ typedef union ucm_event {
      * munmap() is called.
      */
     struct {
-        int            result;
-        void           *address;
-        size_t         size;
+        int                result;
+        void               *address;
+        size_t             size;
     } munmap;
 
     /*
@@ -106,11 +102,11 @@ typedef union ucm_event {
      * mremap() is called.
      */
     struct {
-        void           *result;
-        void           *address;
-        size_t         old_size;
-        size_t         new_size;
-        int            flags;
+        void               *result;
+        void               *address;
+        size_t             old_size;
+        size_t             new_size;
+        int                flags;
     } mremap;
 
     /*
@@ -118,10 +114,10 @@ typedef union ucm_event {
      * shmat() is called.
      */
     struct {
-        void           *result;
-        int            shmid;
-        const void     *shmaddr;
-        int            shmflg;
+        void               *result;
+        int                shmid;
+        const void         *shmaddr;
+        int                shmflg;
     } shmat;
 
     /*
@@ -129,8 +125,8 @@ typedef union ucm_event {
      * shmdt() is called.
      */
     struct {
-        int            result;
-        const void     *shmaddr;
+        int                result;
+        const void         *shmaddr;
     } shmdt;
 
     /*
@@ -138,8 +134,8 @@ typedef union ucm_event {
      * sbrk() is called.
      */
     struct {
-        void           *result;
-        intptr_t       increment;
+        void               *result;
+        intptr_t           increment;
     } sbrk;
 
     /*
@@ -147,10 +143,10 @@ typedef union ucm_event {
      * madvise() is called.
      */
     struct {
-        int            result;
-        void           *addr;
-        size_t         length;
-        int            advice;
+        int                result;
+        void               *addr;
+        size_t             length;
+        int                advice;
     } madvise;
 
     /*
@@ -164,17 +160,21 @@ typedef union ucm_event {
      * For UCM_EVENT_VM_UNMAPPED, callbacks are pre
      */
     struct {
-        void           *address;
-        size_t         size;
+        void               *address;
+        size_t             size;
     } vm_mapped, vm_unmapped;
 
     /*
-     * memory type allocation and deallocation event
+     * UCM_EVENT_MEM_TYPE_ALLOC, UCM_EVENT_MEM_TYPE_FREE
+     *
+     * Memory type allocation and deallocation event.
+     * If mem_type is @ref UCS_MEMORY_TYPE_LAST, the memory type is unknown, and
+     * further memory type detection is required.
      */
     struct {
-        void           *address;
-        size_t         size;
-        ucm_mem_type_t mem_type;
+        void               *address;
+        size_t             size;
+        ucs_memory_type_t  mem_type;
     } mem_type;
 
 } ucm_event_t;
@@ -194,6 +194,7 @@ typedef struct ucm_global_config {
     int                  enable_cuda_reloc;           /* Enable installing CUDA relocations */
     int                  enable_dynamic_mmap_thresh;  /* Enable adaptive mmap threshold */
     size_t               alloc_alignment;             /* Alignment for memory allocations */
+    int                  dlopen_process_rpath;        /* Process RPATH section in dlopen hook */
 } ucm_global_config_t;
 
 
@@ -323,6 +324,20 @@ ucs_status_t ucm_test_events(int events);
 
 
 /**
+ * @brief Test event external handlers
+ *
+ * This routine checks if external events, as set by @ref ucm_set_external_event,
+ * are actually being reported (by calling APIs such as @ref ucm_vm_munmap).
+ *
+ * @param [in]  events    Bit-mask of events which are supposed to be handled
+ *                        externally.
+ *
+ * @return Status code.
+ */
+ucs_status_t ucm_test_external_events(int events);
+
+
+/**
  * @brief Call the original implementation of @ref mmap without triggering events.
  */
 void *ucm_orig_mmap(void *addr, size_t length, int prot, int flags, int fd,
@@ -435,10 +450,17 @@ int ucm_brk(void *addr);
 
 
 /**
- * @brief Call the original implementation of @ref ucm_madvise and all handlers
+ * @brief Call the original implementation of @ref madvise and all handlers
  * associated with it.
  */
 int ucm_madvise(void *addr, size_t length, int advice);
+
+
+/**
+ * @brief Call the original implementation of @ref dlopen and all handlers
+ * associated with it.
+ */
+void *ucm_dlopen(const char *filename, int flag);
 
 
 END_C_DECLS

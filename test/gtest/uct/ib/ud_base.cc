@@ -9,6 +9,8 @@ void ud_base_test::init()
     m_e1 = uct_test::create_entity(0);
     m_entities.push_back(m_e1);
 
+    check_skip_test();
+
     m_e2 = uct_test::create_entity(0);
     m_entities.push_back(m_e2);
 }
@@ -85,7 +87,5 @@ void ud_base_test::set_tx_win(entity *e, uct_ud_psn_t size)
 
 void ud_base_test::disable_async(entity *e) 
 {
-    ucs_async_remove_handler(iface(e)->async.timer_id, 1);
+    iface(e)->async.disable = 1;
 }
-
-

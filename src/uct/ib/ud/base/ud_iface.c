@@ -1,9 +1,13 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include "ud_iface.h"
 #include "ud_ep.h"
@@ -15,13 +19,9 @@
 #include <ucs/type/class.h>
 #include <ucs/datastruct/queue.h>
 #include <sys/poll.h>
-#include <linux/ip.h>
 
 
-#define UCT_UD_IPV4_ADDR_LEN sizeof(struct in_addr)
-#define UCT_UD_IPV6_ADDR_LEN sizeof(struct in6_addr)
-
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
 static ucs_stats_class_t uct_ud_iface_stats_class = {
     .name = "ud_iface",
     .num_counters = UCT_UD_IFACE_STAT_LAST,
@@ -31,13 +31,11 @@ static ucs_stats_class_t uct_ud_iface_stats_class = {
 };
 #endif
 
+/* cppcheck-suppress ctunullpointer */
 SGLIB_DEFINE_LIST_FUNCTIONS(uct_ud_iface_peer_t, uct_ud_iface_peer_cmp, next)
 SGLIB_DEFINE_HASHED_CONTAINER_FUNCTIONS(uct_ud_iface_peer_t,
                                         UCT_UD_HASH_SIZE,
                                         uct_ud_iface_peer_hash)
-
-static void uct_ud_iface_free_resend_skbs(uct_ud_iface_t *iface);
-static void uct_ud_iface_timer(int timer_id, void *arg);
 
 static void uct_ud_iface_free_pending_rx(uct_ud_iface_t *iface);
 static void uct_ud_iface_free_async_comps(uct_ud_iface_t *iface);
@@ -84,26 +82,29 @@ void uct_ud_iface_cep_cleanup(uct_ud_iface_t *iface)
 
 static uct_ud_iface_peer_t *
 uct_ud_iface_cep_lookup_addr(uct_ud_iface_t *iface, uint16_t dlid,
-                             const union ibv_gid *dgid, uint32_t dest_qpn)
+                             const union ibv_gid *dgid, uint32_t dest_qpn,
+                             int path_index)
 {
     uct_ud_iface_peer_t key;
-    key.dlid    = dlid;
-    key.dgid    = *dgid;
-    key.dst_qpn = dest_qpn;
+    key.dlid       = dlid;
+    key.dgid       = *dgid;
+    key.dst_qpn    = dest_qpn;
+    key.path_index = path_index;
     return sglib_hashed_uct_ud_iface_peer_t_find_member(iface->peers, &key);
 }
 
 static uct_ud_iface_peer_t *
 uct_ud_iface_cep_lookup_peer(uct_ud_iface_t *iface,
                              const uct_ib_address_t *src_ib_addr,
-                             const uct_ud_iface_addr_t *src_if_addr)
+                             const uct_ud_iface_addr_t *src_if_addr,
+                             int path_index)
 {
     uint32_t dest_qpn = uct_ib_unpack_uint24(src_if_addr->qp_num);
-    union ibv_gid dgid;
-    uint16_t dlid;
+    uct_ib_address_pack_params_t params;
 
-    uct_ib_address_unpack(src_ib_addr, &dlid, &dgid);
-    return uct_ud_iface_cep_lookup_addr(iface, dlid, &dgid, dest_qpn);
+    uct_ib_address_unpack(src_ib_addr, &params);
+    return uct_ud_iface_cep_lookup_addr(iface, params.lid, &params.gid,
+                                        dest_qpn, path_index);
 }
 
 static uct_ud_ep_t *
@@ -145,25 +146,27 @@ uct_ud_iface_cep_getid(uct_ud_iface_peer_t *peer, uint32_t conn_id)
 ucs_status_t uct_ud_iface_cep_insert(uct_ud_iface_t *iface,
                                      const uct_ib_address_t *src_ib_addr,
                                      const uct_ud_iface_addr_t *src_if_addr,
-                                     uct_ud_ep_t *ep, uint32_t conn_id)
+                                     uct_ud_ep_t *ep, uint32_t conn_id,
+                                     int path_index)
 {
     uint32_t dest_qpn = uct_ib_unpack_uint24(src_if_addr->qp_num);
+    uct_ib_address_pack_params_t params;
     uct_ud_iface_peer_t *peer;
-    union ibv_gid dgid;
     uct_ud_ep_t *cep;
-    uint16_t dlid;
 
-    uct_ib_address_unpack(src_ib_addr, &dlid, &dgid);
-    peer = uct_ud_iface_cep_lookup_addr(iface, dlid, &dgid, dest_qpn);
+    uct_ib_address_unpack(src_ib_addr, &params);
+    peer = uct_ud_iface_cep_lookup_addr(iface, params.lid, &params.gid,
+                                        dest_qpn, path_index);
     if (peer == NULL) {
         peer = malloc(sizeof *peer);
         if (peer == NULL) {
             return UCS_ERR_NO_MEMORY;
         }
 
-        peer->dlid    = dlid;
-        peer->dgid    = dgid;
-        peer->dst_qpn = dest_qpn;
+        peer->dlid       = params.lid;
+        peer->dgid       = params.gid;
+        peer->dst_qpn    = dest_qpn;
+        peer->path_index = path_index;
         sglib_hashed_uct_ud_iface_peer_t_add(iface->peers, peer);
         ucs_list_head_init(&peer->ep_list);
         peer->conn_id_last = 0;
@@ -175,8 +178,8 @@ ucs_status_t uct_ud_iface_cep_insert(uct_ud_iface_t *iface,
     }
 
     if (ucs_list_is_empty(&peer->ep_list)) {
-            ucs_list_add_head(&peer->ep_list, &ep->cep_list);
-            return UCS_OK;
+        ucs_list_add_head(&peer->ep_list, &ep->cep_list);
+        return UCS_OK;
     }
     ucs_list_for_each(cep, &peer->ep_list, cep_list) {
         ucs_assert_always(cep->conn_id != ep->conn_id);
@@ -201,12 +204,13 @@ void uct_ud_iface_cep_remove(uct_ud_ep_t *ep)
 uct_ud_ep_t *uct_ud_iface_cep_lookup(uct_ud_iface_t *iface,
                                      const uct_ib_address_t *src_ib_addr,
                                      const uct_ud_iface_addr_t *src_if_addr,
-                                     uint32_t conn_id)
+                                     uint32_t conn_id, int path_index)
 {
     uct_ud_iface_peer_t *peer;
     uct_ud_ep_t *ep;
 
-    peer = uct_ud_iface_cep_lookup_peer(iface, src_ib_addr, src_if_addr);
+    peer = uct_ud_iface_cep_lookup_peer(iface, src_ib_addr, src_if_addr,
+                                        path_index);
     if (peer == NULL) {
         return NULL;
     }
@@ -225,7 +229,8 @@ void uct_ud_iface_cep_rollback(uct_ud_iface_t *iface,
 {
     uct_ud_iface_peer_t *peer;
 
-    peer = uct_ud_iface_cep_lookup_peer(iface, src_ib_addr, src_if_addr);
+    peer = uct_ud_iface_cep_lookup_peer(iface, src_ib_addr, src_if_addr,
+                                        ep->path_index);
     ucs_assert_always(peer != NULL);
     ucs_assert_always(peer->conn_id_last > 0);
     ucs_assert_always(ep->conn_id + 1 == peer->conn_id_last);
@@ -240,16 +245,16 @@ static void uct_ud_iface_send_skb_init(uct_iface_h tl_iface, void *obj,
                                        uct_mem_h memh)
 {
     uct_ud_send_skb_t *skb = obj;
-    uct_ib_mem_t *ib_memh = memh;
 
-    skb->lkey  = ib_memh->lkey;
-    skb->flags = 0;
+    skb->lkey  = uct_ib_memh_get_lkey(memh);
+    skb->flags = UCT_UD_SEND_SKB_FLAG_INVALID;
 }
 
 static ucs_status_t
 uct_ud_iface_create_qp(uct_ud_iface_t *self, const uct_ud_iface_config_t *config)
 {
-    uct_ib_qp_attr_t qp_init_attr      = {};
+    uct_ud_iface_ops_t *ops = ucs_derived_of(self->super.ops, uct_ud_iface_ops_t);
+    uct_ib_qp_attr_t qp_init_attr = {};
     struct ibv_qp_attr qp_attr;
     static ucs_status_t status;
     int ret;
@@ -260,10 +265,9 @@ uct_ud_iface_create_qp(uct_ud_iface_t *self, const uct_ud_iface_config_t *config
     qp_init_attr.cap.max_recv_wr     = config->super.rx.queue_len;
     qp_init_attr.cap.max_send_sge    = 2;
     qp_init_attr.cap.max_recv_sge    = 1;
-    qp_init_attr.cap.max_inline_data = ucs_max(config->super.tx.min_inline,
-                                               UCT_UD_MIN_INLINE);
+    qp_init_attr.cap.max_inline_data = config->super.tx.min_inline;
 
-    status = self->super.ops->create_qp(&self->super, &qp_init_attr, &self->qp);
+    status = ops->create_qp(&self->super, &qp_init_attr, &self->qp);
     if (status != UCS_OK) {
         return status;
     }
@@ -273,7 +277,6 @@ uct_ud_iface_create_qp(uct_ud_iface_t *self, const uct_ud_iface_config_t *config
 #else
     self->config.max_inline = qp_init_attr.cap.max_inline_data;
 #endif
-    uct_ib_iface_set_max_iov(&self->super, qp_init_attr.cap.max_send_sge);
 
     memset(&qp_attr, 0, sizeof(qp_attr));
     /* Modify QP to INIT state */
@@ -307,8 +310,49 @@ uct_ud_iface_create_qp(uct_ud_iface_t *self, const uct_ud_iface_config_t *config
 
     return UCS_OK;
 err_destroy_qp:
-    ibv_destroy_qp(self->qp);
+    uct_ib_destroy_qp(self->qp);
     return UCS_ERR_INVALID_PARAM;
+}
+
+static inline void uct_ud_iface_async_progress(uct_ud_iface_t *iface)
+{
+    uct_ud_iface_ops_t *ops =
+        ucs_derived_of(iface->super.ops, uct_ud_iface_ops_t);
+    unsigned ev_count;
+
+    if (ucs_unlikely(iface->async.disable)) {
+        return;
+    }
+
+    ev_count = ops->async_progress(iface);
+    if (ev_count > 0) {
+        uct_ud_iface_raise_pending_async_ev(iface);
+    }
+}
+
+static void uct_ud_iface_async_handler(int fd, int events, void *arg)
+{
+    uct_ud_iface_t *iface = arg;
+
+    uct_ud_iface_async_progress(iface);
+
+    /* arm for new solicited events
+     * if user asks to provide notifications for all completion
+     * events by calling uct_iface_event_arm(), RX CQ will be
+     * armed again with solicited flag = 0 */
+    uct_ib_iface_pre_arm(&iface->super);
+    iface->super.ops->arm_cq(&iface->super, UCT_IB_DIR_RX, 1);
+
+    ucs_assert(iface->async.event_cb != NULL);
+    /* notify user */
+    iface->async.event_cb(iface->async.event_arg, 0);
+}
+
+static void uct_ud_iface_timer(int timer_id, int events, void *arg)
+{
+    uct_ud_iface_t *iface = arg;
+
+    uct_ud_iface_async_progress(iface);
 }
 
 ucs_status_t uct_ud_iface_complete_init(uct_ud_iface_t *iface)
@@ -316,71 +360,106 @@ ucs_status_t uct_ud_iface_complete_init(uct_ud_iface_t *iface)
     ucs_async_context_t *async = iface->super.super.worker->async;
     ucs_async_mode_t async_mode = async->mode;
     ucs_status_t status;
+    int event_fd;
 
-    iface->tx.resend_skbs_quota = iface->tx.available;
-
-    /* TODO: make tick configurable */
-    iface->async.slow_tick = ucs_time_from_msec(100);
-    status = ucs_twheel_init(&iface->async.slow_timer,
-                             iface->async.slow_tick / 4,
-                             uct_ud_iface_get_async_time(iface));
+    status = ucs_twheel_init(&iface->tx.timer, iface->tx.tick / 4,
+                             uct_ud_iface_get_time(iface));
     if (status != UCS_OK) {
         goto err;
     }
 
-    status = ucs_async_add_timer(async_mode, iface->async.slow_tick,
-                                 uct_ud_iface_timer, iface, async,
-                                 &iface->async.timer_id);
+    status = uct_ib_iface_event_fd_get(&iface->super.super.super, &event_fd);
     if (status != UCS_OK) {
         goto err_twheel_cleanup;
+    }
+
+    if (iface->async.event_cb != NULL) {
+        status = ucs_async_set_event_handler(async_mode, event_fd,
+                                             UCS_EVENT_SET_EVREAD |
+                                             UCS_EVENT_SET_EVERR,
+                                             uct_ud_iface_async_handler,
+                                             iface, async);
+        if (status != UCS_OK) {
+            goto err_twheel_cleanup;
+        }
+
+        status = iface->super.ops->arm_cq(&iface->super, UCT_IB_DIR_RX, 1);
+        if (status != UCS_OK) {
+            goto err_twheel_cleanup;
+        }
     }
 
     return UCS_OK;
 
 err_twheel_cleanup:
-    ucs_twheel_cleanup(&iface->async.slow_timer);
+    ucs_twheel_cleanup(&iface->tx.timer);
 err:
     return status;
 }
 
 void uct_ud_iface_remove_async_handlers(uct_ud_iface_t *iface)
 {
-    uct_base_iface_progress_disable(&iface->super.super.super,
-                                    UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
-    ucs_async_remove_handler(iface->async.timer_id, 1);
+    ucs_status_t status;
+    int event_fd;
+
+    uct_ud_iface_progress_disable(&iface->super.super.super,
+                                  UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
+    if (iface->async.event_cb != NULL) {
+        status = uct_ib_iface_event_fd_get(&iface->super.super.super,
+                                           &event_fd);
+        if (status == UCS_OK) {
+            ucs_async_remove_handler(event_fd, 1);
+        }
+    }
 }
 
-/* Calculate real GIDs len. Can be either 16 (RoCEv1 or RoCEv2/IPv6)
- * or 4 (RoCEv2/IPv4). This len is used for packets filtering by DGIDs.
- *
- * According to Annex17_RoCEv2 (A17.4.5.2):
- * "The first 40 bytes of user posted UD Receive Buffers are reserved for the L3
- * header of the incoming packet (as per the InfiniBand Spec Section 11.4.1.2).
- * In RoCEv2, this area is filled up with the IP header. IPv6 header uses the
- * entire 40 bytes. IPv4 headers use the 20 bytes in the second half of the
- * reserved 40 bytes area (i.e. offset 20 from the beginning of the receive
- * buffer). In this case, the content of the first 20 bytes is undefined." */
-static void uct_ud_iface_calc_gid_len(uct_ud_iface_t *iface)
+static ucs_status_t uct_ud_iface_gid_hash_init(uct_ud_iface_t *iface,
+                                               uct_md_h md)
 {
-    uint16_t *local_gid_u16 = (uint16_t*)iface->super.gid.raw;
+    static const union ibv_gid zero_gid = { .raw = {0} };
+    uct_ib_device_t *dev                = &ucs_derived_of(md, uct_ib_md_t)->dev;
+    int port                            = iface->super.config.port_num;
+    uct_ib_device_gid_info_t gid_info;
+    int gid_idx, gid_tbl_len, kh_ret;
+    ucs_status_t status;
+    char gid_str[128];
 
-    /* Make sure that daddr in IPv4 resides in the last 4 bytes in GRH */
-    UCS_STATIC_ASSERT((UCT_IB_GRH_LEN - (20 + offsetof(struct iphdr, daddr))) ==
-                      UCT_UD_IPV4_ADDR_LEN);
+    kh_init_inplace(uct_ud_iface_gid, &iface->gid_table.hash);
 
-    /* Make sure that dgid resides in the last 16 bytes in GRH */
-    UCS_STATIC_ASSERT((UCT_IB_GRH_LEN - offsetof(struct ibv_grh, dgid)) ==
-                      UCT_UD_IPV6_ADDR_LEN);
+    gid_tbl_len = uct_ib_device_port_attr(dev, port)->gid_tbl_len;
+    for (gid_idx = 0; gid_idx < gid_tbl_len; ++gid_idx) {
+        status = uct_ib_device_query_gid_info(dev->ibv_context,
+                                              uct_ib_device_name(dev),
+                                              port, gid_idx, &gid_info);
+        if (status != UCS_OK) {
+            goto err;
+        }
 
-    /* IPv4 mapped to IPv6 looks like: 0000:0000:0000:0000:0000:ffff:????:????,
-     * so check for leading zeroes and verify that 11-12 bytes are 0xff.
-     * Otherwise either RoCEv1 or RoCEv2/IPv6 are used. */
-    if (local_gid_u16[0] == 0x0000) {
-        ucs_assert_always(local_gid_u16[5] == 0xffff);
-        iface->config.gid_len = UCT_UD_IPV4_ADDR_LEN;
-    } else {
-        iface->config.gid_len = UCT_UD_IPV6_ADDR_LEN;
+        if (!memcmp(&gid_info.gid, &zero_gid, sizeof(zero_gid))) {
+            continue;
+        }
+
+        ucs_debug("iface %p: adding gid %s to hash on device %s port %d index "
+                  "%d)", iface, uct_ib_gid_str(&gid_info.gid, gid_str,
+                                                sizeof(gid_str)),
+                  uct_ib_device_name(dev), port, gid_idx);
+        kh_put(uct_ud_iface_gid, &iface->gid_table.hash, gid_info.gid,
+               &kh_ret);
+        if (kh_ret < 0) {
+            ucs_error("failed to add gid to hash on device %s port %d index %d",
+                      uct_ib_device_name(dev), port, gid_idx);
+            status = UCS_ERR_NO_MEMORY;
+            goto err;
+        }
     }
+
+    iface->gid_table.last     = zero_gid;
+    iface->gid_table.last_len = sizeof(zero_gid);
+    return UCS_OK;
+
+err:
+    kh_destroy_inplace(uct_ud_iface_gid, &iface->gid_table.hash);
+    return status;
 }
 
 UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
@@ -419,9 +498,7 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
     init_attr->rx_priv_len = sizeof(uct_ud_recv_skb_t) -
                              sizeof(uct_ib_iface_recv_desc_t);
     init_attr->rx_hdr_len  = UCT_IB_GRH_LEN + sizeof(uct_ud_neth_t);
-    init_attr->tx_cq_len   = config->super.tx.queue_len;
-    init_attr->rx_cq_len   = config->super.rx.queue_len;
-    init_attr->seg_size    = ucs_min(mtu, config->super.super.max_bcopy);
+    init_attr->seg_size    = ucs_min(mtu, config->super.seg_size);
     init_attr->qp_type     = IBV_QPT_UD;
 
     UCS_CLASS_CALL_SUPER_INIT(uct_ib_iface_t, &ops->super, md, worker,
@@ -434,6 +511,8 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
 
     self->tx.unsignaled          = 0;
     self->tx.available           = config->super.tx.queue_len;
+    self->tx.timer_sweep_count   = 0;
+    self->async.disable          = 0;
 
     self->rx.available           = config->super.rx.queue_len;
     self->rx.quota               = 0;
@@ -442,24 +521,66 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
     self->config.check_grh_dgid  = config->dgid_check &&
                                    uct_ib_iface_is_roce(&self->super);
 
-    if (config->slow_timer_backoff <= 0.) {
-        ucs_error("The slow timer back off should be > 0 (%lf)",
-                  config->slow_timer_backoff);
+    if ((config->max_window < UCT_UD_CA_MIN_WINDOW) ||
+        (config->max_window > UCT_UD_CA_MAX_WINDOW)) {
+        ucs_error("Max congestion avoidance window should be >= %d and <= %d (%d)",
+                  UCT_UD_CA_MIN_WINDOW, UCT_UD_CA_MAX_WINDOW, config->max_window);
         return UCS_ERR_INVALID_PARAM;
-    } else {
-        self->config.slow_timer_backoff = config->slow_timer_backoff;
     }
 
+    self->config.max_window = config->max_window;
+
+    self->rx.async_max_poll = config->rx_async_max_poll;
+
+    if (config->timer_tick <= 0.) {
+        ucs_error("The timer tick should be > 0 (%lf)",
+                  config->timer_tick);
+        return UCS_ERR_INVALID_PARAM;
+    } else {
+        self->tx.tick = ucs_time_from_sec(config->timer_tick);
+    }
+
+    if (config->timer_backoff < UCT_UD_MIN_TIMER_TIMER_BACKOFF) {
+        ucs_error("The timer back off must be >= %lf (%lf)",
+                  UCT_UD_MIN_TIMER_TIMER_BACKOFF, config->timer_backoff);
+        return UCS_ERR_INVALID_PARAM;
+    } else {
+        self->tx.timer_backoff = config->timer_backoff;
+    }
+
+    if (config->event_timer_tick <= 0.) {
+        ucs_error("The event timer tick should be > 0 (%lf)",
+                  config->event_timer_tick);
+        return UCS_ERR_INVALID_PARAM;
+    } else {
+        self->async.tick = ucs_time_from_sec(config->event_timer_tick);
+    }
+
+    if (params->field_mask & UCT_IFACE_PARAM_FIELD_ASYNC_EVENT_CB) {
+        self->async.event_cb = params->async_event_cb;
+    } else {
+        self->async.event_cb = NULL;
+    }
+
+    if (params->field_mask & UCT_IFACE_PARAM_FIELD_ASYNC_EVENT_ARG) {
+        self->async.event_arg = params->async_event_arg;
+    } else {
+        self->async.event_arg = NULL;
+    }
+
+    self->async.timer_id = 0;
+
     /* Redefine receive desc release callback */
-    self->super.release_desc.cb  = uct_ud_iface_release_desc;
+    self->super.release_desc.cb = uct_ud_iface_release_desc;
 
     UCT_UD_IFACE_HOOK_INIT(self);
 
-    if (uct_ud_iface_create_qp(self, config) != UCS_OK) {
+    status = uct_ud_iface_create_qp(self, config);
+    if (status != UCS_OK) {
         return UCS_ERR_INVALID_PARAM;
     }
 
-    ucs_ptr_array_init(&self->eps, 0, "ud_eps");
+    ucs_ptr_array_init(&self->eps, "ud_eps");
     uct_ud_iface_cep_init(self);
 
     status = uct_ib_iface_recv_mpool_init(&self->super, &config->super,
@@ -475,8 +596,10 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
 
     data_size = sizeof(uct_ud_ctl_hdr_t) + self->super.addr_size;
     data_size = ucs_max(data_size, self->super.config.seg_size);
-    data_size = ucs_max(data_size, sizeof(uct_ud_zcopy_desc_t) + self->config.max_inline);
-
+    data_size = ucs_max(data_size,
+                        sizeof(uct_ud_zcopy_desc_t) + self->config.max_inline);
+    data_size = ucs_max(data_size,
+                        sizeof(uct_ud_ctl_desc_t) + sizeof(uct_ud_neth_t));
     status = uct_iface_mpool_init(&self->super.super, &self->tx.mp,
                                   sizeof(uct_ud_send_skb_t) + data_size,
                                   sizeof(uct_ud_send_skb_t),
@@ -487,23 +610,13 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
         goto err_rx_mpool;
     }
 
-    ucs_assert_always(data_size >= UCT_UD_MIN_INLINE);
-
-    self->tx.skb               = NULL;
-    self->tx.skb_inl.super.len = sizeof(uct_ud_neth_t);
-
-    ucs_queue_head_init(&self->tx.resend_skbs);
-    self->tx.resend_skbs_quota = 0;
-
-    ucs_arbiter_init(&self->tx.pending_q);
-
-    ucs_queue_head_init(&self->tx.async_comp_q);
-
-    ucs_queue_head_init(&self->rx.pending_q);
-
+    self->tx.skb                  = NULL;
     self->tx.async_before_pending = 0;
 
-    uct_ud_iface_calc_gid_len(self);
+    ucs_arbiter_init(&self->tx.pending_q);
+    ucs_queue_head_init(&self->tx.outstanding_q);
+    ucs_queue_head_init(&self->tx.async_comp_q);
+    ucs_queue_head_init(&self->rx.pending_q);
 
     status = UCS_STATS_NODE_ALLOC(&self->stats, &uct_ud_iface_stats_class,
                                   self->super.super.stats);
@@ -511,14 +624,21 @@ UCS_CLASS_INIT_FUNC(uct_ud_iface_t, uct_ud_iface_ops_t *ops, uct_md_h md,
         goto err_tx_mpool;
     }
 
+    status = uct_ud_iface_gid_hash_init(self, md);
+    if (status != UCS_OK) {
+        goto err_release_stats;
+    }
+
     return UCS_OK;
 
+err_release_stats:
+    UCS_STATS_NODE_FREE(self->stats);
 err_tx_mpool:
     ucs_mpool_cleanup(&self->tx.mp, 1);
 err_rx_mpool:
     ucs_mpool_cleanup(&self->rx.mp, 1);
 err_qp:
-    ibv_destroy_qp(self->qp);
+    uct_ib_destroy_qp(self->qp);
     ucs_ptr_array_cleanup(&self->eps);
     return status;
 }
@@ -529,46 +649,66 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ud_iface_t)
 
     /* TODO: proper flush and connection termination */
     uct_ud_enter(self);
+    ucs_twheel_cleanup(&self->tx.timer);
     ucs_debug("iface(%p): cep cleanup", self);
     uct_ud_iface_cep_cleanup(self);
-    uct_ud_iface_free_resend_skbs(self);
     uct_ud_iface_free_async_comps(self);
     ucs_mpool_cleanup(&self->tx.mp, 0);
     /* TODO: qp to error state and cleanup all wqes */
     uct_ud_iface_free_pending_rx(self);
     ucs_mpool_cleanup(&self->rx.mp, 0);
-    ibv_destroy_qp(self->qp);
+    uct_ib_destroy_qp(self->qp);
     ucs_debug("iface(%p): ptr_array cleanup", self);
     ucs_ptr_array_cleanup(&self->eps);
     ucs_arbiter_cleanup(&self->tx.pending_q);
     UCS_STATS_NODE_FREE(self->stats);
+    kh_destroy_inplace(uct_ud_iface_gid, &self->gid_table.hash);
     uct_ud_leave(self);
 }
 
 UCS_CLASS_DEFINE(uct_ud_iface_t, uct_ib_iface_t);
 
 ucs_config_field_t uct_ud_iface_config_table[] = {
-    {"IB_", "", NULL,
+    {UCT_IB_CONFIG_PREFIX, "", NULL,
      ucs_offsetof(uct_ud_iface_config_t, super), UCS_CONFIG_TYPE_TABLE(uct_ib_iface_config_table)},
 
-    {"", "", NULL,
+    {"UD_", "", NULL,
      ucs_offsetof(uct_ud_iface_config_t, ud_common),
      UCS_CONFIG_TYPE_TABLE(uct_ud_iface_common_config_table)},
 
     {"TIMEOUT", "5.0m", "Transport timeout",
      ucs_offsetof(uct_ud_iface_config_t, peer_timeout), UCS_CONFIG_TYPE_TIME},
-    {"SLOW_TIMER_BACKOFF", "2.0", "Timeout multiplier for resending trigger",
-     ucs_offsetof(uct_ud_iface_config_t, slow_timer_backoff),
+    {"TIMER_TICK", "10ms", "Initial timeout for retransmissions",
+     ucs_offsetof(uct_ud_iface_config_t, timer_tick), UCS_CONFIG_TYPE_TIME},
+    {"TIMER_BACKOFF", "2.0",
+     "Timeout multiplier for resending trigger (must be >= "
+     UCS_PP_MAKE_STRING(UCT_UD_MIN_TIMER_TIMER_BACKOFF) ")",
+     ucs_offsetof(uct_ud_iface_config_t, timer_backoff),
                   UCS_CONFIG_TYPE_DOUBLE},
+    {"ASYNC_TIMER_TICK", "100ms", "Resolution for async timer",
+     ucs_offsetof(uct_ud_iface_config_t, event_timer_tick), UCS_CONFIG_TYPE_TIME},
     {"ETH_DGID_CHECK", "y",
-     "Enable checking destination GID for incoming packets of Ethernet network\n"
+     "Enable checking destination GID for incoming packets of Ethernet network.\n"
      "Mismatched packets are silently dropped.",
      ucs_offsetof(uct_ud_iface_config_t, dgid_check), UCS_CONFIG_TYPE_BOOL},
+
+    {"MAX_WINDOW", UCS_PP_MAKE_STRING(UCT_UD_CA_MAX_WINDOW),
+     "Max congestion avoidance window. Should be >= "
+      UCS_PP_MAKE_STRING(UCT_UD_CA_MIN_WINDOW) " and <= "
+      UCS_PP_MAKE_STRING(UCT_UD_CA_MAX_WINDOW),
+     ucs_offsetof(uct_ud_iface_config_t, max_window), UCS_CONFIG_TYPE_UINT},
+
+    {"RX_ASYNC_MAX_POLL", "64",
+     "Max number of receive completions to pick during asynchronous TX poll",
+     ucs_offsetof(uct_ud_iface_config_t, rx_async_max_poll), UCS_CONFIG_TYPE_UINT},
+
     {NULL}
 };
 
 
-ucs_status_t uct_ud_iface_query(uct_ud_iface_t *iface, uct_iface_attr_t *iface_attr)
+ucs_status_t uct_ud_iface_query(uct_ud_iface_t *iface,
+                                uct_iface_attr_t *iface_attr,
+                                size_t am_max_iov, size_t am_max_hdr)
 {
     ucs_status_t status;
 
@@ -586,9 +726,10 @@ ucs_status_t uct_ud_iface_query(uct_ud_iface_t *iface, uct_iface_attr_t *iface_a
                                          UCT_IFACE_FLAG_PENDING          |
                                          UCT_IFACE_FLAG_CB_SYNC          |
                                          UCT_IFACE_FLAG_CB_ASYNC         |
-                                         UCT_IFACE_FLAG_EVENT_SEND_COMP  |
-                                         UCT_IFACE_FLAG_EVENT_RECV       |
                                          UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE;
+    iface_attr->cap.event_flags        = UCT_IFACE_FLAG_EVENT_SEND_COMP |
+                                         UCT_IFACE_FLAG_EVENT_RECV      |
+                                         UCT_IFACE_FLAG_EVENT_ASYNC_CB;
 
     iface_attr->cap.am.max_short       = uct_ib_iface_hdr_size(iface->config.max_inline,
                                                                sizeof(uct_ud_neth_t));
@@ -597,8 +738,8 @@ ucs_status_t uct_ud_iface_query(uct_ud_iface_t *iface, uct_iface_attr_t *iface_a
     iface_attr->cap.am.max_zcopy       = iface->super.config.seg_size - sizeof(uct_ud_neth_t);
     iface_attr->cap.am.align_mtu       = uct_ib_mtu_value(uct_ib_iface_port_attr(&iface->super)->active_mtu);
     iface_attr->cap.am.opt_zcopy_align = UCS_SYS_PCI_MAX_PAYLOAD;
-    /* The first iov is reserved for the header */
-    iface_attr->cap.am.max_iov         = uct_ib_iface_get_max_iov(&iface->super) - 1;
+    iface_attr->cap.am.max_iov         = am_max_iov;
+    iface_attr->cap.am.max_hdr         = am_max_hdr;
 
     iface_attr->cap.put.max_short      = uct_ib_iface_hdr_size(iface->config.max_inline,
                                                                sizeof(uct_ud_neth_t) +
@@ -609,7 +750,7 @@ ucs_status_t uct_ud_iface_query(uct_ud_iface_t *iface, uct_iface_attr_t *iface_a
     iface_attr->max_conn_priv          = 0;
 
     /* UD lacks of scatter to CQE support */
-    iface_attr->latency.overhead      += 10e-9;
+    iface_attr->latency.c             += 30e-9;
 
     if (iface_attr->cap.am.max_short) {
         iface_attr->cap.flags |= UCT_IFACE_FLAG_AM_SHORT;
@@ -645,7 +786,8 @@ ucs_status_t uct_ud_iface_flush(uct_iface_h tl_iface, unsigned flags,
 
     uct_ud_enter(iface);
 
-    if (ucs_unlikely(uct_ud_iface_has_pending_async_ev(iface))) {
+    if (ucs_unlikely(uct_ud_iface_has_pending_async_ev(iface) ||
+                     !ucs_queue_is_empty(&iface->tx.outstanding_q))) {
         UCT_TL_IFACE_STAT_FLUSH_WAIT(&iface->super.super);
         uct_ud_leave(iface);
         return UCS_INPROGRESS;
@@ -672,15 +814,14 @@ ucs_status_t uct_ud_iface_flush(uct_iface_h tl_iface, unsigned flags,
 
 void uct_ud_iface_add_ep(uct_ud_iface_t *iface, uct_ud_ep_t *ep)
 {
-    uint32_t prev_gen;
-    ep->ep_id = ucs_ptr_array_insert(&iface->eps, ep, &prev_gen);
+    ep->ep_id = ucs_ptr_array_insert(&iface->eps, ep);
 }
 
 void uct_ud_iface_remove_ep(uct_ud_iface_t *iface, uct_ud_ep_t *ep)
 {
     if (ep->ep_id != UCT_UD_EP_NULL_ID) {
         ucs_trace("iface(%p) remove ep: %p id %d", iface, ep, ep->ep_id);
-        ucs_ptr_array_remove(&iface->eps, ep->ep_id, 0);
+        ucs_ptr_array_remove(&iface->eps, ep->ep_id);
     }
 }
 
@@ -693,100 +834,43 @@ void uct_ud_iface_replace_ep(uct_ud_iface_t *iface,
     p = ucs_ptr_array_replace(&iface->eps, old_ep->ep_id, new_ep);
     ucs_assert_always(p == (void *)old_ep);
     ucs_trace("replace_ep: old(%p) id=%d new(%p) id=%d", old_ep, old_ep->ep_id, new_ep, new_ep->ep_id);
-    ucs_ptr_array_remove(&iface->eps, new_ep->ep_id, 0);
+    ucs_ptr_array_remove(&iface->eps, new_ep->ep_id);
 }
 
-
-uct_ud_send_skb_t *uct_ud_iface_resend_skb_get(uct_ud_iface_t *iface)
+uct_ud_send_skb_t *uct_ud_iface_ctl_skb_get(uct_ud_iface_t *iface)
 {
-    ucs_queue_elem_t *elem;
     uct_ud_send_skb_t *skb;
 
     /* grow reserved skb's queue on-demand */
-    if (iface->tx.resend_skbs_quota > 0) {
-        skb = ucs_mpool_get(&iface->tx.mp);
-        if (skb == NULL) {
-            ucs_fatal("failed to allocate control skb");
-        }
-        --iface->tx.resend_skbs_quota;
-        return skb;
-    } else {
-        elem = ucs_queue_pull(&iface->tx.resend_skbs);
-        ucs_assert(elem != NULL);
-        return ucs_container_of(elem, uct_ud_send_skb_t, queue);
-    }
-}
-
-
-static void uct_ud_iface_free_resend_skbs(uct_ud_iface_t *iface)
-{
-    uct_ud_send_skb_t *skb;
-
-    iface->tx.resend_skbs_quota = 0;
-    ucs_queue_for_each_extract(skb, &iface->tx.resend_skbs, queue, 1) {
-        ucs_mpool_put(skb);
-    }
-}
-
-static void uct_ud_ep_dispatch_err_comp(uct_ud_ep_t *ep, uct_ud_send_skb_t *skb)
-{
-    uct_ud_iface_t *iface = ucs_derived_of(ep->super.super.iface, uct_ud_iface_t);
-    ucs_status_t status;
-
-    ucs_assert(ep->tx.err_skb_count > 0);
-    --ep->tx.err_skb_count;
-
-    if ((ep->tx.err_skb_count > 0) || (ep->flags & UCT_UD_EP_FLAG_DISCONNECTED)) {
-        return;
+    skb = ucs_mpool_get(&iface->tx.mp);
+    if (skb == NULL) {
+        ucs_fatal("failed to allocate control skb");
     }
 
-    if (ep->flags & UCT_UD_EP_FLAG_PRIVATE) {
-        uct_ep_destroy(&ep->super.super);
-        return;
-    }
-
-    status = iface->super.ops->set_ep_failed(&iface->super, &ep->super.super,
-                                             skb->status);
-    if (status != UCS_OK) {
-        ucs_fatal("transport error: %s", ucs_status_string(status));
-    }
+    VALGRIND_MAKE_MEM_DEFINED(&skb->lkey, sizeof(skb->lkey));
+    skb->flags = 0;
+    return skb;
 }
 
 void uct_ud_iface_dispatch_async_comps_do(uct_ud_iface_t *iface)
 {
     uct_ud_comp_desc_t *cdesc;
-    uct_ud_send_skb_t  *skb;
-    uct_ud_ep_t *ep;
+    uct_ud_send_skb_t *skb;
 
-    do {
-        skb = ucs_queue_pull_elem_non_empty(&iface->tx.async_comp_q,
-                                            uct_ud_send_skb_t, queue);
+    ucs_queue_for_each_extract(skb, &iface->tx.async_comp_q, queue, 1) {
+        ucs_assert(!(skb->flags & UCT_UD_SEND_SKB_FLAG_RESENDING));
         cdesc = uct_ud_comp_desc(skb);
-        ep    = cdesc->ep;
-
-        if (skb->flags & UCT_UD_SEND_SKB_FLAG_COMP) {
-            ucs_assert(!(ep->flags & UCT_UD_EP_FLAG_DISCONNECTED));
-            uct_invoke_completion(cdesc->comp, skb->status);
-        }
-
-        if (ucs_unlikely(skb->flags & UCT_UD_SEND_SKB_FLAG_ERR)) {
-            uct_ud_ep_dispatch_err_comp(ep, skb);
-        }
-
-        ep->flags &= ~UCT_UD_EP_FLAG_ASYNC_COMPS;
-        skb->flags = 0;
-        ucs_mpool_put(skb);
-    } while (!ucs_queue_is_empty(&iface->tx.async_comp_q));
+        uct_ud_iface_dispatch_comp(iface, cdesc->comp, cdesc->status);
+        uct_ud_skb_release(skb, 0, 0, NULL);
+    }
 }
 
 static void uct_ud_iface_free_async_comps(uct_ud_iface_t *iface)
 {
     uct_ud_send_skb_t *skb;
 
-    while (!ucs_queue_is_empty(&iface->tx.async_comp_q)) {
-        skb = ucs_queue_pull_elem_non_empty(&iface->tx.async_comp_q,
-                                            uct_ud_send_skb_t, queue);
-        ucs_mpool_put(skb);
+    ucs_queue_for_each_extract(skb, &iface->tx.async_comp_q, queue, 1) {
+        uct_ud_skb_release(skb, 0, 0, NULL);
     }
 }
 
@@ -827,31 +911,6 @@ static void uct_ud_iface_free_pending_rx(uct_ud_iface_t *iface)
     }
 }
 
-static inline void uct_ud_iface_async_progress(uct_ud_iface_t *iface)
-{
-    unsigned ev_count;
-    uct_ud_iface_ops_t *ops;
-
-    ops = ucs_derived_of(iface->super.ops, uct_ud_iface_ops_t);
-    ev_count = ops->async_progress(iface);
-    if (ev_count > 0) {
-        uct_ud_iface_raise_pending_async_ev(iface);
-    }
-}
-
-static void uct_ud_iface_timer(int timer_id, void *arg)
-{
-    uct_ud_iface_t *iface = arg;
-    ucs_time_t now;
-
-    uct_ud_enter(iface);
-    now = uct_ud_iface_get_async_time(iface);
-    ucs_trace_async("iface(%p) slow_timer_sweep: now %lu", iface, now);
-    ucs_twheel_sweep(&iface->async.slow_timer, now);
-    uct_ud_iface_async_progress(iface);
-    uct_ud_leave(iface);
-}
-
 void uct_ud_iface_release_desc(uct_recv_desc_t *self, void *desc)
 {
     uct_ud_iface_t *iface = ucs_container_of(self,
@@ -860,13 +919,6 @@ void uct_ud_iface_release_desc(uct_recv_desc_t *self, void *desc)
     uct_ud_enter(iface);
     uct_ib_iface_release_desc(self, desc);
     uct_ud_leave(iface);
-}
-
-void uct_ud_iface_handle_failure(uct_ib_iface_t *iface, void *arg,
-                                 ucs_status_t status)
-{
-    uct_ud_tx_wnd_purge_outstanding(ucs_derived_of(iface, uct_ud_iface_t),
-                                    (uct_ud_ep_t *)arg, status);
 }
 
 ucs_status_t uct_ud_iface_event_arm(uct_iface_h tl_iface, unsigned events)
@@ -920,15 +972,128 @@ out:
 
 void uct_ud_iface_progress_enable(uct_iface_h tl_iface, unsigned flags)
 {
-    uct_ud_iface_t *iface = ucs_derived_of(tl_iface, uct_ud_iface_t);
+    uct_ud_iface_t *iface       = ucs_derived_of(tl_iface, uct_ud_iface_t);
+    ucs_async_context_t *async  = iface->super.super.worker->async;
+    ucs_async_mode_t async_mode = async->mode;
+    ucs_status_t status;
+
+    uct_ud_enter(iface);
 
     if (flags & UCT_PROGRESS_RECV) {
-        uct_ud_enter(iface);
         iface->rx.available += iface->rx.quota;
         iface->rx.quota      = 0;
         /* let progress (possibly async) post the missing receives */
-        uct_ud_leave(iface);
     }
 
+    if (iface->async.timer_id == 0) {
+        status = ucs_async_add_timer(async_mode, iface->async.tick,
+                                     uct_ud_iface_timer, iface, async,
+                                     &iface->async.timer_id);
+        if (status != UCS_OK) {
+            ucs_fatal("iface(%p): unable to add iface timer handler - %s",
+                      iface, ucs_status_string(status));
+        }
+        ucs_assert(iface->async.timer_id != 0);
+    }
+
+    uct_ud_leave(iface);
+
     uct_base_iface_progress_enable(tl_iface, flags);
+}
+
+void uct_ud_iface_progress_disable(uct_iface_h tl_iface, unsigned flags)
+{
+    uct_ud_iface_t *iface = ucs_derived_of(tl_iface, uct_ud_iface_t);
+    ucs_status_t status;
+
+    uct_ud_enter(iface);
+
+    if (iface->async.timer_id != 0) {
+        status = ucs_async_remove_handler(iface->async.timer_id, 1);
+        if (status != UCS_OK) {
+            ucs_fatal("iface(%p): unable to remove iface timer handler (%d) - %s",
+                      iface, iface->async.timer_id, ucs_status_string(status));
+        }
+        iface->async.timer_id = 0;
+    }
+
+    uct_ud_leave(iface);
+
+    uct_base_iface_progress_disable(tl_iface, flags);
+}
+
+void uct_ud_iface_ctl_skb_complete(uct_ud_iface_t *iface,
+                                   uct_ud_ctl_desc_t *cdesc, int is_async)
+{
+    uct_ud_send_skb_t *resent_skb, *skb;
+
+    skb = cdesc->self_skb;
+    ucs_assert(!(skb->flags & UCT_UD_SEND_SKB_FLAG_INVALID));
+
+    resent_skb = cdesc->resent_skb;
+    ucs_assert(uct_ud_ctl_desc(skb) == cdesc);
+
+    if (resent_skb != NULL) {
+        ucs_assert(skb->flags        & UCT_UD_SEND_SKB_FLAG_CTL_RESEND);
+        ucs_assert(resent_skb->flags & UCT_UD_SEND_SKB_FLAG_RESENDING);
+
+        resent_skb->flags &= ~UCT_UD_SEND_SKB_FLAG_RESENDING;
+        --cdesc->ep->tx.resend_count;
+
+        uct_ud_ep_window_release_completed(cdesc->ep, is_async);
+    } else {
+        ucs_assert(skb->flags & UCT_UD_SEND_SKB_FLAG_CTL_ACK);
+    }
+
+    uct_ud_skb_release(skb, 0, 0, NULL);
+
+}
+
+void uct_ud_iface_send_completion(uct_ud_iface_t *iface, uint16_t sn,
+                                  int is_async)
+{
+    uct_ud_ctl_desc_t *cdesc;
+
+    ucs_queue_for_each_extract(cdesc, &iface->tx.outstanding_q, queue,
+                               UCS_CIRCULAR_COMPARE16(cdesc->sn, <=, sn)) {
+        uct_ud_iface_ctl_skb_complete(iface, cdesc, is_async);
+    }
+}
+
+union ibv_gid* uct_ud_grh_get_dgid(struct ibv_grh *grh, size_t dgid_len)
+{
+    size_t i;
+
+    /* Make sure that daddr in IPv4 resides in the last 4 bytes in GRH */
+    UCS_STATIC_ASSERT((UCT_IB_GRH_LEN - (20 + offsetof(struct iphdr, daddr))) ==
+                      UCS_IPV4_ADDR_LEN);
+
+    /* Make sure that dgid resides in the last 16 bytes in GRH */
+    UCS_STATIC_ASSERT((UCT_IB_GRH_LEN - offsetof(struct ibv_grh, dgid)) ==
+                      UCS_IPV6_ADDR_LEN);
+
+    ucs_assert((dgid_len == UCS_IPV4_ADDR_LEN) ||
+               (dgid_len == UCS_IPV6_ADDR_LEN));
+
+    /*
+    * According to Annex17_RoCEv2 (A17.4.5.2):
+    * "The first 40 bytes of user posted UD Receive Buffers are reserved for the L3
+    * header of the incoming packet (as per the InfiniBand Spec Section 11.4.1.2).
+    * In RoCEv2, this area is filled up with the IP header. IPv6 header uses the
+    * entire 40 bytes. IPv4 headers use the 20 bytes in the second half of the
+    * reserved 40 bytes area (i.e. offset 20 from the beginning of the receive
+    * buffer). In this case, the content of the first 20 bytes is undefined. "
+    */
+    if (dgid_len == UCS_IPV4_ADDR_LEN) {
+        /* IPv4 mapped to IPv6 looks like: 0000:0000:0000:0000:0000:ffff:????:????
+           reset begin to make hash function working */
+        for (i = 0; i < (sizeof(union ibv_gid) - UCS_IPV4_ADDR_LEN - 2);) {
+            grh->dgid.raw[i++] = 0x00;
+        }
+
+        grh->dgid.raw[i++]     = 0xff;
+        grh->dgid.raw[i++]     = 0xff;
+    }
+
+    return &grh->dgid;
 }

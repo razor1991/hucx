@@ -3,12 +3,18 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "rocm_gdr_iface.h"
 #include "rocm_gdr_md.h"
 #include "rocm_gdr_ep.h"
 
+#include <uct/rocm/base/rocm_base.h>
 #include <ucs/type/class.h>
 #include <ucs/sys/string.h>
+
 
 static ucs_config_field_t uct_rocm_gdr_iface_config_table[] = {
 
@@ -42,10 +48,12 @@ static int uct_rocm_gdr_iface_is_reachable(const uct_iface_h tl_iface,
     return (addr != NULL) && (iface->id == *addr);
 }
 
-static ucs_status_t uct_rocm_gdr_iface_query(uct_iface_h iface,
+static ucs_status_t uct_rocm_gdr_iface_query(uct_iface_h tl_iface,
                                              uct_iface_attr_t *iface_attr)
 {
-    memset(iface_attr, 0, sizeof(uct_iface_attr_t));
+    uct_rocm_gdr_iface_t *iface = ucs_derived_of(tl_iface, uct_rocm_gdr_iface_t);
+
+    uct_base_iface_query(&iface->super, iface_attr);
 
     iface_attr->iface_addr_len          = sizeof(uct_rocm_gdr_iface_addr_t);
     iface_attr->device_addr_len         = 0;
@@ -79,9 +87,9 @@ static ucs_status_t uct_rocm_gdr_iface_query(uct_iface_h iface,
     iface_attr->cap.am.max_hdr          = 0;
     iface_attr->cap.am.max_iov          = 1;
 
-    iface_attr->latency.overhead        = 1e-6; /* 1 us */
-    iface_attr->latency.growth          = 0;
-    iface_attr->bandwidth               = 6911 * 1024.0 * 1024.0;
+    iface_attr->latency                 = ucs_linear_func_make(1e-6, 0);
+    iface_attr->bandwidth.dedicated     = 0;
+    iface_attr->bandwidth.shared        = 6911.0 * UCS_MBYTE;
     iface_attr->overhead                = 0;
     iface_attr->priority                = 0;
 
@@ -104,7 +112,7 @@ static uct_iface_ops_t uct_rocm_gdr_iface_ops = {
     .iface_progress           = ucs_empty_function_return_zero,
     .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_rocm_gdr_iface_t),
     .iface_query              = uct_rocm_gdr_iface_query,
-    .iface_get_device_address = (void*)ucs_empty_function_return_success,
+    .iface_get_device_address = (uct_iface_get_device_address_func_t)ucs_empty_function_return_success,
     .iface_get_address        = uct_rocm_gdr_iface_get_address,
     .iface_is_reachable       = uct_rocm_gdr_iface_is_reachable,
 };
@@ -132,37 +140,6 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_rocm_gdr_iface_t, uct_iface_t, uct_md_h, uct_worke
                           const uct_iface_params_t*, const uct_iface_config_t*);
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_rocm_gdr_iface_t, uct_iface_t);
 
-
-static ucs_status_t uct_rocm_gdr_query_tl_resources(uct_md_h md,
-                                                    uct_tl_resource_desc_t **resource_p,
-                                                    unsigned *num_resources_p)
-{
-    uct_tl_resource_desc_t *resource;
-
-    resource = ucs_calloc(1, sizeof(uct_tl_resource_desc_t), "ROCm copy resource desc");
-    if (NULL == resource) {
-        ucs_error("Failed to allocate memory");
-        return UCS_ERR_NO_MEMORY;
-    }
-
-    ucs_snprintf_zero(resource->tl_name, sizeof(resource->tl_name), "%s",
-                      UCT_ROCM_GDR_TL_NAME);
-    ucs_snprintf_zero(resource->dev_name, sizeof(resource->dev_name), "%s",
-                      md->component->name);
-
-    resource->dev_type = UCT_DEVICE_TYPE_ACC;
-
-    *num_resources_p = 1;
-    *resource_p = resource;
-    return UCS_OK;
-}
-
-UCT_TL_COMPONENT_DEFINE(uct_rocm_gdr_tl,
-                        uct_rocm_gdr_query_tl_resources,
-                        uct_rocm_gdr_iface_t,
-                        UCT_ROCM_GDR_TL_NAME,
-                        "ROCM_GDR_",
-                        uct_rocm_gdr_iface_config_table,
-                        uct_rocm_gdr_iface_config_t);
-
-UCT_MD_REGISTER_TL(&uct_rocm_gdr_md_component, &uct_rocm_gdr_tl);
+UCT_TL_DEFINE(&uct_rocm_gdr_component, rocm_gdr, uct_rocm_base_query_devices,
+              uct_rocm_gdr_iface_t, "ROCM_GDR_",
+              uct_rocm_gdr_iface_config_table, uct_rocm_gdr_iface_config_t);

@@ -1,7 +1,7 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2013.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
 * Copyright (C) UT-Battelle, LLC. 2014. ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 * See file LICENSE for terms.
 */
 
@@ -14,7 +14,6 @@
 
 #include <ucs/sys/compiler_def.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <stdio.h>
 
 
@@ -42,7 +41,7 @@ typedef struct ucs_memtrack_entry {
 
 
 
-#if ENABLE_MEMTRACK
+#ifdef ENABLE_MEMTRACK
 
 #define UCS_MEMTRACK_ARG        , const char* alloc_name
 #define UCS_MEMTRACK_VAL        , alloc_name
@@ -51,13 +50,13 @@ typedef struct ucs_memtrack_entry {
 
 
 /**
- * Start trakcing memory (or increment reference count).
+ * Start tracking memory (or increment reference count).
  */
 void ucs_memtrack_init();
 
 
 /**
- * Stop trakcing memory (or decrement reference count).
+ * Stop tracking memory (or decrement reference count).
  */
 void ucs_memtrack_cleanup();
 
@@ -104,7 +103,8 @@ void ucs_memtrack_releasing(void *ptr);
 void *ucs_malloc(size_t size, const char *name);
 void *ucs_calloc(size_t nmemb, size_t size, const char *name);
 void *ucs_realloc(void *ptr, size_t size, const char *name);
-void *ucs_memalign(size_t boundary, size_t size, const char *name);
+int ucs_posix_memalign(void **ptr, size_t boundary, size_t size,
+                       const char *name);
 void ucs_free(void *ptr);
 void *ucs_mmap(void *addr, size_t length, int prot, int flags, int fd,
                off_t offset, const char *name);
@@ -131,7 +131,9 @@ char *ucs_strndup(const char *src, size_t n, const char *name);
 #define ucs_malloc(_s, ...)                        malloc(_s)
 #define ucs_calloc(_n, _s, ...)                    calloc(_n, _s)
 #define ucs_realloc(_p, _s, ...)                   realloc(_p, _s)
-#define ucs_memalign(_b, _s, ...)                  memalign(_b, _s)
+#if HAVE_POSIX_MEMALIGN
+#define ucs_posix_memalign(_pp, _b, _s, ...)       posix_memalign(_pp, _b, _s)
+#endif
 #define ucs_free(_p)                               free(_p)
 #define ucs_mmap(_a, _l, _p, _fl, _fd, _o, ...)    mmap(_a, _l, _p, _fl, _fd, _o)
 #define ucs_munmap(_a, _l)                         munmap(_a, _l)

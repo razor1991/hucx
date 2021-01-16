@@ -12,7 +12,6 @@
 extern "C" {
 #include <ucs/async/async.h>
 #include <ucs/sys/string.h>
-#include <ucs/sys/sys.h>
 }
 #include <pthread.h>
 #include <string>
@@ -113,7 +112,7 @@ void test_perf::rte::exchange_vec(void *rte_group, void * req)
 }
 
 void test_perf::rte::report(void *rte_group, const ucx_perf_result_t *result,
-                            void *arg, int is_final)
+                            void *arg, int is_final, int is_multi_thread)
 {
 }
 
@@ -193,12 +192,11 @@ test_perf::test_result test_perf::run_multi_threaded(const test_spec &test, unsi
     params.alignment       = ucs_get_page_size();
     params.max_outstanding = test.max_outstanding;
     if (ucs::test_time_multiplier() == 1) {
-        params.warmup_iter     = test.iters / 10;
-        params.max_iter        = test.iters;
+        params.warmup_iter = test.iters / 10;
+        params.max_iter    = test.iters;
     } else {
-        params.warmup_iter     = 0;
-        params.max_iter        = ucs_min(20u,
-                                         test.iters / ucs::test_time_multiplier());
+        params.warmup_iter = 0;
+        params.max_iter    = ucs_min(20u, test.iters / ucs::test_time_multiplier());
     }
     params.max_time        = 0.0;
     params.report_interval = 1.0;
@@ -206,7 +204,7 @@ test_perf::test_result test_perf::run_multi_threaded(const test_spec &test, unsi
     params.rte             = &rte::test_rte;
     params.report_arg      = NULL;
     ucs_strncpy_zero(params.uct.dev_name, dev_name.c_str(), sizeof(params.uct.dev_name));
-    ucs_strncpy_zero(params.uct.tl_name , tl_name.c_str(),  sizeof(params.uct.tl_name));
+    ucs_strncpy_zero(params.uct.tl_name , tl_name.c_str(), sizeof(params.uct.tl_name));
     params.uct.data_layout = (uct_perf_data_layout_t)test.data_layout;
     params.uct.fc_window   = UCT_PERF_TEST_MAX_FC_WINDOW;
     params.msg_size_cnt    = test.msglencnt;

@@ -4,6 +4,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "parser.h"
 
 #include <ucm/api/ucm.h>
@@ -71,6 +75,11 @@ static ucs_config_field_t ucm_global_config_table[] = {
    ucs_offsetof(ucm_global_config_t, enable_dynamic_mmap_thresh),
    UCS_CONFIG_TYPE_BOOL},
 
+  {"DLOPEN_PROCESS_RPATH", "yes",
+   "Process RPATH section of caller module during dynamic libraries opening.",
+   ucs_offsetof(ucm_global_config_t, dlopen_process_rpath),
+   UCS_CONFIG_TYPE_BOOL},
+
   {NULL}
 };
 
@@ -79,5 +88,5 @@ UCS_CONFIG_REGISTER_TABLE(ucm_global_config_table, "UCM", UCM_CONFIG_PREFIX,
 
 UCS_STATIC_INIT {
     (void)ucs_config_parser_fill_opts(&ucm_global_opts, ucm_global_config_table,
-                                      NULL, UCM_CONFIG_PREFIX, 0);
+                                      UCS_DEFAULT_ENV_PREFIX, UCM_CONFIG_PREFIX, 0);
 }
