@@ -3,13 +3,17 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "rocm_base.h"
 
 #include <ucs/sys/module.h>
 
 #include <hsa_ext_amd.h>
-
 #include <pthread.h>
+
 
 #define MAX_AGENTS 16
 static struct agents {
@@ -29,7 +33,7 @@ static hsa_status_t uct_rocm_hsa_agent_callback(hsa_agent_t agent, void* data)
 {
     hsa_device_type_t device_type;
 
-    assert(uct_rocm_base_agents.num < MAX_AGENTS);
+    ucs_assert(uct_rocm_base_agents.num < MAX_AGENTS);
 
     hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type);
     if (device_type == HSA_DEVICE_TYPE_CPU) {
@@ -87,9 +91,32 @@ end:
     return status;
 }
 
+ucs_status_t
+uct_rocm_base_query_md_resources(uct_component_h component,
+                                 uct_md_resource_desc_t **resources_p,
+                                 unsigned *num_resources_p)
+{
+    if (uct_rocm_base_init() != HSA_STATUS_SUCCESS) {
+        ucs_debug("could not initialize ROCm support");
+        return uct_md_query_empty_md_resource(resources_p, num_resources_p);
+    }
+
+    return uct_md_query_single_md_resource(component, resources_p,
+                                           num_resources_p);
+}
+
+ucs_status_t uct_rocm_base_query_devices(uct_md_h md,
+                                         uct_tl_device_resource_t **tl_devices_p,
+                                         unsigned *num_tl_devices_p)
+{
+    return uct_single_device_resource(md, md->component->name,
+                                      UCT_DEVICE_TYPE_ACC, tl_devices_p,
+                                      num_tl_devices_p);
+}
+
 hsa_agent_t uct_rocm_base_get_dev_agent(int dev_num)
 {
-    assert(dev_num < uct_rocm_base_agents.num);
+    ucs_assert(dev_num < uct_rocm_base_agents.num);
     return uct_rocm_base_agents.agents[dev_num];
 }
 
@@ -101,7 +128,7 @@ int uct_rocm_base_get_dev_num(hsa_agent_t agent)
         if (uct_rocm_base_agents.agents[i].handle == agent.handle)
             return i;
     }
-    assert(0);
+    ucs_assert(0);
     return -1;
 }
 
@@ -143,28 +170,33 @@ hsa_status_t uct_rocm_base_get_ptr_info(void *ptr, size_t size,
     return HSA_STATUS_SUCCESS;
 }
 
-int uct_rocm_base_is_mem_type_owned(uct_md_h md, void *addr, size_t length)
+ucs_status_t uct_rocm_base_detect_memory_type(uct_md_h md, const void *addr,
+                                              size_t length,
+                                              ucs_memory_type_t *mem_type_p)
 {
     hsa_status_t status;
     hsa_amd_pointer_info_t info;
 
     if (addr == NULL) {
-        return 0;
+        *mem_type_p = UCS_MEMORY_TYPE_HOST;
+        return UCS_OK;
     }
 
     info.size = sizeof(hsa_amd_pointer_info_t);
-    status = hsa_amd_pointer_info(addr, &info, NULL, NULL, NULL);
+    status = hsa_amd_pointer_info((void*)addr, &info, NULL, NULL, NULL);
     if ((status == HSA_STATUS_SUCCESS) &&
         (info.type == HSA_EXT_POINTER_TYPE_HSA)) {
         hsa_device_type_t dev_type;
 
         status = hsa_agent_get_info(info.agentOwner, HSA_AGENT_INFO_DEVICE, &dev_type);
         if ((status == HSA_STATUS_SUCCESS) &&
-            (dev_type == HSA_DEVICE_TYPE_GPU))
-            return 1;
+            (dev_type == HSA_DEVICE_TYPE_GPU)) {
+            *mem_type_p = UCS_MEMORY_TYPE_ROCM;
+            return UCS_OK;
+        }
     }
 
-    return 0;
+    return UCS_ERR_INVALID_ADDR;
 }
 
 UCS_MODULE_INIT() {

@@ -3,6 +3,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "rdmacm_iface.h"
 #include "rdmacm_ep.h"
 #include <uct/base/uct_worker.h>
@@ -15,6 +19,10 @@ enum uct_rdmacm_process_event_flags {
 };
 
 static ucs_config_field_t uct_rdmacm_iface_config_table[] = {
+    {"", "", NULL,
+     ucs_offsetof(uct_rdmacm_iface_config_t, super),
+     UCS_CONFIG_TYPE_TABLE(uct_iface_config_table)},
+
     {"BACKLOG", "1024",
      "Maximum number of pending connections for an rdma_cm_id.",
      ucs_offsetof(uct_rdmacm_iface_config_t, backlog), UCS_CONFIG_TYPE_UINT},
@@ -31,7 +39,11 @@ static UCS_CLASS_DECLARE_DELETE_FUNC(uct_rdmacm_iface_t, uct_iface_t);
 static ucs_status_t uct_rdmacm_iface_query(uct_iface_h tl_iface,
                                            uct_iface_attr_t *iface_attr)
 {
-    memset(iface_attr, 0, sizeof(uct_iface_attr_t));
+    uct_rdmacm_iface_t *rdmacm_iface = ucs_derived_of(tl_iface, uct_rdmacm_iface_t);
+    struct sockaddr *addr;
+    ucs_status_t status;
+
+    uct_base_iface_query(&rdmacm_iface->super, iface_attr);
 
     iface_attr->iface_addr_len  = sizeof(ucs_sock_addr_t);
     iface_attr->device_addr_len = 0;
@@ -42,15 +54,16 @@ static ucs_status_t uct_rdmacm_iface_query(uct_iface_h tl_iface,
      * the private_data header (to hold the length of the data) */
     iface_attr->max_conn_priv   = UCT_RDMACM_MAX_CONN_PRIV;
 
-    return UCS_OK;
-}
+    if (rdmacm_iface->is_server) {
+        addr   = rdma_get_local_addr(rdmacm_iface->cm_id);
+        status = ucs_sockaddr_copy((struct sockaddr *)&iface_attr->listen_sockaddr,
+                                   addr);
+        if (status != UCS_OK) {
+            return status;
+        }
+    }
 
-static int uct_rdmacm_iface_is_reachable(const uct_iface_h tl_iface,
-                                         const uct_device_addr_t *dev_addr,
-                                         const uct_iface_addr_t *iface_addr)
-{
-    /* Reachability can be checked with the uct_md_is_sockaddr_accessible API call */
-    return 1;
+    return UCS_OK;
 }
 
 static ucs_status_t uct_rdmacm_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *iface_addr)
@@ -98,7 +111,7 @@ static ucs_status_t uct_rdmacm_iface_reject(uct_iface_h tl_iface,
     ucs_status_t               status = UCS_OK;
     uct_rdmacm_priv_data_hdr_t hdr    = {
         .length = 0,
-        .status = UCS_ERR_REJECTED
+        .status = (uint8_t)UCS_ERR_REJECTED
     };
 
     ucs_trace("rejecting event %p with id %p", event, event->id);
@@ -143,15 +156,15 @@ static uct_iface_ops_t uct_rdmacm_iface_ops = {
     .ep_pending_purge         = ucs_empty_function,
     .iface_accept             = uct_rdmacm_iface_accept,
     .iface_reject             = uct_rdmacm_iface_reject,
-    .iface_progress_enable    = (void*)ucs_empty_function_return_success,
-    .iface_progress_disable   = (void*)ucs_empty_function_return_success,
+    .iface_progress_enable    = (uct_iface_progress_enable_func_t)ucs_empty_function_return_success,
+    .iface_progress_disable   = (uct_iface_progress_disable_func_t)ucs_empty_function_return_success,
     .iface_progress           = ucs_empty_function_return_zero,
     .iface_flush              = uct_base_iface_flush,
     .iface_fence              = uct_base_iface_fence,
     .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_rdmacm_iface_t),
     .iface_query              = uct_rdmacm_iface_query,
-    .iface_is_reachable       = uct_rdmacm_iface_is_reachable,
-    .iface_get_device_address = (void*)ucs_empty_function_return_success,
+    .iface_is_reachable       = (uct_iface_is_reachable_func_t)ucs_empty_function_return_zero,
+    .iface_get_device_address = (uct_iface_get_device_address_func_t)ucs_empty_function_return_success,
     .iface_get_address        = uct_rdmacm_iface_get_address
 };
 
@@ -236,8 +249,10 @@ static void uct_rdmacm_iface_process_conn_req(uct_rdmacm_iface_t *iface,
  * is locked.
  */
 static void uct_rdmacm_iface_release_cm_id(uct_rdmacm_iface_t *iface,
-                                          uct_rdmacm_ctx_t *cm_id_ctx)
+                                           uct_rdmacm_ctx_t **cm_id_ctx_p)
 {
+    uct_rdmacm_ctx_t *cm_id_ctx = *cm_id_ctx_p;
+
     ucs_trace("destroying cm_id %p", cm_id_ctx->cm_id);
 
     ucs_list_del(&cm_id_ctx->list);
@@ -247,13 +262,8 @@ static void uct_rdmacm_iface_release_cm_id(uct_rdmacm_iface_t *iface,
     rdma_destroy_id(cm_id_ctx->cm_id);
     ucs_free(cm_id_ctx);
     iface->cm_id_quota++;
-}
 
-static void uct_rdmacm_iface_cm_id_to_dev_name(struct rdma_cm_id *cm_id,
-                                               char *dev_name)
-{
-    ucs_snprintf_zero(dev_name, UCT_DEVICE_NAME_MAX, "%s:%d",
-                      ibv_get_device_name(cm_id->verbs->device), cm_id->port_num);
+    *cm_id_ctx_p = NULL;
 }
 
 static unsigned
@@ -264,9 +274,10 @@ uct_rdmacm_iface_process_event(uct_rdmacm_iface_t *iface,
     uct_rdmacm_md_t *rdmacm_md   = (uct_rdmacm_md_t *)iface->super.md;
     unsigned ret_flags           = UCT_RDMACM_PROCESS_EVENT_ACK_EVENT_FLAG;
     uct_rdmacm_ep_t *ep          = NULL;
+    uct_cm_ep_priv_data_pack_args_t pack_args;
     char ip_port_str[UCS_SOCKADDR_STRING_LEN];
     char dev_name[UCT_DEVICE_NAME_MAX];
-    uct_rdmacm_priv_data_hdr_t hdr;
+    uct_rdmacm_priv_data_hdr_t *hdr;
     struct rdma_conn_param conn_param;
     uct_rdmacm_ctx_t *cm_id_ctx;
     ssize_t priv_data_ret;
@@ -314,30 +325,29 @@ uct_rdmacm_iface_process_event(uct_rdmacm_iface_t *iface,
             conn_param.private_data = ucs_alloca(UCT_RDMACM_MAX_CONN_PRIV +
                                                  sizeof(uct_rdmacm_priv_data_hdr_t));
 
-            uct_rdmacm_iface_cm_id_to_dev_name(ep->cm_id_ctx->cm_id, dev_name);
+            uct_rdmacm_cm_id_to_dev_name(ep->cm_id_ctx->cm_id, dev_name);
+
+            hdr                  = (uct_rdmacm_priv_data_hdr_t*)conn_param.private_data;
+            pack_args.field_mask = UCT_CM_EP_PRIV_DATA_PACK_ARGS_FIELD_DEVICE_NAME;
+            ucs_strncpy_safe(pack_args.dev_name, dev_name, UCT_DEVICE_NAME_MAX);
             /* TODO check the ep's cb_flags to determine when to invoke this callback.
              * currently only UCT_CB_FLAG_ASYNC is supported so the cb is invoked from here */
-            priv_data_ret = ep->pack_cb(ep->pack_cb_arg, dev_name,
-                                        (void*)(conn_param.private_data +
-                                        sizeof(uct_rdmacm_priv_data_hdr_t)));
+            priv_data_ret = ep->pack_cb(ep->pack_cb_arg, &pack_args, hdr + 1);
             if (priv_data_ret < 0) {
                 ucs_trace("rdmacm client (iface=%p cm_id=%p fd=%d) failed to fill "
                           "private data. status: %s",
                           iface, event->id, iface->event_ch->fd,
-                          ucs_status_string(priv_data_ret));
+                          ucs_status_string((ucs_status_t)priv_data_ret));
                 ret_flags |= UCT_RDMACM_PROCESS_EVENT_DESTROY_CM_ID_FLAG;
-                uct_rdmacm_client_handle_failure(iface, ep, priv_data_ret);
+                uct_rdmacm_client_handle_failure(iface, ep, (ucs_status_t)priv_data_ret);
                 break;
             }
 
-            hdr.length = (uint8_t)priv_data_ret;
-            hdr.status = UCS_OK;
-            UCS_STATIC_ASSERT(sizeof(hdr) == sizeof(uct_rdmacm_priv_data_hdr_t));
+            hdr->length = (uint8_t)priv_data_ret;
+            hdr->status = UCS_OK;
             /* The private_data starts with the header of the user's private data
              * and then the private data itself */
-            memcpy((void*)conn_param.private_data, &hdr, sizeof(uct_rdmacm_priv_data_hdr_t));
-            conn_param.private_data_len = sizeof(uct_rdmacm_priv_data_hdr_t) +
-                                          hdr.length;
+            conn_param.private_data_len = sizeof(*hdr) + hdr->length;
 
             if (rdma_connect(event->id, &conn_param)) {
                 ucs_error("rdma_connect(to addr=%s) failed: %m",
@@ -381,11 +391,11 @@ uct_rdmacm_iface_process_event(uct_rdmacm_iface_t *iface,
 
     /* client error events */
     case RDMA_CM_EVENT_UNREACHABLE:
-        hdr = *(uct_rdmacm_priv_data_hdr_t *)event->param.conn.private_data;
-        if ((event->param.conn.private_data_len > 0) &&
-            (hdr.status == UCS_ERR_REJECTED)) {
-            ucs_assert(hdr.length == 0);
-            ucs_assert(event->param.conn.private_data_len >= sizeof(hdr));
+        hdr = (uct_rdmacm_priv_data_hdr_t *)event->param.ud.private_data;
+        if ((hdr != NULL) && (event->param.ud.private_data_len > 0) &&
+            ((ucs_status_t)hdr->status == UCS_ERR_REJECTED)) {
+            ucs_assert(hdr->length == 0);
+            ucs_assert(event->param.ud.private_data_len >= sizeof(*hdr));
             ucs_assert(!iface->is_server);
             status = UCS_ERR_REJECTED;
         }
@@ -417,7 +427,7 @@ uct_rdmacm_iface_process_event(uct_rdmacm_iface_t *iface,
     return ret_flags;
 }
 
-static void uct_rdmacm_iface_event_handler(int fd, void *arg)
+static void uct_rdmacm_iface_event_handler(int fd, int events, void *arg)
 {
     uct_rdmacm_iface_t             *iface     = arg;
     uct_rdmacm_ctx_t               *cm_id_ctx = NULL;
@@ -451,7 +461,7 @@ static void uct_rdmacm_iface_event_handler(int fd, void *arg)
 
         if ((proc_event_flags & UCT_RDMACM_PROCESS_EVENT_DESTROY_CM_ID_FLAG) &&
             (cm_id_ctx != NULL)) {
-            uct_rdmacm_iface_release_cm_id(iface, cm_id_ctx);
+            uct_rdmacm_iface_release_cm_id(iface, &cm_id_ctx);
             uct_rdmacm_iface_client_start_next_ep(iface);
         }
     }
@@ -513,6 +523,8 @@ static UCS_CLASS_INIT_FUNC(uct_rdmacm_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     if (params->open_mode & UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER) {
+        self->is_server = 1;
+
         /* Create an id for this interface. Events associated with this id will be
          * reported on the event_channel that was previously created. */
         if (rdma_create_id(self->event_ch, &self->cm_id, NULL, RDMA_PS_UDP)) {
@@ -552,7 +564,6 @@ static UCS_CLASS_INIT_FUNC(uct_rdmacm_iface_t, uct_md_h md, uct_worker_h worker,
         self->cb_flags         = params->mode.sockaddr.cb_flags;
         self->conn_request_cb  = params->mode.sockaddr.conn_request_cb;
         self->conn_request_arg = params->mode.sockaddr.conn_request_arg;
-        self->is_server        = 1;
     } else {
         self->cm_id            = NULL;
         self->is_server        = 0;
@@ -564,7 +575,7 @@ static UCS_CLASS_INIT_FUNC(uct_rdmacm_iface_t, uct_md_h md, uct_worker_h worker,
 
     /* Server and client register an event handler for incoming messages */
     status = ucs_async_set_event_handler(self->super.worker->async->mode,
-                                         self->event_ch->fd, POLLIN,
+                                         self->event_ch->fd, UCS_EVENT_SET_EVREAD,
                                          uct_rdmacm_iface_event_handler,
                                          self, self->super.worker->async);
     if (status != UCS_OK) {
@@ -578,7 +589,9 @@ static UCS_CLASS_INIT_FUNC(uct_rdmacm_iface_t, uct_md_h md, uct_worker_h worker,
     return UCS_OK;
 
 err_destroy_id:
-    rdma_destroy_id(self->cm_id);
+    if (self->is_server) {
+        rdma_destroy_id(self->cm_id);
+    }
 err_destroy_event_channel:
     rdma_destroy_event_channel(self->event_ch);
 err:
@@ -587,7 +600,7 @@ err:
 
 static UCS_CLASS_CLEANUP_FUNC(uct_rdmacm_iface_t)
 {
-    uct_rdmacm_ctx_t *cm_id_ctx;
+    uct_rdmacm_ctx_t *cm_id_ctx, *tmp_cm_id_ctx;
 
     ucs_async_remove_handler(self->event_ch->fd, 1);
     if (self->is_server) {
@@ -596,12 +609,9 @@ static UCS_CLASS_CLEANUP_FUNC(uct_rdmacm_iface_t)
 
     UCS_ASYNC_BLOCK(self->super.worker->async);
 
-    while (!ucs_list_is_empty(&self->used_cm_ids_list)) {
-        cm_id_ctx = ucs_list_extract_head(&self->used_cm_ids_list,
-                                          uct_rdmacm_ctx_t, list);
-        rdma_destroy_id(cm_id_ctx->cm_id);
-        ucs_free(cm_id_ctx);
-        self->cm_id_quota++;
+    ucs_list_for_each_safe(cm_id_ctx, tmp_cm_id_ctx,
+                           &self->used_cm_ids_list, list) {
+        uct_rdmacm_iface_release_cm_id(self, &cm_id_ctx);
     }
 
     UCS_ASYNC_UNBLOCK(self->super.worker->async);
@@ -615,20 +625,15 @@ static UCS_CLASS_DEFINE_NEW_FUNC(uct_rdmacm_iface_t, uct_iface_t, uct_md_h,
                                  const uct_iface_config_t *);
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_rdmacm_iface_t, uct_iface_t);
 
-static ucs_status_t uct_rdmacm_query_tl_resources(uct_md_h md,
-                                                  uct_tl_resource_desc_t **resource_p,
-                                                  unsigned *num_resources_p)
+static ucs_status_t
+uct_rdmacm_query_tl_devices(uct_md_h md, uct_tl_device_resource_t **tl_devices_p,
+                            unsigned *num_tl_devices_p)
 {
-    *num_resources_p = 0;
-    *resource_p      = NULL;
+    *num_tl_devices_p = 0;
+    *tl_devices_p     = NULL;
     return UCS_OK;
 }
 
-UCT_TL_COMPONENT_DEFINE(uct_rdmacm_tl,
-                        uct_rdmacm_query_tl_resources,
-                        uct_rdmacm_iface_t,
-                        UCT_RDMACM_TL_NAME,
-                        "RDMACM_",
-                        uct_rdmacm_iface_config_table,
-                        uct_rdmacm_iface_config_t);
-UCT_MD_REGISTER_TL(&uct_rdmacm_mdc, &uct_rdmacm_tl);
+UCT_TL_DEFINE(&uct_rdmacm_component, rdmacm, uct_rdmacm_query_tl_devices,
+              uct_rdmacm_iface_t, "RDMACM_", uct_rdmacm_iface_config_table,
+              uct_rdmacm_iface_config_t);

@@ -1,6 +1,5 @@
 /**
- * Copyright (C) Mellanox Technologies Ltd. 2001-2015.  ALL RIGHTS RESERVED.
- * Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+ * Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
  *
  * See file LICENSE for terms.
  */
@@ -13,7 +12,7 @@
 #include "ucp_context.h"
 #include "ucp_thread.h"
 
-#include <ucp/proto/proto.h>
+#include <ucp/core/ucp_am.h>
 #include <ucp/tag/tag_match.h>
 #include <ucp/wireup/ep_match.h>
 #include <ucs/datastruct/mpool.h>
@@ -25,7 +24,7 @@
 /* The size of the private buffer in UCT descriptor headroom, which UCP may
  * use for its own needs. This size does not include ucp_recv_desc_t length,
  * because it is common for all cases and protocols (TAG, STREAM). */
-#define UCP_WORKER_HEADROOM_PRIV_SIZE 24
+#define UCP_WORKER_HEADROOM_PRIV_SIZE 32
 
 
 #if ENABLE_MT
@@ -97,6 +96,11 @@ enum {
 
     UCP_WORKER_STAT_TAG_RX_RNDV_EXP,
     UCP_WORKER_STAT_TAG_RX_RNDV_UNEXP,
+
+    UCP_WORKER_STAT_TAG_RX_RNDV_GET_ZCOPY,
+    UCP_WORKER_STAT_TAG_RX_RNDV_SEND_RTR,
+    UCP_WORKER_STAT_TAG_RX_RNDV_RKEY_PTR,
+
     UCP_WORKER_STAT_LAST
 };
 
@@ -114,6 +118,7 @@ enum {
     UCP_WORKER_STAT_TAG_OFFLOAD_BLOCK_WILDCARD,
     UCP_WORKER_STAT_TAG_OFFLOAD_BLOCK_SW_PEND,
     UCP_WORKER_STAT_TAG_OFFLOAD_BLOCK_NO_IFACE,
+    UCP_WORKER_STAT_TAG_OFFLOAD_BLOCK_MEM_REG,
     UCP_WORKER_STAT_TAG_OFFLOAD_RX_UNEXP_EGR,
     UCP_WORKER_STAT_TAG_OFFLOAD_RX_UNEXP_RNDV,
     UCP_WORKER_STAT_TAG_OFFLOAD_RX_UNEXP_SW_RNDV,
@@ -134,7 +139,7 @@ enum {
 
 #define UCP_WORKER_STAT_EAGER_MSG(_worker, _flags) \
     UCS_STATS_UPDATE_COUNTER((_worker)->stats, \
-                             (_flags & UCP_RECV_DESC_FLAG_EAGER_SYNC) ? \
+                             ((_flags) & UCP_RECV_DESC_FLAG_EAGER_SYNC) ? \
                              UCP_WORKER_STAT_TAG_RX_EAGER_SYNC_MSG : \
                              UCP_WORKER_STAT_TAG_RX_EAGER_MSG, 1);
 
@@ -142,21 +147,21 @@ enum {
     UCS_STATS_UPDATE_COUNTER((_worker)->stats, \
                              UCP_WORKER_STAT_TAG_RX_EAGER_CHUNK_##_is_exp, 1);
 
-#define UCP_WORKER_STAT_RNDV(_worker, _is_exp) \
+#define UCP_WORKER_STAT_RNDV(_worker, _is_exp, _value) \
     UCS_STATS_UPDATE_COUNTER((_worker)->stats, \
-                             UCP_WORKER_STAT_TAG_RX_RNDV_##_is_exp, 1);
+                             UCP_WORKER_STAT_TAG_RX_RNDV_##_is_exp, _value);
 
 #define UCP_WORKER_STAT_TAG_OFFLOAD(_worker, _name) \
     UCS_STATS_UPDATE_COUNTER((_worker)->tm_offload_stats, \
                              UCP_WORKER_STAT_TAG_OFFLOAD_##_name, 1);
 
-#define ucp_worker_mpool_get(_worker) \
+#define ucp_worker_mpool_get(_mp) \
     ({ \
-        ucp_mem_desc_t *rdesc = ucs_mpool_get_inline(&(_worker)->reg_mp); \
-        if (rdesc != NULL) { \
-            VALGRIND_MAKE_MEM_DEFINED(rdesc, sizeof(*rdesc)); \
+        ucp_mem_desc_t *_rdesc = ucs_mpool_get_inline(_mp); \
+        if (_rdesc != NULL) { \
+            VALGRIND_MAKE_MEM_DEFINED(_rdesc, sizeof(*_rdesc)); \
         } \
-        rdesc; \
+        _rdesc; \
     })
 
 
@@ -182,6 +187,16 @@ struct ucp_worker_iface {
 
 
 /**
+ * UCP worker CM, which encapsulates UCT CM and its auxiliary info.
+ */
+struct ucp_worker_cm {
+    uct_cm_h                      cm;            /* UCT CM handle */
+    ucp_rsc_index_t               cmpt_idx;      /* Index of corresponding
+                                                    component */
+};
+
+
+/**
  * UCP worker (thread context).
  */
 typedef struct ucp_worker {
@@ -191,6 +206,7 @@ typedef struct ucp_worker {
     uint64_t                      uuid;          /* Unique ID for wireup */
     uct_worker_h                  uct;           /* UCT worker handle */
     ucs_mpool_t                   req_mp;        /* Memory pool for requests */
+    ucs_mpool_t                   rkey_mp;       /* Pool for small memory keys */
     uint64_t                      atomic_tls;    /* Which resources can be used for atomics */
 
     int                           inprogress;
@@ -198,7 +214,8 @@ typedef struct ucp_worker {
 
     unsigned                      flush_ops_count;/* Number of pending operations */
 
-    int                           epfd;          /* Allocated (on-demand) epoll fd for wakeup */
+    int                           event_fd;      /* Allocated (on-demand) event fd for wakeup */
+    ucs_sys_event_set_t           *event_set;    /* Allocated UCS event set for wakeup */
     int                           eventfd;       /* Event fd to support signal() calls */
     unsigned                      uct_events;    /* UCT arm events */
     ucs_list_link_t               arm_ifaces;    /* List of interfaces to arm */
@@ -208,18 +225,25 @@ typedef struct ucp_worker {
     ucs_list_link_t               stream_ready_eps; /* List of EPs with received stream data */
     ucs_list_link_t               all_eps;       /* List of all endpoints */
     ucp_ep_match_ctx_t            ep_match_ctx;  /* Endpoint-to-endpoint matching context */
-    ucp_worker_iface_t            *ifaces;       /* Array of interfaces, one for each resource */
+    ucp_worker_iface_t            **ifaces;      /* Array of pointers to interfaces,
+                                                    one for each resource */
     unsigned                      num_ifaces;    /* Number of elements in ifaces array  */
     unsigned                      num_active_ifaces; /* Number of activated ifaces  */
+    uint64_t                      scalable_tl_bitmap; /* Map of scalable tl resources */
+    ucp_worker_cm_t               *cms;          /* Array of CMs, one for each component */
     ucs_mpool_t                   am_mp;         /* Memory pool for AM receives */
     ucs_mpool_t                   reg_mp;        /* Registered memory pool */
     ucs_mpool_t                   rndv_frag_mp;  /* Memory pool for RNDV fragments */
+    ucs_queue_head_t              rkey_ptr_reqs; /* Queue of submitted RKEY PTR requests that
+                                                  * are in-progress */
+    uct_worker_cb_id_t            rkey_ptr_cb_id;/* RKEY PTR worker callback queue ID */
     ucp_tag_match_t               tm;            /* Tag-matching queues and offload info */
-    void                         *groups;        /* Groups and collectives context */
-    ucp_ep_h                      mem_type_ep[UCT_MD_MEM_TYPE_LAST];/* memory type eps */
+    ucp_am_context_t              am;            /* Array of AM callbacks and their data */
+    uint64_t                      am_message_id; /* For matching long am's */
+    ucp_ep_h                      mem_type_ep[UCS_MEMORY_TYPE_LAST];/* memory type eps */
 
-    UCS_STATS_NODE_DECLARE(stats);
-    UCS_STATS_NODE_DECLARE(tm_offload_stats);
+    UCS_STATS_NODE_DECLARE(stats)
+    UCS_STATS_NODE_DECLARE(tm_offload_stats)
 
     ucs_cpu_set_t                 cpu_mask;        /* Save CPU mask for subsequent calls to ucp_worker_listen */
     unsigned                      ep_config_max;   /* Maximal number of configurations */
@@ -240,12 +264,14 @@ typedef struct ucp_worker_err_handle_arg {
 } ucp_worker_err_handle_arg_t;
 
 
-unsigned ucp_worker_get_ep_config(ucp_worker_h worker,
-                                  const ucp_ep_config_key_t *key);
+ucs_status_t ucp_worker_get_ep_config(ucp_worker_h worker,
+                                      const ucp_ep_config_key_t *key,
+                                      int print_cfg,
+                                      ucp_ep_cfg_index_t *config_idx_p);
 
 ucs_status_t ucp_worker_iface_open(ucp_worker_h worker, ucp_rsc_index_t tl_id,
                                    uct_iface_params_t *iface_params,
-                                   ucp_worker_iface_t *wiface);
+                                   ucp_worker_iface_t **wiface);
 
 ucs_status_t ucp_worker_iface_init(ucp_worker_h worker, ucp_rsc_index_t tl_id,
                                    ucp_worker_iface_t *wiface);
@@ -286,7 +312,15 @@ static inline ucp_ep_h ucp_worker_get_ep_by_ptr(ucp_worker_h worker,
 static UCS_F_ALWAYS_INLINE ucp_worker_iface_t*
 ucp_worker_iface(ucp_worker_h worker, ucp_rsc_index_t rsc_index)
 {
-    return &worker->ifaces[ucs_bitmap2idx(worker->context->tl_bitmap, rsc_index)];
+    uint64_t tl_bitmap;
+
+    if (rsc_index == UCP_NULL_RESOURCE) {
+        return NULL;
+    }
+
+    tl_bitmap = worker->context->tl_bitmap;
+    ucs_assert(UCS_BIT(rsc_index) & tl_bitmap);
+    return worker->ifaces[ucs_bitmap2idx(tl_bitmap, rsc_index)];
 }
 
 static UCS_F_ALWAYS_INLINE uct_iface_attr_t*
@@ -295,10 +329,30 @@ ucp_worker_iface_get_attr(ucp_worker_h worker, ucp_rsc_index_t rsc_index)
     return &ucp_worker_iface(worker, rsc_index)->attr;
 }
 
+static UCS_F_ALWAYS_INLINE double
+ucp_worker_iface_bandwidth(ucp_worker_h worker, ucp_rsc_index_t rsc_index)
+{
+    uct_iface_attr_t *iface_attr = ucp_worker_iface_get_attr(worker, rsc_index);
+
+    return ucp_tl_iface_bandwidth(worker->context, &iface_attr->bandwidth);
+}
+
 static UCS_F_ALWAYS_INLINE int
 ucp_worker_unified_mode(ucp_worker_h worker)
 {
     return worker->context->config.ext.unified_mode;
+}
+
+static UCS_F_ALWAYS_INLINE ucp_rsc_index_t
+ucp_worker_num_cm_cmpts(const ucp_worker_h worker)
+{
+    return worker->context->config.num_cm_cmpts;
+}
+
+static UCS_F_ALWAYS_INLINE int
+ucp_worker_sockaddr_is_cm_proto(const ucp_worker_h worker)
+{
+    return !!ucp_worker_num_cm_cmpts(worker);
 }
 
 #endif

@@ -4,19 +4,29 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "async_int.h"
 
 #include <ucs/arch/atomic.h>
 #include <ucs/debug/debug.h>
 #include <ucs/datastruct/khash.h>
-#include <ucs/sys/sys.h>
+#include <ucs/sys/stubs.h>
 
 
-#define UCS_ASYNC_TIMER_ID_MIN      1000000u
-#define UCS_ASYNC_TIMER_ID_MAX      2000000u
+#define UCS_ASYNC_TIMER_ID_MIN          1000000u
+#define UCS_ASYNC_TIMER_ID_MAX          2000000u
 
-#define UCS_ASYNC_HANDLER_FMT       "%p [id=%d] %s()"
-#define UCS_ASYNC_HANDLER_ARG(_h)   (_h), (_h)->id, ucs_debug_get_symbol_name((_h)->cb)
+#define UCS_ASYNC_HANDLER_FMT           "%p [id=%d ref %d] %s()"
+#define UCS_ASYNC_HANDLER_ARG(_h)       (_h), (_h)->id, (_h)->refcount, \
+                                        ucs_debug_get_symbol_name((_h)->cb)
+
+#define UCS_ASYNC_HANDLER_CALLER_NULL   ((pthread_t)-1)
+
+#define UCS_ASYNC_MISSED_QUEUE_SHIFT    32
+#define UCS_ASYNC_MISSED_QUEUE_MASK     UCS_MASK(UCS_ASYNC_MISSED_QUEUE_SHIFT)
 
 /* Hash table for all event and timer handlers */
 KHASH_MAP_INIT_INT(ucs_async_handler, ucs_async_handler_t *);
@@ -87,6 +97,18 @@ static inline int ucs_async_handler_kh_is_end(khiter_t hash_it)
     return hash_it == kh_end(&ucs_async_global_context.handlers);
 }
 
+static inline uint64_t ucs_async_missed_event_pack(int id, int events)
+{
+    return ((uint64_t)id << UCS_ASYNC_MISSED_QUEUE_SHIFT) | (uint32_t)events;
+}
+
+static inline void ucs_async_missed_event_unpack(uint64_t value, int *id_p,
+                                                 int *events_p)
+{
+    *id_p     = value >> UCS_ASYNC_MISSED_QUEUE_SHIFT;
+    *events_p = value & UCS_ASYNC_MISSED_QUEUE_MASK;
+}
+
 static void ucs_async_handler_hold(ucs_async_handler_t *handler)
 {
     ucs_atomic_add32(&handler->refcount, 1);
@@ -140,7 +162,7 @@ static ucs_async_handler_t *ucs_async_handler_extract(int id)
 /* decrement reference count and release the handler if reached 0 */
 static void ucs_async_handler_put(ucs_async_handler_t *handler)
 {
-    if (ucs_atomic_fadd32(&handler->refcount, -1) > 1) {
+    if (ucs_atomic_fsub32(&handler->refcount, 1) > 1) {
         return;
     }
 
@@ -153,9 +175,9 @@ static void ucs_async_handler_put(ucs_async_handler_t *handler)
 static ucs_status_t ucs_async_handler_add(int min_id, int max_id,
                                           ucs_async_handler_t *handler)
 {
+    khiter_t hash_it = 0;
     int hash_extra_status;
     ucs_status_t status;
-    khiter_t hash_it;
     int i, id;
 
     pthread_rwlock_wrlock(&ucs_async_global_context.handlers_lock);
@@ -202,31 +224,48 @@ out_unlock:
     return status;
 }
 
-static ucs_status_t ucs_async_handler_dispatch(ucs_async_handler_t *handler)
+static void ucs_async_handler_invoke(ucs_async_handler_t *handler, int events)
+{
+    ucs_trace_async("calling async handler " UCS_ASYNC_HANDLER_FMT,
+                    UCS_ASYNC_HANDLER_ARG(handler));
+
+    /* track call count to allow removing the handler synchronously from itself
+     * the handler must always be called with async context blocked, so no need
+     * for atomic operations here.
+     */
+    ucs_assert(handler->caller == UCS_ASYNC_HANDLER_CALLER_NULL);
+    handler->caller = pthread_self();
+    handler->cb(handler->id, events, handler->arg);
+    handler->caller = UCS_ASYNC_HANDLER_CALLER_NULL;
+}
+
+static ucs_status_t ucs_async_handler_dispatch(ucs_async_handler_t *handler,
+                                               int events)
 {
     ucs_async_context_t *async;
     ucs_async_mode_t mode;
     ucs_status_t status;
+    uint64_t value;
 
     mode  = handler->mode;
     async = handler->async;
-    if (async != NULL) {
-        async->last_wakeup = ucs_get_time();
-    }
+
     if (async == NULL) {
-        ucs_trace_async("calling async handler " UCS_ASYNC_HANDLER_FMT,
-                        UCS_ASYNC_HANDLER_ARG(handler));
-        handler->cb(handler->id, handler->arg);
-    } else if (ucs_async_method_call(mode, context_try_block, async)) {
-        ucs_trace_async("calling async handler " UCS_ASYNC_HANDLER_FMT,
-                        UCS_ASYNC_HANDLER_ARG(handler));
-        handler->cb(handler->id, handler->arg);
+        ucs_async_handler_invoke(handler, events);
+        return UCS_OK;
+    }
+
+    async->last_wakeup = ucs_get_time();
+    if (ucs_async_method_call(mode, context_try_block, async)) {
+        ucs_async_handler_invoke(handler, events);
         ucs_async_method_call(mode, context_unblock, async);
-    } else /* async != NULL */ {
+    } else {
         ucs_trace_async("missed " UCS_ASYNC_HANDLER_FMT ", last_wakeup %lu",
                         UCS_ASYNC_HANDLER_ARG(handler), async->last_wakeup);
         if (ucs_atomic_cswap32(&handler->missed, 0, 1) == 0) {
-            status = ucs_mpmc_queue_push(&async->missed, handler->id);
+            /* save both the handler_id and events */
+            value = ucs_async_missed_event_pack(handler->id, events);
+            status = ucs_mpmc_queue_push(&async->missed, value);
             if (status != UCS_OK) {
                 ucs_fatal("Failed to push event %d to miss queue: %s",
                           handler->id, ucs_status_string(status));
@@ -237,19 +276,20 @@ static ucs_status_t ucs_async_handler_dispatch(ucs_async_handler_t *handler)
     return UCS_OK;
 }
 
-ucs_status_t ucs_async_dispatch_handlers(int *events, size_t count)
+ucs_status_t ucs_async_dispatch_handlers(int *handler_ids, size_t count,
+                                         int events)
 {
     ucs_status_t status = UCS_OK, tmp_status;
     ucs_async_handler_t *handler;
 
-    for (; count > 0; --count, ++events) {
-        handler = ucs_async_handler_get(*events);
+    for (; count > 0; --count, ++handler_ids) {
+        handler = ucs_async_handler_get(*handler_ids);
         if (handler == NULL) {
-            ucs_trace_async("handler for %d not found - ignoring", *events);
+            ucs_trace_async("handler for %d not found - ignoring", *handler_ids);
             continue;
         }
 
-        tmp_status = ucs_async_handler_dispatch(handler);
+        tmp_status = ucs_async_handler_dispatch(handler, events);
         if (tmp_status != UCS_OK) {
             status = tmp_status;
         }
@@ -276,7 +316,8 @@ ucs_status_t ucs_async_dispatch_timerq(ucs_timer_queue_t *timerq,
         }
     })
 
-    return ucs_async_dispatch_handlers(expired_timers, num_timers);
+    return ucs_async_dispatch_handlers(expired_timers, num_timers,
+                                       UCS_ASYNC_EVENT_DUMMY);
 }
 
 ucs_status_t ucs_async_context_init(ucs_async_context_t *async, ucs_async_mode_t mode)
@@ -342,9 +383,8 @@ void ucs_async_context_cleanup(ucs_async_context_t *async)
         pthread_rwlock_rdlock(&ucs_async_global_context.handlers_lock);
         kh_foreach_value(&ucs_async_global_context.handlers, handler, {
             if (async == handler->async) {
-                ucs_warn("async %p handler "UCS_ASYNC_HANDLER_FMT" %s() not released",
-                         async, UCS_ASYNC_HANDLER_ARG(handler),
-                         ucs_debug_get_symbol_name(handler->cb));
+                ucs_warn("async %p handler "UCS_ASYNC_HANDLER_FMT" not released",
+                         async, UCS_ASYNC_HANDLER_ARG(handler));
             }
         });
         ucs_warn("releasing async context with %d handlers", async->num_handlers);
@@ -380,7 +420,7 @@ ucs_async_alloc_handler(int min_id, int max_id, ucs_async_mode_t mode,
 
     /* Limit amount of handlers per context */
     if (async != NULL) {
-        if (ucs_atomic_fadd32(&async->num_handlers, +1) >= ucs_global_opts.async_max_events) {
+        if (ucs_atomic_fadd32(&async->num_handlers, 1) >= ucs_global_opts.async_max_events) {
             status = UCS_ERR_EXCEEDS_LIMIT;
             goto err_dec_num_handlers;
         }
@@ -394,6 +434,7 @@ ucs_async_alloc_handler(int min_id, int max_id, ucs_async_mode_t mode,
 
     handler->mode     = mode;
     handler->events   = events;
+    handler->caller   = UCS_ASYNC_HANDLER_CALLER_NULL;
     handler->cb       = cb;
     handler->arg      = arg;
     handler->async    = async;
@@ -414,7 +455,7 @@ err_free:
     ucs_free(handler);
 err_dec_num_handlers:
     if (async != NULL) {
-        ucs_atomic_add32(&async->num_handlers, -1);
+        ucs_atomic_add32(&async->num_handlers, (uint32_t)-1);
     }
 err:
     return status;
@@ -482,7 +523,7 @@ err:
     return status;
 }
 
-ucs_status_t ucs_async_remove_handler(int id, int sync)
+ucs_status_t ucs_async_remove_handler(int id, int is_sync)
 {
     ucs_async_handler_t *handler;
     ucs_status_t status;
@@ -513,11 +554,14 @@ ucs_status_t ucs_async_remove_handler(int id, int sync)
     }
 
     if (handler->async != NULL) {
-        ucs_atomic_add32(&handler->async->num_handlers, -1);
+        ucs_atomic_add32(&handler->async->num_handlers, (uint32_t)-1);
     }
 
-    if (sync) {
-        while (handler->refcount > 1) {
+    if (is_sync) {
+        int called = (pthread_self() == handler->caller);
+        ucs_trace("waiting for " UCS_ASYNC_HANDLER_FMT " completion (called=%d)",
+                  UCS_ASYNC_HANDLER_ARG(handler), called);
+        while ((handler->refcount - called) > 1) {
             /* TODO use pthread_cond / futex to reduce CPU usage while waiting
              * for the async handler to complete */
             sched_yield();
@@ -537,7 +581,10 @@ ucs_status_t ucs_async_modify_handler(int fd, int events)
         return UCS_ERR_INVALID_PARAM;
     }
 
+    ucs_async_method_call_all(block);
     handler = ucs_async_handler_get(fd);
+    ucs_async_method_call_all(unblock);
+
     if (handler == NULL) {
         return UCS_ERR_NO_ELEM;
     }
@@ -553,8 +600,9 @@ ucs_status_t ucs_async_modify_handler(int fd, int events)
 void __ucs_async_poll_missed(ucs_async_context_t *async)
 {
     ucs_async_handler_t *handler;
+    int handler_id, events;
     ucs_status_t status;
-    uint32_t value;
+    uint64_t value;
 
     ucs_trace_async("miss handler");
 
@@ -568,20 +616,17 @@ void __ucs_async_poll_missed(ucs_async_context_t *async)
         }
 
         ucs_async_method_call_all(block);
-        handler = ucs_async_handler_get(value);
+        UCS_ASYNC_BLOCK(async);
+
+        ucs_async_missed_event_unpack(value, &handler_id, &events);
+        handler = ucs_async_handler_get(handler_id);
         if (handler != NULL) {
-            ucs_trace_async("calling missed async handler " UCS_ASYNC_HANDLER_FMT,
-                            UCS_ASYNC_HANDLER_ARG(handler));
-            if (handler->async) {
-                UCS_ASYNC_BLOCK(handler->async);
-            }
+            ucs_assert(handler->async == async);
             handler->missed = 0;
-            handler->cb(handler->id, handler->arg);
-            if (handler->async) {
-                UCS_ASYNC_UNBLOCK(handler->async);
-            }
+            ucs_async_handler_invoke(handler, events);
             ucs_async_handler_put(handler);
         }
+        UCS_ASYNC_UNBLOCK(async);
         ucs_async_method_call_all(unblock);
     }
 }
@@ -608,7 +653,8 @@ void ucs_async_poll(ucs_async_context_t *async)
     pthread_rwlock_unlock(&ucs_async_global_context.handlers_lock);
 
     for (i = 0; i < n; ++i) {
-        ucs_async_handler_dispatch(handlers[i]);
+        /* dispatch the handler with all the registered events */
+        ucs_async_handler_dispatch(handlers[i], handlers[i]->events);
         ucs_async_handler_put(handlers[i]);
     }
 }
@@ -630,8 +676,8 @@ void ucs_async_global_cleanup()
 {
     int num_elems = kh_size(&ucs_async_global_context.handlers);
     if (num_elems != 0) {
-        ucs_info("async handler table is not empty during exit (contains %d elems)",
-                 num_elems);
+        ucs_debug("async handler table is not empty during exit (contains %d elems)",
+                  num_elems);
     }
     ucs_async_method_call_all(cleanup);
     kh_destroy_inplace(ucs_async_handler, &ucs_async_global_context.handlers);

@@ -4,6 +4,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "dt.h"
 
 #include <ucp/core/ucp_ep.inl>
@@ -15,7 +19,7 @@
 UCS_PROFILE_FUNC(ucs_status_t, ucp_mem_type_unpack,
                  (worker, buffer, recv_data, recv_length, mem_type),
                  ucp_worker_h worker, void *buffer, const void *recv_data,
-                 size_t recv_length, uct_memory_type_t mem_type)
+                 size_t recv_length, ucs_memory_type_t mem_type)
 {
     ucp_ep_h ep         = worker->mem_type_ep[mem_type];
     ucp_md_map_t md_map = 0;
@@ -36,7 +40,8 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_mem_type_unpack,
                                       mem_type, md_index, memh, &md_map,
                                       &rkey_bundle);
     if (status != UCS_OK) {
-        ucs_error("failed to register buffer with mem type domian");
+        ucs_error("failed to register buffer with mem type domain %s",
+                  ucs_memory_type_names[mem_type]);
         return status;
     }
 
@@ -46,7 +51,7 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_mem_type_unpack,
         ucs_error("uct_ep_put_short() failed %s", ucs_status_string(status));
     }
 
-    ucp_mem_type_unreg_buffers(worker, mem_type, memh,
+    ucp_mem_type_unreg_buffers(worker, mem_type, md_index, memh,
                                &md_map, &rkey_bundle);
     return status;
 }
@@ -54,12 +59,12 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_mem_type_unpack,
 UCS_PROFILE_FUNC(ucs_status_t, ucp_mem_type_pack,
                  (worker, dest, src, length, mem_type),
                  ucp_worker_h worker, void *dest, const void *src, size_t length,
-                 uct_memory_type_t mem_type)
+                 ucs_memory_type_t mem_type)
 {
     ucp_ep_h ep         = worker->mem_type_ep[mem_type];
     ucp_md_map_t md_map = 0;
     ucp_lane_index_t lane;
-    unsigned md_index;
+    ucp_md_index_t md_index;
     ucs_status_t status;
     uct_mem_h memh[1];
     uct_rkey_bundle_t rkey_bundle;
@@ -71,26 +76,27 @@ UCS_PROFILE_FUNC(ucs_status_t, ucp_mem_type_pack,
     lane     = ucp_ep_config(ep)->key.rma_lanes[0];
     md_index = ucp_ep_md_index(ep, lane);
 
-    status = ucp_mem_type_reg_buffers(worker, (void *)src, length, mem_type, md_index,
-                                      memh, &md_map, &rkey_bundle);
+    status = ucp_mem_type_reg_buffers(worker, (void *)src, length, mem_type,
+                                      md_index, memh, &md_map, &rkey_bundle);
     if (status != UCS_OK) {
-        ucs_error("failed to register buffer with mem type domian");
+        ucs_error("failed to register buffer with mem type domain %s",
+                  ucs_memory_type_names[mem_type]);
         return status;
     }
 
     status = uct_ep_get_short(ep->uct_eps[lane], dest, length,
                               (uint64_t)src, rkey_bundle.rkey);
     if (status != UCS_OK) {
-        ucs_error("uct_ep_put_short() failed %s", ucs_status_string(status));
+        ucs_error("uct_ep_get_short() failed %s", ucs_status_string(status));
     }
 
-    ucp_mem_type_unreg_buffers(worker, mem_type, memh,
+    ucp_mem_type_unreg_buffers(worker, mem_type, md_index, memh,
                                &md_map, &rkey_bundle);
     return status;
 }
 
 size_t ucp_dt_pack(ucp_worker_h worker, ucp_datatype_t datatype,
-                   uct_memory_type_t mem_type, void *dest, const void *src,
+                   ucs_memory_type_t mem_type, void *dest, const void *src,
                    ucp_dt_state_t *state, size_t length)
 {
     size_t result_len = 0;
@@ -102,12 +108,13 @@ size_t ucp_dt_pack(ucp_worker_h worker, ucp_datatype_t datatype,
 
     switch (datatype & UCP_DATATYPE_CLASS_MASK) {
     case UCP_DATATYPE_CONTIG:
-        if ((ucs_likely(UCP_MEM_IS_HOST(mem_type))) ||
-            (ucs_likely(UCP_MEM_IS_CUDA_MANAGED(mem_type))) ||
-            (ucs_likely(UCP_MEM_IS_ROCM_MANAGED(mem_type)))) {
-            UCS_PROFILE_CALL(memcpy, dest, src + state->offset, length);
+        if (UCP_MEM_IS_ACCESSIBLE_FROM_CPU(mem_type)) {
+            UCS_PROFILE_CALL(ucs_memcpy_relaxed, dest,
+                             UCS_PTR_BYTE_OFFSET(src, state->offset), length);
         } else {
-            ucp_mem_type_pack(worker, dest, src + state->offset, length, mem_type);
+            ucp_mem_type_pack(worker, dest,
+                              UCS_PTR_BYTE_OFFSET(src, state->offset),
+                              length, mem_type);
         }
         result_len = length;
         break;

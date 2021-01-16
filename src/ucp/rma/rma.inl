@@ -14,6 +14,7 @@
 #include <ucs/debug/log.h>
 
 
+/* TODO: remove it after AMO API is implemented via NBX  */
 static UCS_F_ALWAYS_INLINE ucs_status_ptr_t
 ucp_rma_send_request_cb(ucp_request_t *req, ucp_send_callback_t cb)
 {
@@ -22,13 +23,30 @@ ucp_rma_send_request_cb(ucp_request_t *req, ucp_send_callback_t cb)
     if (req->flags & UCP_REQUEST_FLAG_COMPLETED) {
         ucs_trace_req("releasing send request %p, returning status %s", req,
                       ucs_status_string(status));
-        ucs_mpool_put(req);
+        ucp_request_put(req);
         return UCS_STATUS_PTR(status);
     }
 
     ucs_trace_req("returning request %p, status %s", req,
                   ucs_status_string(status));
-    ucp_request_set_callback(req, send.cb, cb);
+    ucp_request_set_callback(req, send.cb, (ucp_send_nbx_callback_t)cb, NULL);
+    return req + 1;
+}
+
+static UCS_F_ALWAYS_INLINE ucs_status_ptr_t
+ucp_rma_send_request(ucp_request_t *req, const ucp_request_param_t *param)
+{
+    ucs_status_t status = ucp_request_send(req, 0);
+
+    if (req->flags & UCP_REQUEST_FLAG_COMPLETED) {
+        ucp_request_imm_cmpl_param(param, req, status, send);
+    }
+
+    ucs_trace_req("returning request %p, status %s", req,
+                  ucs_status_string(status));
+
+    ucp_request_set_send_callback_param(param, req, send);
+
     return req + 1;
 }
 
@@ -71,7 +89,8 @@ static inline void ucp_ep_rma_remote_request_completed(ucp_ep_t *ep)
 
     ucs_queue_for_each_extract(req, &flush_state->reqs, send.flush.queue,
                                UCS_CIRCULAR_COMPARE32(req->send.flush.cmpl_sn,
-                                                      <= ,flush_state->cmpl_sn)) {
+                                                      <= ,
+                                                      flush_state->cmpl_sn)) {
         ucp_ep_flush_remote_completed(req);
     }
 }

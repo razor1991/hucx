@@ -55,19 +55,15 @@ protected:
 
     void random_op(const mapped_buffer &sendbuf, const mapped_buffer &recvbuf);
 
-    virtual void run(unsigned count);
+    void run(unsigned count);
 
     virtual void init();
 
     virtual void cleanup();
 
-protected:
-    void check_run_conditions();
-
-    size_t                   m_send_size;
-
 private:
     std::vector<send_func_t> m_avail_send_funcs;
+    size_t                   m_send_size;
     static uint32_t          am_pending;
 };
 

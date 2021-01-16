@@ -109,7 +109,14 @@ UCS_TEST_P(test_ucp_wakeup, efd)
     EXPECT_EQ(send_data, recv_data);
 }
 
-UCS_TEST_P(test_ucp_wakeup, tx_wait, "ZCOPY_THRESH=10000")
+/* This test doesn't progress receiver's worker, while
+ * waiting for the events on a sender's worker fd. So,
+ * this causes the hang due to lack of the progress during
+ * TCP CM message exchange (TCP doesn't have an async progress
+ * for such events)
+ * TODO: add async progress for TCP connections */
+UCS_TEST_SKIP_COND_P(test_ucp_wakeup, tx_wait,
+                     has_transport("tcp"), "ZCOPY_THRESH=10000")
 {
     const ucp_datatype_t DATATYPE = ucp_dt_make_contig(1);
     const size_t COUNT            = 20000;

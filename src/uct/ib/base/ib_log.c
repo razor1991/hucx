@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ib_log.h"
 
 #include <ucs/sys/sys.h>
@@ -26,11 +30,11 @@ const char *uct_ib_qp_type_str(int qp_type)
     }
 }
 
-void uct_ib_log_dump_opcode(uct_ib_opcode_t *op, int signal, int fence, int se,
+void uct_ib_log_dump_opcode(uct_ib_opcode_t *op, int sig, int fence, int se,
                             char *buf, size_t max)
 {
     snprintf(buf, max, "%s %c%c%c", op->name,
-             signal ? 's' : '-',
+             sig    ? 's' : '-',
              fence  ? 'f' : '-',
              se     ? 'e' : '-');
 }
@@ -61,10 +65,11 @@ void uct_ib_log_dump_sg_list(uct_ib_iface_t *iface, uct_am_trace_type_t type,
         s               += strlen(s);
 
         if (data_dump) {
-            len = ucs_min(sg_list[i].length, (void*)data + sizeof(data) - md);
+            len = ucs_min(sg_list[i].length,
+                          UCS_PTR_BYTE_DIFF(md, data) + sizeof(data));
             memcpy(md, (void*)sg_list[i].addr, len);
 
-            md              += len;
+            md               = UCS_PTR_BYTE_OFFSET(md, len);
             total_len       += len;
             total_valid_len += sg_list[i].length;
         }
@@ -138,7 +143,7 @@ static void uct_ib_dump_wr_opcode(struct ibv_qp *qp, uint64_t wr_id,
     char *s    = buf;
     char *ends = buf + max;
 
-    snprintf(s, ends - s, "QP 0x%x wrid 0x%"PRIx64, qp->qp_num, wr_id);
+    snprintf(s, ends - s, "QP 0x%x wrid 0x%"PRIx64" ", qp->qp_num, wr_id);
     s += strlen(s);
 
     uct_ib_log_dump_opcode(op,
@@ -177,7 +182,9 @@ static void uct_ib_dump_wr(struct ibv_qp *qp, uct_ib_opcode_t *op,
             uct_ib_log_dump_atomic_cswap(wr->wr.atomic.compare_add,
                                      wr->wr.atomic.swap, s, ends - s);
         }
-        s += strlen(s);
+
+        /* do not forget `s += strlen(s);` here if you are
+         * processing more information for dumping below */
     }
 }
 
@@ -193,7 +200,7 @@ static void uct_ib_dump_send_wr(uct_ib_iface_t *iface, struct ibv_qp *qp,
         [IBV_WR_SEND_WITH_IMM]        = { "SEND_IMM",   0 },
         [IBV_WR_ATOMIC_CMP_AND_SWP]   = { "CSWAP",      UCT_IB_OPCODE_FLAG_HAS_ATOMIC },
         [IBV_WR_ATOMIC_FETCH_AND_ADD] = { "FETCH_ADD",  UCT_IB_OPCODE_FLAG_HAS_ATOMIC },
-   };
+    };
 
     char *s             = buf;
     char *ends          = buf + max;
@@ -236,7 +243,7 @@ void __uct_ib_log_recv_completion(const char *file, int line, const char *functi
     len = length;
     if (iface->config.qp_type == IBV_QPT_UD) {
         len  -= UCT_IB_GRH_LEN;
-        data += UCT_IB_GRH_LEN;
+        data  = UCS_PTR_BYTE_OFFSET(data, UCT_IB_GRH_LEN);
     }
     uct_ib_log_dump_recv_completion(iface, l_qp, r_qp, slid, data, len,
                                     packet_dump_cb, buf, sizeof(buf) - 1);

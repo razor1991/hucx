@@ -9,9 +9,12 @@
 #define UCT_UGNI_TYPES_H
 
 #include "ugni_def.h"
+
+#include <uct/base/uct_iface.h>
 #include <uct/base/uct_md.h>
 #include <ucs/datastruct/arbiter.h>
 #include <gni_pub.h>
+
 
 typedef struct uct_ugni_device {
     gni_nic_device_t type;                      /**< Device type */
@@ -21,20 +24,20 @@ typedef struct uct_ugni_device {
     uint32_t         address;                   /**< Device address */
     uint32_t         cpu_id;                    /**< CPU attached directly
                                                   to the device */
-    cpu_set_t        cpu_mask;                  /**< CPU mask */
+    ucs_sys_cpuset_t cpu_mask;                  /**< CPU mask */
     /* TBD - reference counter */
 } uct_ugni_device_t;
 
 typedef struct uct_ugni_cdm {
-    gni_cdm_handle_t   cdm_handle; /**< Ugni communication domain */
-    gni_nic_handle_t   nic_handle; /**< Ugni NIC handle */
-    uct_ugni_device_t *dev;        /**< Ugni device the cdm is connected to */
-    ucs_thread_mode_t  thread_mode;
-    uint32_t           address; 
-    uint32_t           domain_id;
+    gni_cdm_handle_t         cdm_handle; /**< Ugni communication domain */
+    gni_nic_handle_t         nic_handle; /**< Ugni NIC handle */
+    uct_ugni_device_t       *dev;        /**< Ugni device the cdm is connected to */
+    ucs_thread_mode_t        thread_mode;
+    uint32_t                 address;
+    uint32_t                 domain_id;
 
 #if ENABLE_MT
-    ucs_spinlock_t   lock;                      /**< Device lock */
+    ucs_recursive_spinlock_t lock;       /**< Device lock */
 #endif
 } uct_ugni_cdm_t;
 

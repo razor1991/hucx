@@ -1,6 +1,7 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
 * Copyright (C) UT-Battelle, LLC. 2014. ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 * See file LICENSE for terms.
 */
 
@@ -17,6 +18,9 @@
 #endif
 
 #include <errno.h>
+
+#include <ucs/type/status.h>
+#include <ucs/debug/log.h>
 
 #ifndef HAVE_VERBS_EXP_H
 #  define IBV_EXP_SEND_INLINE              IBV_SEND_INLINE
@@ -37,12 +41,6 @@
 #  define IBV_EXP_ACCESS_REMOTE_ATOMIC     IBV_ACCESS_REMOTE_ATOMIC
 #  define ibv_exp_reg_shared_mr            ibv_reg_shared_mr_ex
 #  define ibv_exp_reg_shared_mr_in         ibv_reg_shared_mr_in
-#  if HAVE_DECL_IBV_QUERY_DEVICE_EX
-#    define ibv_exp_device_attr            ibv_device_attr_ex
-#    define IBV_DEV_ATTR(_dev, _attr)      ((_dev)->dev_attr.orig_attr._attr)
-#  else
-#    define ibv_exp_device_attr            ibv_device_attr
-#  endif
 #  define ibv_exp_send_wr                  ibv_send_wr
 #  define exp_opcode                       opcode
 #  define ibv_exp_post_send                ibv_post_send
@@ -60,23 +58,97 @@
 
 #  define IBV_SHARED_MR_ACCESS_FLAGS(_shared_mr)    ((_shared_mr)->exp_access)
 #  define IBV_EXP_DEVICE_ATTR_SET_COMP_MASK(_attr)
-#  define IBV_EXP_PORT_ATTR_SET_COMP_MASK(_attr)
 
 #else
 #  define IBV_SHARED_MR_ACCESS_FLAGS(_shared_mr)    ((_shared_mr)->access)
-#if HAVE_DECL_IBV_EXP_DEVICE_ATTR_RESERVED_2
-#  define IBV_EXP_DEVICE_ATTR_SET_COMP_MASK(_attr)  do { \
-            (_attr)->comp_mask = 0xffffffff; \
-            (_attr)->comp_mask_2 = (IBV_EXP_DEVICE_ATTR_RESERVED_2 - 1); \
-        } while (0)
-#else
-#  define IBV_EXP_DEVICE_ATTR_SET_COMP_MASK(_attr)  (_attr)->comp_mask = (IBV_EXP_DEVICE_ATTR_RESERVED - 1)
-#endif /* HAVE_DECL_IBV_EXP_DEVICE_ATTR_RESERVED_2 */
-#  define IBV_EXP_PORT_ATTR_SET_COMP_MASK(_attr)    (_attr)->comp_mask = 0
 #endif /* HAVE_VERBS_EXP_H */
 
-#ifndef IBV_DEV_ATTR
+/* Read device properties */
+#if HAVE_DECL_IBV_EXP_QUERY_DEVICE
+
 #  define IBV_DEV_ATTR(_dev, _attr)        ((_dev)->dev_attr._attr)
+
+typedef struct ibv_exp_device_attr uct_ib_device_attr;
+
+static inline ucs_status_t uct_ib_query_device(struct ibv_context *ctx,
+                                               uct_ib_device_attr* attr) {
+    int ret;
+#if HAVE_DECL_IBV_EXP_DEVICE_ATTR_RESERVED_2
+    attr->comp_mask = 0xffffffff;
+    attr->comp_mask_2 = IBV_EXP_DEVICE_ATTR_RESERVED_2 - 1;
+#else
+    attr->comp_mask = IBV_EXP_DEVICE_ATTR_RESERVED - 1;
+#endif
+    ret = ibv_exp_query_device(ctx, attr);
+    if (ret != 0) {
+        ucs_error("ibv_exp_query_device(%s) returned %d: %m",
+                  ibv_get_device_name(ctx->device), ret);
+        return UCS_ERR_IO_ERROR;
+    }
+
+    return UCS_OK;
+}
+#elif HAVE_DECL_IBV_QUERY_DEVICE_EX
+
+#  define IBV_DEV_ATTR(_dev, _attr)        ((_dev)->dev_attr.orig_attr._attr)
+
+typedef struct ibv_device_attr_ex uct_ib_device_attr;
+
+
+/**
+ * @return true if device name begins with "hns".
+ */
+static inline int uct_ib_device_is_hns(struct ibv_context *ctx)
+{
+#if HAVE_HNS_ROCE
+#define UCT_IB_DEVICE_HNS "hns"
+#define UCT_IB_DEVICE_HNS_LEN 3
+    return !strncmp(ibv_get_device_name(ctx->device), UCT_IB_DEVICE_HNS, UCT_IB_DEVICE_HNS_LEN);
+#else
+    return 0;
+#endif
+}
+
+static inline ucs_status_t uct_ib_query_device(struct ibv_context *ctx,
+                                               uct_ib_device_attr* attr) {
+    int ret;
+
+    attr->comp_mask = 0;
+    if (uct_ib_device_is_hns(ctx)) {
+        memset(attr, 0, sizeof(*attr));
+        ret = ibv_query_device(ctx, &attr->orig_attr);
+    } else {
+        ret = ibv_query_device_ex(ctx, NULL, attr);
+    }
+    if (ret != 0) {
+        ucs_error("ibv_query_device_ex(%s) returned %d: %m",
+                  ibv_get_device_name(ctx->device), ret);
+        return UCS_ERR_IO_ERROR;
+    }
+
+    return UCS_OK;
+}
+
+#else
+
+#  define IBV_DEV_ATTR(_dev, _attr)        ((_dev)->dev_attr._attr)
+
+typedef struct ibv_device_attr uct_ib_device_attr;
+
+static inline ucs_status_t uct_ib_query_device(struct ibv_context *ctx,
+                                               uct_ib_device_attr* attr) {
+    int ret;
+
+    ret = ibv_query_device(ctx, attr);
+    if (ret != 0) {
+        ucs_error("ibv_query_device(%s) returned %d: %m",
+                  ibv_get_device_name(ctx->device), ret);
+        return UCS_ERR_IO_ERROR;
+    }
+
+    return UCS_OK;
+}
+
 #endif
 
 
@@ -93,7 +165,7 @@
 /*
  * On-demand paging support
  */
-#if HAVE_STRUCT_IBV_EXP_DEVICE_ATTR_ODP_CAPS
+#ifdef HAVE_STRUCT_IBV_EXP_DEVICE_ATTR_ODP_CAPS
 #  define IBV_EXP_HAVE_ODP(_attr)                   ((_attr)->odp_caps.general_odp_caps & IBV_EXP_ODP_SUPPORT)
 #  define IBV_EXP_ODP_CAPS(_attr, _xport)           ((_attr)->odp_caps.per_transport_caps._xport##_odp_caps)
 #else
@@ -101,27 +173,40 @@
 #  define IBV_EXP_ODP_CAPS(_attr, _xport)           0
 #endif
 
-#if !HAVE_DECL_IBV_EXP_ACCESS_ON_DEMAND
-#  define IBV_EXP_ACCESS_ON_DEMAND                  0
+#if HAVE_ODP
+#  ifdef HAVE_VERBS_EXP_H
+#    define IBV_ACCESS_ON_DEMAND        IBV_EXP_ACCESS_ON_DEMAND
+#    define ibv_reg_mr_func_name        "ibv_exp_reg_mr"
+#  else
+#    define ibv_reg_mr_func_name        "ibv_reg_mr"
+#  endif
+#else
+#  define IBV_ACCESS_ON_DEMAND          0
+#  define ibv_reg_mr_func_name          "ibv_reg_mr"
+#endif
+
+#if HAVE_ODP_IMPLICIT
+#  ifdef HAVE_VERBS_EXP_H
+#    define UCT_IB_HAVE_ODP_IMPLICIT(_attr)         ((_attr)->odp_caps.general_odp_caps & IBV_EXP_ODP_SUPPORT_IMPLICIT)
+#  else
+#    define UCT_IB_HAVE_ODP_IMPLICIT(_attr)         ((_attr)->odp_caps.general_caps & IBV_ODP_SUPPORT_IMPLICIT)
+#  endif
+#else
+#  define UCT_IB_HAVE_ODP_IMPLICIT(_attr)           0
+#endif
+
+#if !HAVE_DECL_IBV_ACCESS_RELAXED_ORDERING
+#  define IBV_ACCESS_RELAXED_ORDERING               0
 #endif
 
 #if !HAVE_DECL_IBV_EXP_PREFETCH_WRITE_ACCESS
-#  define IBV_EXP_PREFETCH_WRITE_ACCESS             IBV_EXP_ACCESS_LOCAL_WRITE
+#  define IBV_EXP_PREFETCH_WRITE_ACCESS IBV_EXP_ACCESS_LOCAL_WRITE
 #endif
 
 /*
  * DC support
  */
 #define IBV_DEVICE_HAS_DC(dev)                      (dev->flags & UCT_IB_DEVICE_FLAG_DC)
-
-/*
- * NOP support
- */
-#if HAVE_DECL_IBV_EXP_WR_NOP
-#  define IBV_DEVICE_HAS_NOP(_attr)                 ((_attr)->exp_device_cap_flags & IBV_EXP_DEVICE_NOP)
-#else
-#  define IBV_DEVICE_HAS_NOP(_attr)                 0
-#endif /* HAVE_DECL_IBV_EXP_WR_NOP */
 
 /*
  * Adaptive Routing support
@@ -201,48 +286,10 @@ static inline int ibv_exp_cq_ignore_overrun(struct ibv_cq *cq)
 #  define IBV_PORT_IS_LINK_LAYER_ETHERNET(_attr)    0
 #endif
 
-/*
- * HW tag matching
- */
-#if IBV_HW_TM
-#  if HAVE_INFINIBAND_TM_TYPES_H
-#    include <infiniband/tm_types.h>
-#  else
-#    define ibv_tmh                         ibv_exp_tmh
-#    define ibv_rvh                         ibv_exp_tmh_rvh
-#    define ibv_ravh                        ibv_exp_tmh_ravh
-#    define IBV_TMH_EAGER                   IBV_EXP_TMH_EAGER
-#    define IBV_TMH_RNDV                    IBV_EXP_TMH_RNDV
-#    define IBV_TMH_FIN                     IBV_EXP_TMH_FIN
-#    define IBV_TMH_NO_TAG                  IBV_EXP_TMH_NO_TAG
-#    define IBV_TM_CAP_RC                   IBV_EXP_TM_CAP_RC
-#    define IBV_TM_CAP_DC                   IBV_EXP_TM_CAP_DC
-#  endif
-#  if HAVE_STRUCT_IBV_TM_CAPS_FLAGS
-#    define IBV_DEVICE_TM_FLAGS(_dev)       ((_dev)->dev_attr.tm_caps.flags)
-#  else
-#    define IBV_DEVICE_TM_FLAGS(_dev)       ((_dev)->dev_attr.tm_caps.capability_flags)
-#  endif
-#  define IBV_DEVICE_TM_CAPS(_dev, _field)  ((_dev)->dev_attr.tm_caps._field)
+#if HAVE_DECL_IBV_QPF_GRH_REQUIRED
+#  define uct_ib_grh_required(_attr)                ((_attr)->flags & IBV_QPF_GRH_REQUIRED)
 #else
-#  define IBV_DEVICE_TM_CAPS(_dev, _field)  0
-#  define IBV_TM_CAP_RC                     0
-#  define IBV_TM_CAP_DC                     0
-#endif
-
-#ifndef IBV_EXP_HW_TM_DC
-#  define IBV_EXP_TM_CAP_DC                 0
-#endif
-
-#define IBV_DEVICE_MAX_UNEXP_COUNT          UCS_BIT(14)
-#define IBV_DEVICE_MIN_UWQ_POST             33
-
-#if !HAVE_DECL_IBV_EXP_CREATE_SRQ
-#  if HAVE_DECL_IBV_CREATE_SRQ_EX
-#    define ibv_exp_create_srq_attr         ibv_srq_init_attr_ex
-#  else
-#    define ibv_exp_create_srq_attr         ibv_srq_init_attr
-#  endif
+#  define uct_ib_grh_required(_attr)                0
 #endif
 
 typedef uint8_t uct_ib_uint24_t[3];
@@ -258,6 +305,44 @@ static inline void uct_ib_pack_uint24(uct_ib_uint24_t buf, const uint32_t qp_num
 static inline uint32_t uct_ib_unpack_uint24(const uct_ib_uint24_t buf)
 {
     return buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16);
+}
+
+static inline void uct_ib_destroy_qp(struct ibv_qp *qp)
+{
+    int ret;
+
+    ret = ibv_destroy_qp(qp);
+    if (ret) {
+        ucs_warn("ibv_destroy_qp() failed: %m");
+    }
+}
+
+static inline void uct_ib_destroy_srq(struct ibv_srq *srq)
+{
+    int ret;
+
+    ret = ibv_destroy_srq(srq);
+    if (ret) {
+        ucs_warn("ibv_destroy_srq() failed: %m");
+    }
+}
+
+static inline ucs_status_t uct_ib_qp_max_send_sge(struct ibv_qp *qp,
+                                                  uint32_t *max_send_sge)
+{
+    struct ibv_qp_attr qp_attr;
+    struct ibv_qp_init_attr qp_init_attr;
+    int ret;
+
+    ret = ibv_query_qp(qp, &qp_attr, IBV_QP_CAP, &qp_init_attr);
+    if (ret) {
+        ucs_error("Failed to query UD QP(ret=%d): %m", ret);
+        return UCS_ERR_IO_ERROR;
+    }
+
+    *max_send_sge = qp_attr.cap.max_send_sge;
+
+    return UCS_OK;
 }
 
 typedef struct uct_ib_qpnum {

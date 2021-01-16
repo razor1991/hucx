@@ -1,8 +1,12 @@
 /**
- * Copyright (C) Mellanox Technologies Ltd. 2001-2017.  ALL RIGHTS RESERVED.
+ * Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
  *
  * See file LICENSE for terms.
  */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include "tag_match.inl"
 #include <ucp/tag/offload.h>
@@ -45,12 +49,20 @@ ucs_status_t ucp_tag_match_init(ucp_tag_match_t *tm)
     tm->offload.thresh       = SIZE_MAX;
     tm->offload.zcopy_thresh = SIZE_MAX;
     tm->offload.iface        = NULL;
-    tm->am.message_id        = ucs_generate_uuid(0);
     return UCS_OK;
 }
 
 void ucp_tag_match_cleanup(ucp_tag_match_t *tm)
 {
+    ucp_recv_desc_t *rdesc, *tmp_rdesc;
+
+    ucs_list_for_each_safe(rdesc, tmp_rdesc, &tm->unexpected.all,
+                           tag_list[UCP_RDESC_ALL_LIST]) {
+        ucs_warn("unexpected tag-receive descriptor %p was not matched", rdesc);
+        ucp_tag_unexp_remove(rdesc);
+        ucp_recv_desc_release(rdesc);
+    }
+
     kh_destroy_inplace(ucp_tag_offload_hash, &tm->offload.tag_hash);
     kh_destroy_inplace(ucp_tag_frag_hash, &tm->frag_hash);
     ucs_free(tm->unexpected.hash);
@@ -62,7 +74,7 @@ int ucp_tag_unexp_is_empty(ucp_tag_match_t *tm)
     return ucs_list_is_empty(&tm->unexpected.all);
 }
 
-void ucp_tag_exp_remove(ucp_tag_match_t *tm, ucp_request_t *req)
+int ucp_tag_exp_remove(ucp_tag_match_t *tm, ucp_request_t *req)
 {
     ucp_request_queue_t *req_queue = ucp_tag_exp_get_req_queue(tm, req);
     ucs_queue_iter_t iter;
@@ -72,11 +84,14 @@ void ucp_tag_exp_remove(ucp_tag_match_t *tm, ucp_request_t *req)
         if (qreq == req) {
             ucp_tag_offload_try_cancel(req->recv.worker, req, 0);
             ucp_tag_exp_delete(req, tm, req_queue, iter);
-            return;
+            return 1;
         }
     }
 
-    ucs_bug("expected request not found");
+    ucs_assert(!(req->flags & UCP_REQUEST_FLAG_COMPLETED));
+    ucs_trace_req("can't remove req %p (already matched)", req);
+
+    return 0;
 }
 
 static inline uint64_t ucp_tag_exp_req_seq(ucs_queue_iter_t iter)
@@ -159,6 +174,7 @@ void ucp_tag_frag_list_process_queue(ucp_tag_match_t *tm, ucp_request_t *req,
         /* if we completed the request, delete hash entry */
         if (status != UCS_INPROGRESS) {
             kh_del(ucp_tag_frag_hash, &tm->frag_hash, iter);
+            return;
         }
     }
 

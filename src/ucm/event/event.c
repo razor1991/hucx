@@ -18,6 +18,7 @@
 #include <ucs/sys/compiler.h>
 #include <ucs/sys/module.h>
 #include <ucs/type/init_once.h>
+#include <ucs/type/spinlock.h>
 
 #include <sys/mman.h>
 #include <pthread.h>
@@ -30,7 +31,7 @@
 
 UCS_LIST_HEAD(ucm_event_installer_list);
 
-static pthread_spinlock_t ucm_kh_lock;
+static ucs_recursive_spinlock_t ucm_kh_lock;
 #define ucm_ptr_hash(_ptr)  kh_int64_hash_func((uintptr_t)(_ptr))
 KHASH_INIT(ucm_ptr_size, const void*, size_t, 1, ucm_ptr_hash, kh_int64_hash_equal)
 
@@ -127,7 +128,7 @@ static ucs_list_link_t ucm_event_handlers =
                                      &ucm_event_orig_handler.list);
 
 
- void ucm_event_dispatch(ucm_event_type_t event_type, ucm_event_t *event)
+void ucm_event_dispatch(ucm_event_type_t event_type, ucm_event_t *event)
 {
     ucm_event_handler_t *handler;
 
@@ -264,6 +265,25 @@ void *ucm_mremap(void *old_address, size_t old_size, size_t new_size, int flags)
     return event.mremap.result;
 }
 
+static int ucm_shm_del_entry_from_khash(const void *addr, size_t *size)
+{ /* must be called in locked ucm_kh_lock */
+    khiter_t iter;
+
+    ucs_recursive_spin_lock(&ucm_kh_lock);
+    iter = kh_get(ucm_ptr_size, &ucm_shmat_ptrs, addr);
+    if (iter != kh_end(&ucm_shmat_ptrs)) {
+        if (size != NULL) {
+            *size = kh_value(&ucm_shmat_ptrs, iter);
+        }
+        kh_del(ucm_ptr_size, &ucm_shmat_ptrs, iter);
+        ucs_recursive_spin_unlock(&ucm_kh_lock);
+        return 1;
+    }
+
+    ucs_recursive_spin_unlock(&ucm_kh_lock);
+    return 0;
+}
+
 void *ucm_shmat(int shmid, const void *shmaddr, int shmflg)
 {
     uintptr_t attach_addr;
@@ -285,6 +305,7 @@ void *ucm_shmat(int shmid, const void *shmaddr, int shmflg)
             attach_addr -= attach_addr % SHMLBA;
         }
         ucm_dispatch_vm_munmap((void*)attach_addr, size);
+        ucm_shm_del_entry_from_khash((void*)attach_addr, NULL);
     }
 
     event.shmat.result  = MAP_FAILED;
@@ -293,16 +314,14 @@ void *ucm_shmat(int shmid, const void *shmaddr, int shmflg)
     event.shmat.shmflg  = shmflg;
     ucm_event_dispatch(UCM_EVENT_SHMAT, &event);
 
-    pthread_spin_lock(&ucm_kh_lock);
     if (event.shmat.result != MAP_FAILED) {
+        ucs_recursive_spin_lock(&ucm_kh_lock);
         iter = kh_put(ucm_ptr_size, &ucm_shmat_ptrs, event.mmap.result, &result);
         if (result != -1) {
             kh_value(&ucm_shmat_ptrs, iter) = size;
         }
-        pthread_spin_unlock(&ucm_kh_lock);
+        ucs_recursive_spin_unlock(&ucm_kh_lock);
         ucm_dispatch_vm_mmap(event.shmat.result, size);
-    } else {
-        pthread_spin_unlock(&ucm_kh_lock);
     }
 
     ucm_event_leave();
@@ -313,22 +332,15 @@ void *ucm_shmat(int shmid, const void *shmaddr, int shmflg)
 int ucm_shmdt(const void *shmaddr)
 {
     ucm_event_t event;
-    khiter_t iter;
     size_t size;
 
     ucm_event_enter();
 
     ucm_debug("ucm_shmdt(shmaddr=%p)", shmaddr);
 
-    pthread_spin_lock(&ucm_kh_lock);
-    iter = kh_get(ucm_ptr_size, &ucm_shmat_ptrs, shmaddr);
-    if (iter != kh_end(&ucm_shmat_ptrs)) {
-        size = kh_value(&ucm_shmat_ptrs, iter);
-        kh_del(ucm_ptr_size, &ucm_shmat_ptrs, iter);
-    } else {
+    if (!ucm_shm_del_entry_from_khash(shmaddr, &size)) {
         size = ucm_get_shm_seg_size(shmaddr);
     }
-    pthread_spin_unlock(&ucm_kh_lock);
 
     ucm_dispatch_vm_munmap((void*)shmaddr, size);
 
@@ -350,7 +362,8 @@ void *ucm_sbrk(intptr_t increment)
     ucm_trace("ucm_sbrk(increment=%+ld)", increment);
 
     if (increment < 0) {
-        ucm_dispatch_vm_munmap(ucm_orig_sbrk(0) + increment, -increment);
+        ucm_dispatch_vm_munmap(UCS_PTR_BYTE_OFFSET(ucm_orig_sbrk(0), increment),
+                               -increment);
     }
 
     event.sbrk.result    = MAP_FAILED;
@@ -358,7 +371,8 @@ void *ucm_sbrk(intptr_t increment)
     ucm_event_dispatch(UCM_EVENT_SBRK, &event);
 
     if ((increment > 0) && (event.sbrk.result != MAP_FAILED)) {
-        ucm_dispatch_vm_mmap(ucm_orig_sbrk(0) - increment, increment);
+        ucm_dispatch_vm_mmap(UCS_PTR_BYTE_OFFSET(ucm_orig_sbrk(0), -increment),
+                             increment);
     }
 
     ucm_event_leave();
@@ -382,7 +396,8 @@ int ucm_brk(void *addr)
     ucm_trace("ucm_brk(addr=%p)", addr);
 
     if (increment < 0) {
-        ucm_dispatch_vm_munmap(old_addr + increment, -increment);
+        ucm_dispatch_vm_munmap(UCS_PTR_BYTE_OFFSET(old_addr, increment),
+                               -increment);
     }
 
     event.sbrk.result    = (void*)-1;
@@ -459,39 +474,20 @@ void ucm_event_handler_remove(ucm_event_handler_t *handler)
     ucm_event_leave();
 }
 
-static int ucm_events_to_native_events(int events)
-{
-    int native_events;
-
-    native_events = events & ~(UCM_EVENT_VM_MAPPED | UCM_EVENT_VM_UNMAPPED |
-                               UCM_EVENT_MEM_TYPE_ALLOC | UCM_EVENT_MEM_TYPE_FREE);
-    if (events & UCM_EVENT_VM_MAPPED) {
-        native_events |= UCM_NATIVE_EVENT_VM_MAPPED;
-    }
-    if (events & UCM_EVENT_VM_UNMAPPED) {
-        native_events |= UCM_NATIVE_EVENT_VM_UNMAPPED;
-    }
-
-    return native_events;
-}
-
 static ucs_status_t ucm_event_install(int events)
 {
-    static ucs_init_once_t init_once = UCS_INIT_ONCE_INIITIALIZER;
+    static ucs_init_once_t init_once = UCS_INIT_ONCE_INITIALIZER;
     UCS_MODULE_FRAMEWORK_DECLARE(ucm);
     ucm_event_installer_t *event_installer;
-    int native_events, malloc_events;
+    int malloc_events;
     ucs_status_t status;
 
     UCS_INIT_ONCE(&init_once) {
         ucm_prevent_dl_unload();
     }
 
-    /* Replace aggregate events with the native events which make them */
-    native_events = ucm_events_to_native_events(events);
-
     /* TODO lock */
-    status = ucm_mmap_install(native_events);
+    status = ucm_mmap_install(events);
     if (status != UCS_OK) {
         ucm_debug("failed to install mmap events");
         goto out_unlock;
@@ -512,7 +508,7 @@ static ucs_status_t ucm_event_install(int events)
     /* Call extra event installers */
     UCS_MODULE_FRAMEWORK_LOAD(ucm, UCS_MODULE_LOAD_FLAG_NODELETE);
     ucs_list_for_each(event_installer, &ucm_event_installer_list, list) {
-        status = event_installer->func(events);
+        status = event_installer->install(events);
         if (status != UCS_OK) {
             goto out_unlock;
         }
@@ -528,14 +524,32 @@ out_unlock:
 ucs_status_t ucm_set_event_handler(int events, int priority,
                                    ucm_event_callback_t cb, void *arg)
 {
+    ucm_event_installer_t *event_installer;
     ucm_event_handler_t *handler;
     ucs_status_t status;
+    int flags;
 
-    if (!ucm_global_opts.enable_events) {
+    if (events & ~(UCM_EVENT_MMAP|UCM_EVENT_MUNMAP|UCM_EVENT_MREMAP|
+                   UCM_EVENT_SHMAT|UCM_EVENT_SHMDT|
+                   UCM_EVENT_SBRK|
+                   UCM_EVENT_MADVISE|
+                   UCM_EVENT_VM_MAPPED|UCM_EVENT_VM_UNMAPPED|
+                   UCM_EVENT_MEM_TYPE_ALLOC|UCM_EVENT_MEM_TYPE_FREE|
+                   UCM_EVENT_FLAG_NO_INSTALL|
+                   UCM_EVENT_FLAG_EXISTING_ALLOC)) {
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    if (events && !ucm_global_opts.enable_events) {
         return UCS_ERR_UNSUPPORTED;
     }
 
-    if (!(events & UCM_EVENT_FLAG_NO_INSTALL) && (events & ~ucm_external_events)) {
+    /* separate event flags from real events */
+    flags   = events & (UCM_EVENT_FLAG_NO_INSTALL |
+                        UCM_EVENT_FLAG_EXISTING_ALLOC);
+    events &= ~flags;
+
+    if (!(flags & UCM_EVENT_FLAG_NO_INSTALL) && (events & ~ucm_external_events)) {
         status = ucm_event_install(events & ~ucm_external_events);
         if (status != UCS_OK) {
             return status;
@@ -553,6 +567,12 @@ ucs_status_t ucm_set_event_handler(int events, int priority,
     handler->arg      = arg;
 
     ucm_event_handler_add(handler);
+
+    if (flags & UCM_EVENT_FLAG_EXISTING_ALLOC) {
+        ucs_list_for_each(event_installer, &ucm_event_installer_list, list) {
+            event_installer->get_existing_alloc(handler);
+        }
+    }
 
     ucm_debug("added user handler (func=%p arg=%p) for events=0x%x prio=%d", cb,
               arg, events, priority);
@@ -591,23 +611,33 @@ void ucm_unset_event_handler(int events, ucm_event_callback_t cb, void *arg)
     ucm_event_leave();
 
     /* Do not release memory while we hold event lock - may deadlock */
-    while (!ucs_list_is_empty(&gc_list)) {
-        elem = ucs_list_extract_head(&gc_list, ucm_event_handler_t, list);
+    ucs_list_for_each_safe(elem, tmp, &gc_list, list) {
         free(elem);
     }
 }
 
 ucs_status_t ucm_test_events(int events)
 {
-    return ucm_mmap_test_installed_events(ucm_events_to_native_events(events));
+    return ucm_mmap_test_installed_events(events);
+}
+
+ucs_status_t ucm_test_external_events(int events)
+{
+    return ucm_mmap_test_events(events & ucm_external_events, "external");
 }
 
 UCS_STATIC_INIT {
-    pthread_spin_init(&ucm_kh_lock, PTHREAD_PROCESS_PRIVATE);
+    ucs_recursive_spinlock_init(&ucm_kh_lock, 0);
     kh_init_inplace(ucm_ptr_size, &ucm_shmat_ptrs);
 }
 
 UCS_STATIC_CLEANUP {
+    ucs_status_t status;
+
     kh_destroy_inplace(ucm_ptr_size, &ucm_shmat_ptrs);
-    pthread_spin_destroy(&ucm_kh_lock);
+
+    status = ucs_recursive_spinlock_destroy(&ucm_kh_lock);
+    if (status != UCS_OK) {
+        ucm_warn("ucs_recursive_spinlock_destroy() failed (%d)", status);
+    }
 }

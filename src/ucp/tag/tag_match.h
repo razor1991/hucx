@@ -1,5 +1,5 @@
 /**
- * Copyright (C) Mellanox Technologies Ltd. 2001-2017.  ALL RIGHTS RESERVED.
+ * Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
  *
  * See file LICENSE for terms.
  */
@@ -46,8 +46,8 @@ typedef struct {
  * Hash table entry for tag message fragments
  */
 typedef union {
-    ucs_queue_head_t      unexp_q;    /* Queue of unexpected descriptors */
-    ucp_request_t         *exp_req;   /* Expected request */
+    ucs_queue_head_t  unexp_q;    /* Queue of unexpected descriptors */
+    ucp_request_t     *exp_req;   /* Expected request */
 } ucp_tag_frag_match_t;
 
 
@@ -98,10 +98,6 @@ typedef struct ucp_tag_match {
                                                    'thresh' configuration. */
     } offload;
 
-    struct {
-        uint64_t              message_id;       /* Unique ID for active messages */
-    } am;
-
 } ucp_tag_match_t;
 
 
@@ -109,7 +105,7 @@ ucs_status_t ucp_tag_match_init(ucp_tag_match_t *tm);
 
 void ucp_tag_match_cleanup(ucp_tag_match_t *tm);
 
-void ucp_tag_exp_remove(ucp_tag_match_t *tm, ucp_request_t *req);
+int ucp_tag_exp_remove(ucp_tag_match_t *tm, ucp_request_t *req);
 
 int ucp_tag_unexp_is_empty(ucp_tag_match_t *tm);
 

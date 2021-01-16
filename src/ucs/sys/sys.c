@@ -1,6 +1,6 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2012.  ALL RIGHTS RESERVED.
-* Copyright (c) UT-Battelle, LLC. 2014-2015. ALL RIGHTS RESERVED.
+* Copyright (c) UT-Battelle, LLC. 2014-2019. ALL RIGHTS RESERVED.
 * Copyright (C) ARM Ltd. 2016-2017.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
@@ -10,14 +10,18 @@
 #  include "config.h"
 #endif
 
-#include "sys.h"
-#include "checker.h"
-#include "string.h"
-#include "math.h"
 
+#include <ucs/algorithm/crc.h>
+#include <ucs/sys/checker.h>
+#include <ucs/sys/string.h>
+#include <ucs/sys/sys.h>
 #include <ucs/debug/log.h>
 #include <ucs/time/time.h>
+#include <ucs/type/init_once.h>
 #include <ucm/util/sys.h>
+
+#include <unistd.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/shm.h>
 #include <sys/mman.h>
@@ -26,6 +30,9 @@
 #include <dirent.h>
 #include <sched.h>
 #include <ctype.h>
+#ifdef HAVE_SYS_THR_H
+#include <sys/thr.h>
+#endif
 
 #if HAVE_SYS_CAPABILITY_H
 #  include <sys/capability.h>
@@ -33,12 +40,50 @@
 
 /* Default huge page size is 2 MBytes */
 #define UCS_DEFAULT_MEM_FREE       640000
-#define UCS_PROCESS_MAPS_FILE      "/proc/self/maps"
+#define UCS_PROCESS_SMAPS_FILE     "/proc/self/smaps"
+#define UCS_PROCESS_NS_DIR         "/proc/self/ns"
+#define UCS_PROCESS_BOOTID_FILE    "/proc/sys/kernel/random/boot_id"
+#define UCS_PROCESS_BOOTID_FMT     "%x-%4hx-%4hx-%4hx-%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx"
+#define UCS_PROCESS_NS_FIRST       0xF0000000U
+#define UCS_PROCESS_NS_NET_DFLT    0xF0000080U
 
+
+struct {
+    const char  *name;
+    ucs_sys_ns_t dflt;
+} static ucs_sys_namespace_info[] = {
+    [UCS_SYS_NS_TYPE_IPC]  = {.name = "ipc",  .dflt = UCS_PROCESS_NS_FIRST - 1},
+    [UCS_SYS_NS_TYPE_MNT]  = {.name = "mnt",  .dflt = UCS_PROCESS_NS_FIRST - 0},
+    [UCS_SYS_NS_TYPE_NET]  = {.name = "net",  .dflt = UCS_PROCESS_NS_NET_DFLT},
+    [UCS_SYS_NS_TYPE_PID]  = {.name = "pid",  .dflt = UCS_PROCESS_NS_FIRST - 4},
+    [UCS_SYS_NS_TYPE_USER] = {.name = "user", .dflt = UCS_PROCESS_NS_FIRST - 3},
+    [UCS_SYS_NS_TYPE_UTS]  = {.name = "uts",  .dflt = UCS_PROCESS_NS_FIRST - 2}
+};
+
+typedef struct {
+    void                     *ctx;
+    ucs_sys_enum_threads_cb_t cb;
+} ucs_sys_enum_threads_t;
+
+
+static const char *ucs_pagemap_file = "/proc/self/pagemap";
+
+
+const char *ucs_get_tmpdir()
+{
+    char *env_tmpdir;
+
+    env_tmpdir = getenv("TMPDIR");
+    if (env_tmpdir) {
+        return env_tmpdir;
+    } else {
+        return "/tmp/";
+    }
+}
 
 const char *ucs_get_host_name()
 {
-    static char hostname[256] = {0};
+    static char hostname[HOST_NAME_MAX] = {0};
 
     if (*hostname == 0) {
         gethostname(hostname, sizeof(hostname));
@@ -102,7 +147,7 @@ uint32_t ucs_file_checksum(const char *filename)
     do {
         nread = read(fd, buffer, sizeof(buffer));
         if (nread > 0) {
-            crc = ucs_calc_crc32(crc, buffer, nread);
+            crc = ucs_crc32(crc, buffer, nread);
         }
     } while (nread == sizeof(buffer));
     close(fd);
@@ -210,7 +255,7 @@ static long ucs_sysconf(int name)
 int ucs_get_first_cpu()
 {
     int first_cpu, total_cpus, ret;
-    cpu_set_t mask;
+    ucs_sys_cpuset_t mask;
 
     ret = ucs_sysconf(_SC_NPROCESSORS_CONF);
     if (ret < 0) {
@@ -220,7 +265,7 @@ int ucs_get_first_cpu()
     total_cpus = ret;
 
     CPU_ZERO(&mask);
-    ret = sched_getaffinity(0, sizeof(mask), &mask);
+    ret = ucs_sys_getaffinity(&mask);
     if (ret < 0) {
         ucs_error("failed to get process affinity: %m");
         return ret;
@@ -252,7 +297,7 @@ uint64_t ucs_generate_uuid(uint64_t seed)
 ucs_status_t
 ucs_open_output_stream(const char *config_str, ucs_log_level_t err_log_level,
                        FILE **p_fstream, int *p_need_close,
-                       const char **p_next_token)
+                       const char **p_next_token, char **p_filename)
 {
     FILE *output_stream;
     char filename[256];
@@ -260,7 +305,10 @@ ucs_open_output_stream(const char *config_str, ucs_log_level_t err_log_level,
     const char *p;
     size_t len;
 
-    *p_next_token = config_str;
+    *p_next_token   = config_str;
+    if (p_filename != NULL) {
+        *p_filename = NULL;
+    }
 
     len = strcspn(config_str, ":");
     if (!strncmp(config_str, "stdout", len)) {
@@ -288,6 +336,16 @@ ucs_open_output_stream(const char *config_str, ucs_log_level_t err_log_level,
             ucs_log(err_log_level, "failed to open '%s' for writing: %m",
                     filename);
             return UCS_ERR_IO_ERROR;
+        }
+
+        if (p_filename != NULL) {
+            *p_filename = ucs_strdup(filename, "filename");
+            if (*p_filename == NULL) {
+                ucs_log(err_log_level, "failed to allocate filename for '%s'",
+                        filename);
+                fclose(output_stream);
+                return UCS_ERR_NO_MEMORY;
+            }
         }
 
         *p_fstream    = output_stream;
@@ -375,19 +433,22 @@ ucs_status_t ucs_read_file_number(long *value, int silent,
     return UCS_OK;
 }
 
-size_t ucs_get_max_iov()
+ssize_t ucs_read_file_str(char *buffer, size_t max, int silent,
+                          const char *filename_fmt, ...)
 {
-    static long max_iov = 0;
+    size_t max_read = ucs_max(max, 1) - 1;
+    ssize_t read_bytes;
+    va_list ap;
 
-    if (max_iov == 0) {
-        max_iov = ucs_sysconf(_SC_IOV_MAX);
-        if (max_iov < 0) {
-            max_iov = 1;
-            ucs_debug("_SC_IOV_MAX is undefined, setting default value to %ld",
-                      max_iov);
-        }
+    va_start(ap, filename_fmt);
+    read_bytes = ucs_read_file_vararg(buffer, max_read, silent, filename_fmt, ap);
+    va_end(ap);
+
+    if ((read_bytes >= 0) && (max > 0)) {
+        buffer[read_bytes] = '\0';
     }
-    return max_iov;
+
+    return read_bytes;
 }
 
 size_t ucs_get_page_size()
@@ -403,6 +464,64 @@ size_t ucs_get_page_size()
         }
     }
     return page_size;
+}
+
+void ucs_get_mem_page_size(void *address, size_t size, size_t *min_page_size_p,
+                           size_t *max_page_size_p)
+{
+    int found = 0;
+    unsigned long start, end;
+    unsigned long page_size_kb;
+    size_t page_size;
+    char buf[1024];
+    FILE *file;
+    int n;
+
+    file = fopen(UCS_PROCESS_SMAPS_FILE, "r");
+    if (!file) {
+        goto out;
+    }
+
+    while (fgets(buf, sizeof(buf), file) != NULL) {
+        n = sscanf(buf, "%lx-%lx", &start, &end);
+        if (n != 2) {
+            continue;
+        }
+
+        if (start > (uintptr_t)address + size) {
+            /* the scanned range is after memory range of interest - stop */
+            break;
+        }
+        if (end <= (uintptr_t)address) {
+            /* the scanned range is still before the memory range of interest */
+            continue;
+        }
+
+        while (fgets(buf, sizeof(buf), file) != NULL) {
+            n = sscanf(buf, "KernelPageSize: %lu kB", &page_size_kb);
+            if (n < 1) {
+                continue;
+            }
+
+            page_size = page_size_kb * UCS_KBYTE;
+            if (found) {
+                *min_page_size_p = ucs_min(*min_page_size_p, page_size);
+                *max_page_size_p = ucs_max(*max_page_size_p, page_size);
+            } else {
+                found            = 1;
+                *min_page_size_p = page_size;
+                *max_page_size_p = page_size;
+            }
+            break;
+        }
+    }
+
+    fclose(file);
+
+out:
+    if (!found) {
+        *min_page_size_p = *max_page_size_p = ucs_get_page_size();
+    }
 }
 
 static ssize_t ucs_get_meminfo_entry(const char* pattern)
@@ -431,7 +550,7 @@ static ssize_t ucs_get_meminfo_entry(const char* pattern)
 
 size_t ucs_get_memfree_size()
 {
-    size_t mem_free;
+    ssize_t mem_free;
 
     mem_free = ucs_get_meminfo_entry("MemFree");
     if (mem_free == -1) {
@@ -543,7 +662,6 @@ static void ucs_sysv_shmget_error_check_ENOSPC(size_t alloc_size,
                  ", total shared memory pages in the system (%lu) would exceed the"
                  " limit in /proc/sys/kernel/shmall (=%lu)",
                  new_shm_tot, ipc_info->shmall);
-        p += strlen(p);
     }
 }
 
@@ -637,23 +755,26 @@ ucs_status_t ucs_sysv_alloc(size_t *size, size_t max_size, void **address_p,
                             int flags, const char *alloc_name, int *shmid)
 {
     char error_string[256];
+#ifdef SHM_HUGETLB
     ssize_t huge_page_size;
+#endif
     size_t alloc_size;
     int sys_errno;
     void *ptr;
     int ret;
 
+#ifdef SHM_HUGETLB
     if (flags & SHM_HUGETLB) {
         huge_page_size = ucs_get_huge_page_size();
         if (huge_page_size <= 0) {
             ucs_debug("huge pages are not supported on the system");
             return UCS_ERR_NO_MEMORY; /* Huge pages not supported */
         }
-    }
 
-    if (flags & SHM_HUGETLB) {
         alloc_size = ucs_align_up(*size, huge_page_size);
-    } else {
+    } else
+#endif
+    {
         alloc_size = ucs_align_up(*size, ucs_get_page_size());
     }
 
@@ -670,7 +791,10 @@ ucs_status_t ucs_sysv_alloc(size_t *size, size_t max_size, void **address_p,
         switch (sys_errno) {
         case ENOMEM:
         case EPERM:
-            if (!(flags & SHM_HUGETLB)) {
+#ifdef SHM_HUGETLB
+            if (!(flags & SHM_HUGETLB))
+#endif
+	    {
                 ucs_error("%s", error_string);
             }
             return UCS_ERR_NO_MEMORY;
@@ -753,8 +877,11 @@ ucs_status_t ucs_mmap_alloc(size_t *size, void **address_p,
 ucs_status_t ucs_mmap_free(void *address, size_t length)
 {
     int ret;
+    size_t alloc_length;
 
-    ret = ucs_munmap(address, length);
+    alloc_length = ucs_align_up_pow2(length, ucs_get_page_size());
+
+    ret = ucs_munmap(address, alloc_length);
     if (ret != 0) {
         ucs_warn("munmap(address=%p, length=%zu) failed: %m", address, length);
         return UCS_ERR_INVALID_PARAM;
@@ -769,7 +896,8 @@ typedef struct {
     int           found;
 } ucs_get_mem_prot_ctx_t;
 
-static int ucs_get_mem_prot_cb(void *arg, void *addr, size_t length, int prot)
+static int ucs_get_mem_prot_cb(void *arg, void *addr, size_t length, int prot,
+                               const char *path)
 {
     ucs_get_mem_prot_ctx_t *ctx = arg;
     unsigned long seg_start = (uintptr_t)addr;
@@ -829,44 +957,88 @@ const char* ucs_get_process_cmdline()
     return cmdline;
 }
 
-unsigned long ucs_sys_get_pfn(uintptr_t address)
+static ucs_status_t
+ucs_sys_enum_pfn_internal(int pagemap_fd, unsigned start_page, uint64_t *data,
+                          uintptr_t address, unsigned page_count,
+                          ucs_sys_enum_pfn_cb_t cb, void *ctx)
 {
-    static const char *pagemap_file = "/proc/self/pagemap";
-    static int initialized = 0;
-    static int pagemap_fd;
-    uint64_t data;
     off_t offset;
     ssize_t ret;
+    size_t len;
+    unsigned i;
+
+    offset = ((address / ucs_get_page_size()) + start_page) * sizeof(*data);
+    len    = page_count * sizeof(*data);
+    ret    = pread(pagemap_fd, data, len, offset);
+    if (ret < 0) {
+        ucs_warn("pread(file=%s offset=%zu) failed: %m", ucs_pagemap_file, offset);
+        return UCS_ERR_IO_ERROR;
+    }
+
+    for (i = 0; i < ret / sizeof(*data); i++) {
+        if (!(data[i] & UCS_BIT(63))) {
+            ucs_trace("address 0x%lx not present",
+                      address + (ucm_get_page_size() * (i + start_page)));
+            return UCS_ERR_IO_ERROR;
+        }
+
+        cb(i + start_page, data[i] & UCS_MASK(55), ctx);
+    }
+
+    return UCS_OK;
+}
+
+ucs_status_t ucs_sys_enum_pfn(uintptr_t address, unsigned page_count,
+                              ucs_sys_enum_pfn_cb_t cb, void *ctx)
+{
+    /* by default use 1K buffer on stack */
+    const int UCS_SYS_ENUM_PFN_ELEM_CNT = ucs_min(128, UCS_ALLOCA_MAX_SIZE /
+                                                  sizeof(uint64_t));
+    static int initialized              = 0;
+    ucs_status_t status                 = UCS_OK;
+    static int pagemap_fd;
+    uint64_t *data;
+    unsigned page_num;
 
     if (!initialized) {
-        pagemap_fd = open(pagemap_file, O_RDONLY);
+        pagemap_fd = open(ucs_pagemap_file, O_RDONLY);
         if (pagemap_fd < 0) {
-            ucs_warn("failed to open %s: %m", pagemap_file);
+            ucs_warn("failed to open %s: %m", ucs_pagemap_file);
         }
         initialized = 1;
     }
 
     if (pagemap_fd < 0) {
-        return 0; /* could not open file */
+        return UCS_ERR_IO_ERROR; /* could not open file */
     }
 
-    offset = (address / ucs_get_page_size()) * sizeof(data);
-    data   = 0;
-    ret    = pread(pagemap_fd, &data, sizeof(data), offset);
-    if (ret < 0) {
-        ucs_warn("pread(file=%s offset=%zu) failed: %m", pagemap_file, offset);
-        return 0;
+    data = ucs_alloca(ucs_min(UCS_SYS_ENUM_PFN_ELEM_CNT, page_count) *
+                      sizeof(*data));
+
+    for (page_num = 0; (page_num < page_count) && (status == UCS_OK);
+         page_num += UCS_SYS_ENUM_PFN_ELEM_CNT) {
+         status = ucs_sys_enum_pfn_internal(pagemap_fd, page_num, data, address,
+                                            ucs_min(UCS_SYS_ENUM_PFN_ELEM_CNT,
+                                                    page_count - page_num),
+                                            cb, ctx);
     }
 
-    if (!(data & UCS_BIT(63))) {
-        ucs_trace("address 0x%lx not present", address);
-        return 0;
-    }
-
-    return data & UCS_MASK(55);
+    return status;
 }
 
-ucs_status_t ucs_sys_fcntl_modfl(int fd, int add, int remove)
+static void ucs_sys_get_pfn_cb(unsigned page_number, unsigned long pfn,
+                               void *ctx)
+{
+    ((unsigned long*)ctx)[page_number] = pfn;
+}
+
+ucs_status_t ucs_sys_get_pfn(uintptr_t address, unsigned page_count,
+                             unsigned long *data)
+{
+    return ucs_sys_enum_pfn(address, page_count, ucs_sys_get_pfn_cb, data);
+}
+
+ucs_status_t ucs_sys_fcntl_modfl(int fd, int add, int rem)
 {
     int oldfl, ret;
 
@@ -876,7 +1048,7 @@ ucs_status_t ucs_sys_fcntl_modfl(int fd, int add, int remove)
         return UCS_ERR_IO_ERROR;
     }
 
-    ret = fcntl(fd, F_SETFL, (oldfl | add) & ~remove);
+    ret = fcntl(fd, F_SETFL, (oldfl | add) & ~rem);
     if (ret < 0) {
         ucs_error("fcntl(fd=%d, F_SETFL) returned %d: %m", fd, ret);
         return UCS_ERR_IO_ERROR;
@@ -887,12 +1059,27 @@ ucs_status_t ucs_sys_fcntl_modfl(int fd, int add, int remove)
 
 pid_t ucs_get_tid(void)
 {
+#ifdef SYS_gettid
     return syscall(SYS_gettid);
+#elif defined(HAVE_SYS_THR_H)
+    long id;
+
+    thr_self(&id);
+    return (id);
+#else
+#error "Port me"
+#endif
 }
 
 int ucs_tgkill(int tgid, int tid, int sig)
 {
+#ifdef SYS_tgkill
     return syscall(SYS_tgkill, tgid, tid, sig);
+#elif defined(HAVE_SYS_THR_H)
+    return (thr_kill2(tgid, tid, sig));
+#else
+#error "Port me"
+#endif
 }
 
 double ucs_get_cpuinfo_clock_freq(const char *header, double scale)
@@ -981,56 +1168,203 @@ void ucs_sys_free(void *ptr, size_t length)
     }
 }
 
-void ucs_empty_function()
+char* ucs_make_affinity_str(const ucs_sys_cpuset_t *cpuset, char *str, size_t len)
 {
+    int i = 0, prev = -1;
+    char *p = str;
+
+    for (i = 0; i < CPU_SETSIZE; i++) {
+        if (CPU_ISSET(i, cpuset)) {
+            if (prev < 0) {
+                prev = i;
+            }
+        } else {
+            if (prev >= 0) {
+                if (prev == i - 1) {
+                    p += snprintf(p, str + len - p, "%d,", prev);
+                } else {
+                    p += snprintf(p, str + len - p, "%d-%d,", prev, i - 1);
+                }
+            }
+            if (p > str + len) {
+                p = str + len - 4;
+                while (*p != ',') {
+                    p--;
+                }
+                sprintf(p, "...");
+                return str;
+            }
+            prev = -1;
+        }
+    }
+
+    *(--p) = 0;
+    return str;
 }
 
-unsigned ucs_empty_function_return_zero()
+int ucs_sys_setaffinity(ucs_sys_cpuset_t *cpuset)
 {
-    return 0;
+    int ret;
+
+#if defined(HAVE_SCHED_SETAFFINITY)
+    ret = sched_setaffinity(0, sizeof(*cpuset), cpuset);
+#elif defined(HAVE_CPUSET_SETAFFINITY)
+    ret = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, getpid(),
+                             sizeof(*cpuset), cpuset);
+#else
+#error "Port me"
+#endif
+    return ret;
 }
 
-int64_t ucs_empty_function_return_zero_int64()
+int ucs_sys_getaffinity(ucs_sys_cpuset_t *cpuset)
 {
-    return 0;
+    int ret;
+
+#if defined(HAVE_SCHED_GETAFFINITY)
+    ret = sched_getaffinity(0, sizeof(*cpuset), cpuset);
+#elif defined(HAVE_CPUSET_GETAFFINITY)
+    ret = cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, getpid(),
+                             sizeof(*cpuset), cpuset);
+#else
+#error "Port me"
+#endif
+    return ret;
 }
 
-ucs_status_t ucs_empty_function_return_success()
+void ucs_sys_cpuset_copy(ucs_cpu_set_t *dst, const ucs_sys_cpuset_t *src)
 {
-    return UCS_OK;
+    int c;
+
+    UCS_CPU_ZERO(dst);
+    for (c = 0; c < UCS_CPU_SETSIZE; ++c) {
+        if (CPU_ISSET(c, src)) {
+            UCS_CPU_SET(c, dst);
+        }
+    }
 }
 
-ucs_status_t ucs_empty_function_return_unsupported()
+ucs_sys_ns_t ucs_sys_get_ns(ucs_sys_namespace_type_t ns)
 {
-    return UCS_ERR_UNSUPPORTED;
+    char filename[MAXPATHLEN];
+    int res;
+    struct stat st;
+
+    if (ns >= UCS_SYS_NS_TYPE_LAST) {
+        return 0;
+    }
+
+    snprintf(filename, sizeof(filename), "%s/%s", UCS_PROCESS_NS_DIR,
+             ucs_sys_namespace_info[ns].name);
+
+    res = stat(filename, &st);
+    if (res == 0) {
+        return (ucs_sys_ns_t)st.st_ino;
+    }
+
+    return ucs_sys_namespace_info[ns].dflt;
 }
 
-ucs_status_t ucs_empty_function_return_inprogress()
+int ucs_sys_ns_is_default(ucs_sys_namespace_type_t ns)
 {
-    return UCS_INPROGRESS;
+    return ucs_sys_get_ns(ns) == ucs_sys_namespace_info[ns].dflt;
 }
 
-ucs_status_t ucs_empty_function_return_no_resource()
+ucs_status_t ucs_sys_get_boot_id(uint64_t *high, uint64_t *low)
 {
-    return UCS_ERR_NO_RESOURCE;
+    static struct {
+        uint64_t     high;
+        uint64_t     low;
+    } boot_id                        = {0, 0};
+
+    static ucs_init_once_t init_once = UCS_INIT_ONCE_INITIALIZER;
+    static ucs_status_t status       = UCS_ERR_IO_ERROR;
+    char bootid_str[256];
+    ssize_t size;
+    uint32_t v1;
+    uint16_t v2;
+    uint16_t v3;
+    uint16_t v4;
+    uint8_t v5[6];
+    int res;
+    int i;
+
+    UCS_INIT_ONCE(&init_once) {
+        size = ucs_read_file_str(bootid_str, sizeof(bootid_str), 1,
+                                 "%s", UCS_PROCESS_BOOTID_FILE);
+        if (size <= 0) {
+            continue; /* jump out of INIT_ONCE section */
+        }
+
+        res = sscanf(bootid_str, UCS_PROCESS_BOOTID_FMT,
+                     &v1, &v2, &v3, &v4,
+                     &v5[0], &v5[1], &v5[2],
+                     &v5[3], &v5[4], &v5[5]);
+        if (res == 10) { /* 10 values should be scanned */
+            status       = UCS_OK;
+            boot_id.low  = ((uint64_t)v1) | ((uint64_t)v2 << 32) |
+                           ((uint64_t)v3 << 48);
+            boot_id.high = v4;
+            for (i = 0; i < ucs_array_size(v5); i++) {
+                boot_id.high |= (uint64_t)v5[i] << (16 + (i * 8));
+            }
+        }
+    }
+
+    if (status == UCS_OK) {
+        *high = boot_id.high;
+        *low  = boot_id.low;
+    }
+
+    return status;
 }
 
-ucs_status_ptr_t ucs_empty_function_return_ptr_no_resource()
+ucs_status_t ucs_sys_readdir(const char *path, ucs_sys_readdir_cb_t cb, void *ctx)
 {
-    return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
+    ucs_status_t res = 0;
+    DIR *dir;
+    struct dirent *entry;
+    struct dirent *entry_out;
+    size_t entry_len;
+
+    dir = opendir(path);
+    if (dir == NULL) {
+        return UCS_ERR_NO_ELEM; /* failed to open directory */
+    }
+
+    entry_len = ucs_offsetof(struct dirent, d_name) +
+                fpathconf(dirfd(dir), _PC_NAME_MAX) + 1;
+    entry     = (struct dirent*)malloc(entry_len);
+    if (entry == NULL) {
+        res = UCS_ERR_NO_MEMORY;
+        goto failed_no_mem;
+    }
+
+    while (!readdir_r(dir, entry, &entry_out) && (entry_out != NULL)) {
+        res = cb(entry, ctx);
+        if (res != UCS_OK) {
+            break;
+        }
+    }
+
+    free(entry);
+failed_no_mem:
+    closedir(dir);
+    return res;
 }
 
-ucs_status_t ucs_empty_function_return_ep_timeout()
+static ucs_status_t ucs_sys_enum_threads_cb(struct dirent *entry, void *_ctx)
 {
-    return UCS_ERR_ENDPOINT_TIMEOUT;
+    ucs_sys_enum_threads_t *ctx = (ucs_sys_enum_threads_t*)_ctx;
+
+    return strncmp(entry->d_name, ".", 1) ?
+           ctx->cb((pid_t)atoi(entry->d_name), ctx->ctx) : 0;
 }
 
-ssize_t ucs_empty_function_return_bc_ep_timeout()
+ucs_status_t ucs_sys_enum_threads(ucs_sys_enum_threads_cb_t cb, void *ctx)
 {
-    return UCS_ERR_ENDPOINT_TIMEOUT;
-}
+    static const char *task_dir  = "/proc/self/task";
+    ucs_sys_enum_threads_t param = {.ctx = ctx, .cb = cb};
 
-ucs_status_t ucs_empty_function_return_busy()
-{
-    return UCS_ERR_BUSY;
+    return ucs_sys_readdir(task_dir, &ucs_sys_enum_threads_cb, &param);
 }

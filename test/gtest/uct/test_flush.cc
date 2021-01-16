@@ -28,15 +28,15 @@ public:
 
     void init() {
         uct_test::init();
+
+        entity *m_sender = uct_test::create_entity(0);
+        m_entities.push_back(m_sender);
+
+        check_skip_test();
+
         if (UCT_DEVICE_TYPE_SELF == GetParam()->dev_type) {
-            entity *e = uct_test::create_entity(0);
-            m_entities.push_back(e);
-
-            e->connect(0, *e, 0);
+            m_sender->connect(0, *m_sender, 0);
         } else {
-            entity *m_sender = uct_test::create_entity(0);
-            m_entities.push_back(m_sender);
-
             entity *m_receiver = uct_test::create_entity(0);
             m_entities.push_back(m_receiver);
 
@@ -142,7 +142,6 @@ public:
 
     void test_flush_put_bcopy(flush_func_t flush) {
         const size_t length = 8;
-        check_caps(UCT_IFACE_FLAG_PUT_BCOPY);
         mapped_buffer sendbuf(length, SEED1, sender());
         mapped_buffer recvbuf(length, SEED2, receiver());
         sendbuf.pattern_fill(SEED3);
@@ -165,7 +164,9 @@ public:
 
     void test_flush_am_zcopy(flush_func_t flush, bool destroy_ep) {
         const size_t length = 8;
-        check_caps(UCT_IFACE_FLAG_AM_ZCOPY);
+        if (is_flush_cancel()) {
+            ASSERT_TRUE(destroy_ep);
+        }
         mapped_buffer sendbuf(length, SEED1, sender());
         mapped_buffer recvbuf(length, SEED2, receiver());
         sendbuf.pattern_fill(SEED3);
@@ -185,6 +186,7 @@ public:
         do {
             status = uct_ep_am_zcopy(sender().ep(0), get_am_id(), NULL, 0, iov,
                                      iovcnt, 0, &zcomp);
+            progress();
         } while (status == UCS_ERR_NO_RESOURCE);
         ASSERT_UCS_OK_OR_INPROGRESS(status);
         if (status == UCS_OK) {
@@ -213,7 +215,9 @@ public:
 
     void test_flush_am_disconnect(flush_func_t flush, bool destroy_ep) {
         const size_t length = 8;
-        check_caps(UCT_IFACE_FLAG_AM_BCOPY);
+        if (is_flush_cancel()) {
+            ASSERT_TRUE(destroy_ep);
+        }
         mapped_buffer sendbuf(length, SEED1, sender());
         mapped_buffer recvbuf(length, SEED2, receiver());
         sendbuf.pattern_fill(SEED3);
@@ -302,8 +306,10 @@ uint32_t uct_flush_test::am_rx_count = 0;
 
 void uct_flush_test::test_flush_am_pending(flush_func_t flush, bool destroy_ep)
 {
+     if (is_flush_cancel()) {
+         ASSERT_TRUE(destroy_ep);
+     }
      const size_t length = 8;
-     check_caps(UCT_IFACE_FLAG_AM_BCOPY | UCT_IFACE_FLAG_PENDING);
      mapped_buffer sendbuf(length, SEED1, sender());
      mapped_buffer recvbuf(length, SEED2, receiver());
      sendbuf.pattern_fill(SEED3);
@@ -368,9 +374,6 @@ void uct_flush_test::test_flush_am_pending(flush_func_t flush, bool destroy_ep)
          if (status == UCS_OK) {
              --flush_req.comp.count;
          } else if (status == UCS_ERR_NO_RESOURCE) {
-             if (is_flush_cancel()) {
-                 continue;
-             }
              /* If flush returned NO_RESOURCE, add to pending must succeed */
              flush_req.test      = this;
              flush_req.uct.func  = flush_progress;
@@ -416,143 +419,122 @@ void uct_flush_test::test_flush_am_pending(flush_func_t flush, bool destroy_ep)
      recvbuf.pattern_check(SEED3);
 }
 
-UCS_TEST_P(uct_flush_test, put_bcopy_flush_ep_no_comp) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, put_bcopy_flush_ep_no_comp,
+                     !check_caps(UCT_IFACE_FLAG_PUT_BCOPY)) {
     am_rx_count   = 0;
     m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
+
     test_flush_put_bcopy(&uct_flush_test::flush_ep_no_comp);
 
-    if (!is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
-        return;
+    if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
+        am_rx_count    = 0;
+        m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
+        test_flush_put_bcopy(&uct_flush_test::flush_ep_no_comp);
     }
-
-    am_rx_count   = 0;
-    m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
-    test_flush_put_bcopy(&uct_flush_test::flush_ep_no_comp);
-
-    am_rx_count   = 0;
-    m_flush_flags &= ~UCT_FLUSH_FLAG_CANCEL;
-    test_flush_put_bcopy(&uct_flush_test::flush_ep_no_comp);
 }
 
-UCS_TEST_P(uct_flush_test, put_bcopy_flush_iface_no_comp) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, put_bcopy_flush_iface_no_comp,
+                     !check_caps(UCT_IFACE_FLAG_PUT_BCOPY)) {
     test_flush_put_bcopy(&uct_flush_test::flush_iface_no_comp);
 }
 
-UCS_TEST_P(uct_flush_test, put_bcopy_flush_ep_nb) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, put_bcopy_flush_ep_nb,
+                     !check_caps(UCT_IFACE_FLAG_PUT_BCOPY)) {
     am_rx_count   = 0;
     m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
+
     test_flush_put_bcopy(&uct_flush_test::flush_ep_nb);
-
-    if (!is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
-        return;
-    }
-
-    am_rx_count   = 0;
-    m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
-    test_flush_put_bcopy(&uct_flush_test::flush_ep_nb);
-
-    am_rx_count   = 0;
-    m_flush_flags &= ~UCT_FLUSH_FLAG_CANCEL;
-    test_flush_put_bcopy(&uct_flush_test::flush_ep_nb);
-}
-
-UCS_TEST_P(uct_flush_test, am_zcopy_flush_ep_no_comp) {
-    am_rx_count   = 0;
-    m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
 
     if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
-
-        test_flush_am_zcopy(&uct_flush_test::flush_ep_no_comp, false);
-
-        am_rx_count   = 0;
+        am_rx_count    = 0;
         m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
-        test_flush_am_zcopy(&uct_flush_test::flush_ep_no_comp, false);
-
-        am_rx_count   = 0;
-        m_flush_flags &= ~UCT_FLUSH_FLAG_CANCEL;
+        test_flush_put_bcopy(&uct_flush_test::flush_ep_nb);
     }
-
-    test_flush_am_zcopy(&uct_flush_test::flush_ep_no_comp, true);
 }
 
-UCS_TEST_P(uct_flush_test, am_zcopy_flush_iface_no_comp) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, am_zcopy_flush_ep_no_comp,
+                     !check_caps(UCT_IFACE_FLAG_AM_ZCOPY),
+                     "UD_TIMER_TICK?=100ms") {
+    am_rx_count   = 0;
+    m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
+
+    test_flush_am_zcopy(&uct_flush_test::flush_ep_no_comp, false);
+
+    if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
+        am_rx_count    = 0;
+        m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
+        test_flush_am_zcopy(&uct_flush_test::flush_ep_no_comp, true);
+    }
+}
+
+UCS_TEST_SKIP_COND_P(uct_flush_test, am_zcopy_flush_iface_no_comp,
+                     !check_caps(UCT_IFACE_FLAG_AM_ZCOPY),
+                     "UD_TIMER_TICK?=100ms") {
     test_flush_am_zcopy(&uct_flush_test::flush_iface_no_comp, true);
 }
 
-UCS_TEST_P(uct_flush_test, am_zcopy_flush_ep_nb) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, am_zcopy_flush_ep_nb,
+                     !check_caps(UCT_IFACE_FLAG_AM_ZCOPY),
+                     "UD_TIMER_TICK?=100ms") {
     am_rx_count   = 0;
     m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
 
+    test_flush_am_zcopy(&uct_flush_test::flush_ep_nb, false);
+
     if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
-        test_flush_am_zcopy(&uct_flush_test::flush_ep_nb, false);
-
-        am_rx_count   = 0;
+        am_rx_count    = 0;
         m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
-        test_flush_am_zcopy(&uct_flush_test::flush_ep_nb, false);
-
-        am_rx_count   = 0;
-        m_flush_flags &= ~UCT_FLUSH_FLAG_CANCEL;
+        test_flush_am_zcopy(&uct_flush_test::flush_ep_nb, true);
     }
-
-    test_flush_am_zcopy(&uct_flush_test::flush_ep_nb, true);
 }
 
-UCS_TEST_P(uct_flush_test, am_flush_ep_no_comp) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, am_flush_ep_no_comp,
+                     !check_caps(UCT_IFACE_FLAG_AM_BCOPY)) {
     am_rx_count   = 0;
     m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
 
+    test_flush_am_disconnect(&uct_flush_test::flush_ep_no_comp, false);
+
     if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
-        test_flush_am_disconnect(&uct_flush_test::flush_ep_no_comp, false);
-
-        am_rx_count   = 0;
+        am_rx_count    = 0;
         m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
-        test_flush_am_disconnect(&uct_flush_test::flush_ep_no_comp, false);
-
-        am_rx_count   = 0;
-        m_flush_flags &= ~UCT_FLUSH_FLAG_CANCEL;
+        test_flush_am_disconnect(&uct_flush_test::flush_ep_no_comp, true);
     }
-
-    test_flush_am_disconnect(&uct_flush_test::flush_ep_no_comp, true);
 }
 
-UCS_TEST_P(uct_flush_test, am_flush_iface_no_comp) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, am_flush_iface_no_comp,
+                     !check_caps(UCT_IFACE_FLAG_AM_BCOPY)) {
     m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
     test_flush_am_disconnect(&uct_flush_test::flush_iface_no_comp, true);
 }
 
-UCS_TEST_P(uct_flush_test, am_flush_ep_nb) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, am_flush_ep_nb,
+                     !check_caps(UCT_IFACE_FLAG_AM_BCOPY)) {
     am_rx_count   = 0;
     m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
+
+    test_flush_am_disconnect(&uct_flush_test::flush_ep_nb, false);
+
     if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
-        test_flush_am_disconnect(&uct_flush_test::flush_ep_nb, false);
-
-        am_rx_count   = 0;
+        am_rx_count    = 0;
         m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
-        test_flush_am_disconnect(&uct_flush_test::flush_ep_nb, false);
-
-        am_rx_count   = 0;
-        m_flush_flags &= ~UCT_FLUSH_FLAG_CANCEL;
+        test_flush_am_disconnect(&uct_flush_test::flush_ep_nb, true);
     }
-
-    test_flush_am_disconnect(&uct_flush_test::flush_ep_nb, true);
 }
 
-UCS_TEST_P(uct_flush_test, am_pending_flush_nb) {
+UCS_TEST_SKIP_COND_P(uct_flush_test, am_pending_flush_nb,
+                     !check_caps(UCT_IFACE_FLAG_AM_BCOPY |
+                                 UCT_IFACE_FLAG_PENDING)) {
     am_rx_count   = 0;
     m_flush_flags = UCT_FLUSH_FLAG_LOCAL;
 
-    if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
-        test_flush_am_pending(&uct_flush_test::flush_ep_nb, false);
+    test_flush_am_pending(&uct_flush_test::flush_ep_nb, false);
 
+    if (is_caps_supported(UCT_IFACE_FLAG_ERRHANDLE_PEER_FAILURE)) {
         am_rx_count    = 0;
         m_flush_flags |= UCT_FLUSH_FLAG_CANCEL;
-        test_flush_am_pending(&uct_flush_test::flush_ep_nb, false);
-
-        am_rx_count    = 0;
-        m_flush_flags &= ~UCT_FLUSH_FLAG_CANCEL;
+        test_flush_am_pending(&uct_flush_test::flush_ep_nb, true);
     }
-
-    test_flush_am_pending(&uct_flush_test::flush_ep_nb, false);
 }
 
 UCT_INSTANTIATE_TEST_CASE(uct_flush_test)

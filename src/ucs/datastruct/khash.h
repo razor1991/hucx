@@ -129,6 +129,17 @@ int main() {
 #include <string.h>
 #include <limits.h>
 
+/* Clang analyzer thinks that `h->flags` can be NULL, but this is
+ * the wrong assumption - add `kassert()` to suppress the warning */
+#ifdef __clang_analyzer__
+#include <assert.h>
+#define kassert(...)              assert(__VA_ARGS__)
+#define kmemset_analyzer(P, Z, N) kmemset(P, Z, N)
+#else
+#define kassert(...)
+#define kmemset_analyzer(P, Z, N)
+#endif
+
 /* compiler specific configuration */
 
 #if UINT_MAX == 0xffffffffu
@@ -246,6 +257,9 @@ static const double __ac_HASH_UPPER = 0.77;
 		if (h->n_buckets) {												\
 			khint_t k, i, last, mask, step = 0; \
 			mask = h->n_buckets - 1;									\
+			\
+			kassert(h->flags != NULL); \
+			\
 			k = __hash_func(key); i = k & mask;							\
 			last = i; \
 			while (!__ac_isempty(h->flags, i) && (__ac_isdel(h->flags, i) || !__hash_equal(h->keys[i], key))) { \
@@ -271,6 +285,8 @@ static const double __ac_HASH_UPPER = 0.77;
 					khkey_t *new_keys = (khkey_t*)krealloc((void *)h->keys, new_n_buckets * sizeof(khkey_t)); \
 					if (!new_keys) { kfree(new_flags); return -1; }		\
 					h->keys = new_keys;									\
+					kmemset_analyzer(h->keys + (h->n_buckets * sizeof(khkey_t)), 0, \
+							 (new_n_buckets - h->n_buckets) * sizeof(khkey_t)); \
 					if (kh_is_map) {									\
 						khval_t *new_vals = (khval_t*)krealloc((void *)h->vals, new_n_buckets * sizeof(khval_t)); \
 						if (!new_vals) { kfree(new_flags); return -1; }	\
@@ -330,6 +346,9 @@ static const double __ac_HASH_UPPER = 0.77;
 				*ret = -1; return h->n_buckets;							\
 			}															\
 		} /* TODO: to implement automatically shrinking; resize() already support shrinking */ \
+		\
+		kassert(h->flags != NULL); \
+		\
 		{																\
 			khint_t k, i, site, last, mask = h->n_buckets - 1, step = 0; \
 			x = site = h->n_buckets; k = __hash_func(key); i = k & mask; \
@@ -506,6 +525,13 @@ static kh_inline khint_t __ac_Wang_hash(khint_t key)
   @return       Iterator to the inserted element [khint_t]
  */
 #define kh_put(name, h, k, r) kh_put_##name(h, k, r)
+
+typedef enum ucs_kh_put {
+    UCS_KH_PUT_FAILED       = -1,
+    UCS_KH_PUT_KEY_PRESENT  = 0,
+    UCS_KH_PUT_BUCKET_EMPTY = 1,
+    UCS_KH_PUT_BUCKET_CLEAR = 2
+} ucs_kh_put_t;
 
 /*! @function
   @abstract     Retrieve a key from the hash table.

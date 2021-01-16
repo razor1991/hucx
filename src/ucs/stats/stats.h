@@ -13,6 +13,7 @@
 #endif
 
 #include <ucs/sys/compiler_def.h>
+#include <ucs/sys/stubs.h>
 
 BEGIN_C_DECLS
 
@@ -23,7 +24,7 @@ void ucs_stats_cleanup();
 void ucs_stats_dump();
 int ucs_stats_is_active();
 #include "stats_fwd.h"
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
 
 #include "libstats.h"
 
@@ -44,7 +45,7 @@ void ucs_stats_node_free(ucs_stats_node_t *node);
 #define UCS_STATS_RVAL(_rval) _rval
 
 #define UCS_STATS_NODE_DECLARE(_node) \
-    ucs_stats_node_t* _node
+    ucs_stats_node_t* _node;
 
 #define UCS_STATS_NODE_ALLOC(_p_node, _class, _parent, ...) \
     ucs_stats_node_alloc(_p_node, _class, _parent, ## __VA_ARGS__ , "")
@@ -98,7 +99,7 @@ void ucs_stats_node_free(ucs_stats_node_t *node);
 #define UCS_STATS_ARG(_arg)
 #define UCS_STATS_RVAL(_rval) NULL
 #define UCS_STATS_NODE_DECLARE(_node)
-#define UCS_STATS_NODE_ALLOC(_p_node, _class, _parent, ...) UCS_OK
+#define UCS_STATS_NODE_ALLOC(_p_node, _class, _parent, ...) ucs_empty_function_return_success()
 #define UCS_STATS_NODE_FREE(_node)
 #define UCS_STATS_UPDATE_COUNTER(_node, _index, _delta)
 #define UCS_STATS_SET_COUNTER(_node, _index, _value)

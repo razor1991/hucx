@@ -90,7 +90,7 @@ typedef struct ucs_frag_list {
     unsigned               elem_count;   /* total number of list elements */
     unsigned               list_count;   /* number of independent lists */
     int                    max_holes;    /* do not allow insertion if ucs_list_count >= max_holes */
-    UCS_STATS_NODE_DECLARE(stats);
+    UCS_STATS_NODE_DECLARE(stats)
 #ifdef ENABLE_STATS
     ucs_frag_list_sn_t prev_sn;      /*  needed to detect busrts */
 #endif
@@ -173,7 +173,7 @@ static inline ucs_frag_list_ooo_type_t
 ucs_frag_list_insert(ucs_frag_list_t *head, ucs_frag_list_elem_t *elem,
                      ucs_frag_list_sn_t sn)
 {
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
     ucs_frag_list_ooo_type_t ret;
 
     if (UCS_FRAG_LIST_SN_CMP(sn, >, head->head_sn)) {
@@ -188,13 +188,14 @@ ucs_frag_list_insert(ucs_frag_list_t *head, ucs_frag_list_elem_t *elem,
     }
 #endif
     /* in order arrival on empty list - inc sn and do nothing */
+    /* cppcheck-suppress syntaxError */
     if (ucs_likely(UCS_FRAG_LIST_SN_CMP(sn, ==, head->head_sn + 1) && (head->elem_count == 0))) {
         head->head_sn = sn;
         return UCS_FRAG_LIST_INSERT_FAST;
     }
 
     /* return either dup or slow */
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
     ret = ucs_frag_list_insert_slow(head, elem, sn);
     UCS_STATS_UPDATE_COUNTER(head->stats, UCS_FRAG_LIST_STAT_GAP_OUT, 
                              ret != UCS_FRAG_LIST_INSERT_DUP ? head->list_count : 0);

@@ -1,5 +1,5 @@
 #
-# Copyright (C) Mellanox Technologies Ltd. 2001-2018.  ALL RIGHTS RESERVED.
+# Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
 # See file LICENSE for terms.
 #
 
@@ -11,7 +11,8 @@ module_LTLIBRARIES        = libuct_rdmacm.la
 libuct_rdmacm_la_CPPFLAGS = $(BASE_CPPFLAGS) $(IBVERBS_CPPFLAGS) $(RDMACM_CPPFLAGS)
 libuct_rdmacm_la_CFLAGS   = $(BASE_CFLAGS)
 libuct_rdmacm_la_LIBADD   = $(RDMACM_LIBS) $(top_builddir)/src/ucs/libucs.la \
-                            $(top_builddir)/src/uct/libuct.la
+                            $(top_builddir)/src/uct/libuct.la \
+                            $(top_builddir)/src/uct/ib/libuct_ib.la
 libuct_rdmacm_la_LDFLAGS  = $(IBVERBS_LDFLAGS) $(RDMACM_LDFLAGS) -version-info $(SOVERSION)
 
 noinst_HEADERS = \
@@ -25,6 +26,18 @@ libuct_rdmacm_la_SOURCES = \
 	rdmacm_iface.c \
 	rdmacm_ep.c
 
+if HAVE_RDMACM_QP_LESS
+noinst_HEADERS += \
+	rdmacm_cm.h \
+	rdmacm_listener.h \
+	rdmacm_cm_ep.h
+
+libuct_rdmacm_la_SOURCES += \
+	rdmacm_cm.c \
+	rdmacm_listener.c \
+	rdmacm_cm_ep.c
+endif # HAVE_RDMACM_QP_LESS
+
 include $(top_srcdir)/config/module.am
 
-endif
+endif # HAVE_RDMACM

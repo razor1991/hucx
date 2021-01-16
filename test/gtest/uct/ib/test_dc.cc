@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2017.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2020.  ALL RIGHTS RESERVED.
 * Copyright (C) UT-Battelle, LLC. 2016. ALL RIGHTS RESERVED.
 * Copyright (C) ARM Ltd. 2016.All rights reserved.
 * See file LICENSE for terms.
@@ -61,7 +61,9 @@ public:
 
     static ucs_log_func_rc_t
     log_ep_destroy(const char *file, unsigned line, const char *function,
-                   ucs_log_level_t level, const char *message, va_list ap)
+                   ucs_log_level_t level,
+                   const ucs_log_component_config_t *comp_conf,
+                   const char *message, va_list ap)
     {
         if (level != UCS_LOG_LEVEL_WARN) {
             /* debug messages are ignored */
@@ -133,10 +135,8 @@ protected:
     {
         struct dcs_pending *preq = (struct dcs_pending *)uct_req;
         uct_dc_mlx5_ep_t *ep;
-        uct_dc_mlx5_iface_t *iface;
 
-        ep    = dc_ep(preq->e, 0);
-        iface = dc_iface(preq->e);
+        ep = dc_ep(preq->e, 0);
 
         EXPECT_NE(UCT_DC_MLX5_EP_NO_DCI, ep->dci);
 
@@ -144,20 +144,14 @@ protected:
          * operation still stands on pending
          */
         preq->is_done = 1;
-        iface->super.super.tx.cq_available = 0;
         return UCS_INPROGRESS;
     }
 
     static void purge_cb(uct_pending_req_t *uct_req, void *arg)
     {
         struct dcs_pending *preq = (struct dcs_pending *)uct_req;
-        uct_dc_mlx5_ep_t *ep;
-        uct_dc_mlx5_iface_t *iface;
 
-        ep    = dc_ep(preq->e, 0);
-        iface = dc_iface(preq->e);
-        EXPECT_NE(UCT_DC_MLX5_EP_NO_DCI, ep->dci);
-        iface->super.super.tx.cq_available = 8;
+        EXPECT_NE(UCT_DC_MLX5_EP_NO_DCI, dc_ep(preq->e, 0)->dci);
     }
 
     static void purge_count_cb(uct_pending_req_t *uct_req, void *arg)
@@ -239,10 +233,8 @@ UCS_TEST_P(test_dc, dcs_multi) {
  */ 
 UCS_TEST_P(test_dc, dcs_ep_destroy) {
 
-    ucs_status_t status;
     uct_dc_mlx5_ep_t *ep;
     uct_dc_mlx5_iface_t *iface;
-
 
     ucs_log_push_handler(log_ep_destroy);
     UCS_TEST_SCOPE_EXIT() { ucs_log_pop_handler(); } UCS_TEST_SCOPE_EXIT_END
@@ -252,8 +244,7 @@ UCS_TEST_P(test_dc, dcs_ep_destroy) {
     iface = dc_iface(m_e1);
     n_warnings = 0;
     EXPECT_EQ(UCT_DC_MLX5_EP_NO_DCI, ep->dci);
-    status = uct_ep_am_short(m_e1->ep(0), 0, 0, NULL, 0);
-    EXPECT_UCS_OK(status);
+    send_am_messages(m_e1, 2, UCS_OK);
     /* dci 0 must be assigned to the ep */
     EXPECT_EQ(iface->tx.dcis_stack[0], ep->dci);
     EXPECT_EQ(1, iface->tx.stack_top);
@@ -299,25 +290,24 @@ UCS_TEST_P(test_dc, dcs_ep_flush_destroy) {
     EXPECT_EQ(0, iface->tx.stack_top);
 }
 
-/* Check that flushing ep from pending releases dci */
-UCS_TEST_P(test_dc, dcs_ep_flush_pending) {
-
+UCS_TEST_P(test_dc, dcs_ep_flush_pending, "DC_NUM_DCI=1") {
     ucs_status_t status;
     uct_dc_mlx5_iface_t *iface;
 
     m_e1->connect_to_iface(0, *m_e2);
     m_e1->connect_to_iface(1, *m_e2);
 
-    /* use all iface resources */
     iface = dc_iface(m_e1);
-    iface->super.super.tx.cq_available = 8;
+
+    /* shorten test time by reducing dci QP resources */
+    iface->tx.dcis[0].txqp.available = 8;
     do {
         status = uct_ep_am_short(m_e1->ep(1), 0, 0, NULL, 0);
     } while (status == UCS_OK);
 
     EXPECT_EQ(UCS_ERR_NO_RESOURCE, status);
 
-    /* flush another ep. Flush fails because there are no cqes */
+    /* flush another ep. Flush fails because there is no free dci */
     status = uct_ep_flush(m_e1->ep(0), 0, NULL);
     EXPECT_EQ(UCS_ERR_NO_RESOURCE, status);
 
@@ -327,6 +317,9 @@ UCS_TEST_P(test_dc, dcs_ep_flush_pending) {
     preq.uct_req.func = uct_pending_flush;
     status = uct_ep_pending_add(m_e1->ep(0), &preq.uct_req, 0);
     EXPECT_UCS_OK(status);
+
+    status = uct_ep_am_short(m_e1->ep(0), 0, 0, NULL, 0);
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE, status);
 
     /* progress till ep is flushed */
     do {
@@ -336,95 +329,47 @@ UCS_TEST_P(test_dc, dcs_ep_flush_pending) {
     /* flush the other active ep */
     flush();
 
+    status = uct_ep_am_short(m_e1->ep(0), 0, 0, NULL, 0);
+    EXPECT_EQ(UCS_OK, status);
+    flush();
+
     /* check that ep does not hold dci */
     EXPECT_EQ(0, iface->tx.stack_top);
 }
 
-/* Check that the following sequnce works ok:
- * - Add some pending request to DCI wait queue
- * - Try to send something from this ep. This will force ep to take free DCI
- *   (the send will not succeed anyway)
- * - Progress all pendings
- * - Make sure that there is no any assertion and everyting is ok
- *   (just send something).
- * */
-UCS_TEST_P(test_dc, dcs_ep_am_pending) {
-
-    ucs_status_t status;
-    uct_dc_mlx5_iface_t *iface;
-
-    m_e1->connect_to_iface(0, *m_e2);
-    m_e1->connect_to_iface(1, *m_e2);
-
-    /* use all iface resources */
-    iface = dc_iface(m_e1);
-    iface->super.super.tx.cq_available = 8;
-    do {
-        status = uct_ep_am_short(m_e1->ep(1), 0, 0, NULL, 0);
-    } while (status == UCS_OK);
-
-    EXPECT_EQ(UCS_ERR_NO_RESOURCE, status);
-
-    /* put AM op on pending */
-    preq.e            = m_e1;
-    preq.uct_req.func = uct_pending_flush;
-    status            = uct_ep_pending_add(m_e1->ep(0), &preq.uct_req, 0);
-    EXPECT_UCS_OK(status);
-
-    status = uct_ep_am_short(m_e1->ep(0), 0, 0, NULL, 0);
-    EXPECT_EQ(UCS_ERR_NO_RESOURCE, status);
-
-    flush();
-
-    status = uct_ep_am_short(m_e1->ep(0), 0, 0, NULL, 0);
-    EXPECT_EQ(UCS_OK, status);
-
-    flush();
-}
-
-/* check that ep does not hold dci after
- * purge
+/* check that ep does not hold dci after purge
  */
-UCS_TEST_P(test_dc, dcs_ep_purge_pending) {
+UCS_TEST_P(test_dc, dcs_ep_purge_pending, "DC_NUM_DCI=1") {
 
     ucs_status_t status;
     uct_dc_mlx5_iface_t *iface;
     uct_dc_mlx5_ep_t *ep;
 
     m_e1->connect_to_iface(0, *m_e2);
-    m_e1->connect_to_iface(1, *m_e2);
 
-    /* use all iface resources */
     iface = dc_iface(m_e1);
-    ep = dc_ep(m_e1, 0);
-    iface->super.super.tx.cq_available = 8;
+    ep    = dc_ep(m_e1, 0);
+    iface->tx.dcis[0].txqp.available = 8;
 
     do {
-        status = uct_ep_am_short(m_e1->ep(1), 0, 0, NULL, 0);
+        status = uct_ep_am_short(m_e1->ep(0), 0, 0, NULL, 0);
     } while (status == UCS_OK);
 
     EXPECT_EQ(UCS_ERR_NO_RESOURCE, status);
 
-    /* flush another ep. Flush fails because there are no cqes */
     status = uct_ep_flush(m_e1->ep(0), 0, NULL);
     EXPECT_EQ(UCS_ERR_NO_RESOURCE, status);
 
     /* put flush op on pending */
     preq.is_done = 0;
     preq.e = m_e1;
-    preq.uct_req.func = uct_pending_dummy;
+    preq.uct_req.func = uct_pending_flush;
     status = uct_ep_pending_add(m_e1->ep(0), &preq.uct_req, 0);
     EXPECT_UCS_OK(status);
 
-    do {
-        progress();
-    } while (!preq.is_done);
-
-    EXPECT_LE(1, iface->tx.stack_top);
     uct_ep_pending_purge(m_e1->ep(0), purge_cb, NULL);
-    EXPECT_EQ(UCT_DC_MLX5_EP_NO_DCI, ep->dci);
     flush();
-    EXPECT_EQ(0, iface->tx.stack_top);
+    EXPECT_EQ(UCT_DC_MLX5_EP_NO_DCI, ep->dci);
 }
 
 UCS_TEST_P(test_dc, rand_dci_many_eps) {
@@ -445,7 +390,7 @@ UCS_TEST_P(test_dc, rand_dci_many_eps) {
     }
 
     /* Try to send on all eps (taking into account available resources) */
-    uint32_t num_sends = ucs_min(num_eps, iface->super.super.tx.cq_available);
+    uint32_t num_sends = num_eps;
 
     for (unsigned i = 0; i < num_sends; i++) {
         ucs_status_t status = uct_ep_am_short(rand_e->ep(i), 0, 0, NULL, 0);
@@ -469,19 +414,20 @@ UCS_TEST_P(test_dc, rand_dci_pending_purge) {
     int dci_id;
     uct_dc_mlx5_ep_t *ep;
 
-    iface->super.super.tx.cq_available = 0;
-
     for (dci_id = 0; dci_id < ndci; ++dci_id) {
         for (int i = 0; i < num_eps; i++) {
             int ep_id = i + dci_id*ndci;
             rand_e->connect_to_iface(ep_id, *m_e2);
             ep = dc_ep(rand_e, ep_id);
             EXPECT_NE(UCT_DC_MLX5_EP_NO_DCI, ep->dci);
+            int available = iface->tx.dcis[ep->dci].txqp.available;
+            iface->tx.dcis[ep->dci].txqp.available = 0;
             for (int j = 0; j < num_reqs; ++j, ++idx) {
                 preq[idx].func = NULL;
                 ASSERT_UCS_OK(uct_ep_pending_add(rand_e->ep(ep_id),
                                                  &preq[idx], 0));
             }
+            iface->tx.dcis[ep->dci].txqp.available = available;
         }
     }
 
@@ -497,8 +443,10 @@ UCS_TEST_P(test_dc, rand_dci_pending_purge) {
     flush();
 }
 
-UCS_TEST_P(test_dc, stress_iface_ops) {
-    test_iface_ops();
+UCS_TEST_SKIP_COND_P(test_dc, stress_iface_ops,
+                     !check_caps(UCT_IFACE_FLAG_PUT_ZCOPY), "DC_NUM_DCI=1") {
+
+    test_iface_ops(dc_iface(m_e1)->tx.dcis[0].txqp.available);
 }
 
 UCT_DC_INSTANTIATE_TEST_CASE(test_dc)
@@ -510,6 +458,27 @@ public:
     /* virtual */
     uct_rc_fc_t* get_fc_ptr(entity *e, int ep_idx = 0) {
         return &ucs_derived_of(e->ep(ep_idx), uct_dc_mlx5_ep_t)->fc;
+    }
+
+    virtual void disable_entity(entity *e) {
+        uct_dc_mlx5_iface_t *iface = ucs_derived_of(e->iface(),
+                                                    uct_dc_mlx5_iface_t);
+
+        for (int i = 0; i < iface->tx.ndci; ++i) {
+            uct_rc_txqp_available_set(&iface->tx.dcis[i].txqp, 0);
+        }
+        iface->tx.stack_top = iface->tx.ndci;
+    }
+
+    virtual void enable_entity(entity *e, unsigned cq_num = 128) {
+        uct_dc_mlx5_iface_t *iface = ucs_derived_of(e->iface(),
+                                                    uct_dc_mlx5_iface_t);
+
+        for (int i = 0; i < iface->tx.ndci; ++i) {
+            uct_rc_txqp_available_set(&iface->tx.dcis[i].txqp,
+                                      iface->tx.dcis[i].txwq.bb_max);
+        }
+        iface->tx.stack_top = 0;
     }
 };
 
@@ -643,7 +612,7 @@ UCS_TEST_P(test_dc_flow_control, dci_leak)
 
     /* Make sure that ep does not hold dci when sends completed */
     uct_dc_mlx5_iface_t *iface = ucs_derived_of(m_e1->iface(), uct_dc_mlx5_iface_t);
-    ucs_time_t deadline   = ucs::get_deadline();
+    ucs_time_t deadline        = ucs::get_deadline();
     while (iface->tx.stack_top && (ucs_get_time() < deadline)) {
         progress();
     }
@@ -661,8 +630,81 @@ UCS_TEST_P(test_dc_flow_control, dci_leak)
 
 UCT_DC_INSTANTIATE_TEST_CASE(test_dc_flow_control)
 
+class test_dc_iface_attrs : public test_rc_iface_attrs {
+public:
+    attr_map_t get_num_iov() {
+        return get_num_iov_mlx5_common(UCT_IB_MLX5_AV_FULL_SIZE);
+    }
+};
 
-#if ENABLE_STATS
+UCS_TEST_P(test_dc_iface_attrs, iface_attrs)
+{
+    basic_iov_test();
+}
+
+UCT_DC_INSTANTIATE_TEST_CASE(test_dc_iface_attrs)
+
+class test_dc_fc_deadlock : public test_dc_flow_control {
+public:
+    test_dc_fc_deadlock() {
+        modify_config("IB_TX_QUEUE_LEN", "8");
+        modify_config("RC_FC_WND_SIZE", "128");
+        modify_config("DC_TX_POLICY", "rand");
+    }
+
+protected:
+    struct dc_pending {
+        uct_pending_req_t uct_req;
+        entity *e;
+    };
+
+    static ucs_status_t am_pending(uct_pending_req_t *req) {
+        struct dc_pending *pr = reinterpret_cast<struct dc_pending *>(req);
+        return uct_ep_am_short(pr->e->ep(0), 0, 0, NULL, 0);
+    }
+};
+
+UCS_TEST_P(test_dc_fc_deadlock, basic, "DC_NUM_DCI=1")
+{
+    // Send to m_e2 until dci resources are exhausted.
+    // Also set FC window to 0 emulating lack of all TX resources
+    ucs_status_t status;
+    do {
+        status = uct_ep_am_short(m_e1->ep(0), 0, 0, NULL, 0);
+    } while (status == UCS_OK);
+    send_am_messages(m_e1, 1, UCS_ERR_NO_RESOURCE);
+    get_fc_ptr(m_e1)->fc_wnd = 0;
+
+    // Add am send to pending
+    struct dc_pending preq;
+    preq.e            = m_e1;
+    preq.uct_req.func = am_pending;
+    EXPECT_UCS_OK(uct_ep_pending_add(m_e1->ep(0), &preq.uct_req, 0));
+
+    // Send whole FC window to m_e1, which will force sending grant request.
+    // This grant request will be added to pending on m_e1, because it has no
+    // resources.
+    int wnd = 5;
+    set_fc_attributes(m_e2, true, wnd,
+                      ucs_max((int)(wnd*0.5), 1),
+                      ucs_max((int)(wnd*0.25), 1));
+    send_am_and_flush(m_e2, wnd);
+
+    // Now, make sure that m_e1 will send grant to m_e2 even though FC window
+    // is still empty (dci resources will be restored during progression).
+    // If grant was not sent, this would be a deadlock situation due to lack
+    // of FC resources.
+    validate_grant(m_e2);
+
+    // Restore m_e1 for proper cleanup
+    ucs_derived_of(m_e1->iface(), uct_dc_mlx5_iface_t)->tx.fc_grants = 0;
+    uct_ep_pending_purge(m_e1->ep(0), NULL, NULL);
+}
+
+UCT_DC_INSTANTIATE_TEST_CASE(test_dc_fc_deadlock)
+
+
+#ifdef ENABLE_STATS
 
 class test_dc_flow_control_stats : public test_rc_flow_control_stats {
 public:

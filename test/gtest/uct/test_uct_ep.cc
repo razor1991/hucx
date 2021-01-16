@@ -9,6 +9,7 @@ extern "C" {
 }
 #include "uct_test.h"
 
+
 class test_uct_ep : public uct_test {
 protected:
 
@@ -16,6 +17,8 @@ protected:
         uct_test::init();
         m_sender = uct_test::create_entity(0);
         m_entities.push_back(m_sender);
+
+        check_skip_test();
 
         m_receiver = uct_test::create_entity(0);
         m_entities.push_back(m_receiver);
@@ -38,21 +41,22 @@ protected:
         m_sender->destroy_ep(0);
     }
 
+    bool skip_on_ib_dc() {
+#ifdef HAVE_DC_DV /* skip due to DCI stuck bug */
+        return has_transport("dc_mlx5");
+#else
+        return false;
+#endif
+    }
+
     entity * m_sender;
     entity * m_receiver;
 };
 
-UCS_TEST_P(test_uct_ep, disconnect_after_send) {
+UCS_TEST_SKIP_COND_P(test_uct_ep, disconnect_after_send,
+                     (!check_caps(UCT_IFACE_FLAG_AM_ZCOPY) ||
+                      skip_on_ib_dc())) {
     ucs_status_t status;
-    unsigned count;
-
-#if HAVE_DC_DV
-    if (GetParam()->tl_name.compare("dc_mlx5") == 0) {
-        UCS_TEST_SKIP_R("DCI stuck bug");
-    }
-#endif
-
-    check_caps(UCT_IFACE_FLAG_AM_ZCOPY);
 
     mapped_buffer buffer(256, 0, *m_sender);
     UCS_TEST_GET_BUFFER_IOV(iov, iovcnt, buffer.ptr(),
@@ -60,10 +64,10 @@ UCS_TEST_P(test_uct_ep, disconnect_after_send) {
                             buffer.memh(),
                             m_sender->iface_attr().cap.am.max_iov);
 
-    for (int i = 0; i < 300 / ucs::test_time_multiplier(); ++i) {
+    unsigned max_iter = 300 / ucs::test_time_multiplier();
+    for (unsigned i = 0; i < max_iter; ++i) {
         connect();
-        count = 0;
-        for (;;) {
+        for (unsigned count = 0; count < max_iter; ) {
             status = uct_ep_am_zcopy(m_sender->ep(0), 1, NULL, 0, iov, iovcnt,
                                      0, NULL);
             if (status == UCS_ERR_NO_RESOURCE) {

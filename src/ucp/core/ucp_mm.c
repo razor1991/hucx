@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ucp_mm.h"
 #include "ucp_context.h"
 #include "ucp_worker.h"
@@ -11,6 +15,7 @@
 #include <ucs/debug/log.h>
 #include <ucs/debug/memtrack.h>
 #include <ucs/sys/math.h>
+#include <ucs/sys/string.h>
 #include <ucs/sys/sys.h>
 #include <string.h>
 #include <inttypes.h>
@@ -27,7 +32,7 @@ static ucp_mem_t ucp_mem_dummy_handle = {
 
 ucs_status_t ucp_mem_rereg_mds(ucp_context_h context, ucp_md_map_t reg_md_map,
                                void *address, size_t length, unsigned uct_flags,
-                               uct_md_h alloc_md, uct_memory_type_t mem_type,
+                               uct_md_h alloc_md, ucs_memory_type_t mem_type,
                                uct_mem_h *alloc_md_memh_p, uct_mem_h *uct_memh,
                                ucp_md_map_t *md_map_p)
 {
@@ -38,13 +43,13 @@ ucs_status_t ucp_mem_rereg_mds(ucp_context_h context, ucp_md_map_t reg_md_map,
     unsigned prev_num_memh;
     unsigned md_index;
     ucs_status_t status;
-    int level;
+    ucs_log_level_t level;
 
     if (reg_md_map == *md_map_p) {
         return UCS_OK; /* shortcut - no changes required */
     }
 
-    prev_num_memh = ucs_popcount(*md_map_p);
+    prev_num_memh = ucs_popcount(*md_map_p & reg_md_map);
     prev_uct_memh = ucs_alloca(prev_num_memh * sizeof(*prev_uct_memh));
 
     /* Go over previous handles, save only the ones we will need */
@@ -79,7 +84,7 @@ ucs_status_t ucp_mem_rereg_mds(ucp_context_h context, ucp_md_map_t reg_md_map,
     }
 
     /* prev_uct_memh should contain the handles which should be reused */
-    ucs_assert(prev_memh_index == ucs_popcount(*md_map_p & reg_md_map));
+    ucs_assert(prev_memh_index == prev_num_memh);
 
     /* Go over requested MD map, and use / register new handles */
     new_md_map      = 0;
@@ -89,6 +94,7 @@ ucs_status_t ucp_mem_rereg_mds(ucp_context_h context, ucp_md_map_t reg_md_map,
         md_attr = &context->tl_mds[md_index].attr;
         if (*md_map_p & UCS_BIT(md_index)) {
             /* already registered, use previous memh */
+            ucs_assert(prev_memh_index < prev_num_memh);
             uct_memh[memh_index++] = prev_uct_memh[prev_memh_index++];
             new_md_map            |= UCS_BIT(md_index);
         } else if (context->tl_mds[md_index].md == alloc_md) {
@@ -96,28 +102,43 @@ ucs_status_t ucp_mem_rereg_mds(ucp_context_h context, ucp_md_map_t reg_md_map,
             ucs_assert(alloc_md_memh_p != NULL);
             uct_memh[memh_index++] = *alloc_md_memh_p;
             new_md_map            |= UCS_BIT(md_index);
-        } else if ((md_attr->cap.flags & UCT_MD_FLAG_REG) &&
-                   (md_attr->cap.reg_mem_types & UCS_BIT(mem_type))) {
-            /* MD supports registration, register new memh on it */
-            status = uct_md_mem_reg(context->tl_mds[md_index].md, address,
-                                    length, uct_flags, &uct_memh[memh_index]);
-            if (status != UCS_OK) {
-                level = (uct_flags & UCT_MD_MEM_FLAG_HIDE_ERRORS) ?
-                        UCS_LOG_LEVEL_DEBUG : UCS_LOG_LEVEL_ERROR;
-                ucs_log(level,
-                        "failed to register address %p length %zu on md[%d]=%s: %s",
-                        address, length, md_index, context->tl_mds[md_index].rsc.md_name,
-                        ucs_status_string(status));
-                ucp_mem_rereg_mds(context, 0, NULL, 0, 0, alloc_md, mem_type,
-                                  alloc_md_memh_p, uct_memh, md_map_p);
-                return status;
+        } else if (!length) {
+            /* don't register zero-length regions */
+            continue;
+        } else if (md_attr->cap.flags & UCT_MD_FLAG_REG) {
+            if (!(md_attr->cap.reg_mem_types & UCS_BIT(mem_type))) {
+                status = UCS_ERR_UNSUPPORTED;
+            } else {
+                ucs_assert(address && length);
+
+                /* MD supports registration, register new memh on it */
+                status = uct_md_mem_reg(context->tl_mds[md_index].md, address,
+                        length, uct_flags, &uct_memh[memh_index]);
             }
 
-            ucs_trace("registered address %p length %zu on md[%d] memh[%d]=%p",
-                      address, length, md_index, memh_index,
-                      uct_memh[memh_index]);
-            new_md_map |= UCS_BIT(md_index);
-            ++memh_index;
+            if (status == UCS_OK) {
+                ucs_trace("registered address %p length %zu on md[%d] memh[%d]=%p",
+                        address, length, md_index, memh_index,
+                        uct_memh[memh_index]);
+                new_md_map |= UCS_BIT(md_index);
+                ++memh_index;
+                continue;
+            }
+
+            level = (uct_flags & UCT_MD_MEM_FLAG_HIDE_ERRORS) ?
+                    UCS_LOG_LEVEL_DEBUG : UCS_LOG_LEVEL_ERROR;
+
+            ucs_log(level,
+                    "failed to register address %p mem_type bit 0x%lx length %zu on "
+                    "md[%d]=%s: %s (md reg_mem_types 0x%lx)",
+                    address, UCS_BIT(mem_type), length, md_index,
+                    context->tl_mds[md_index].rsc.md_name,
+                    ucs_status_string(status),
+                    md_attr->cap.reg_mem_types);
+
+            if (!(uct_flags & UCT_MD_MEM_FLAG_HIDE_ERRORS)) {
+                goto err_dereg;
+            }
         }
     }
 
@@ -125,6 +146,12 @@ ucs_status_t ucp_mem_rereg_mds(ucp_context_h context, ucp_md_map_t reg_md_map,
      * missing from the map.*/
     *md_map_p = new_md_map;
     return UCS_OK;
+
+err_dereg:
+    ucp_mem_rereg_mds(context, 0, NULL, 0, 0, alloc_md, mem_type,
+                      alloc_md_memh_p, uct_memh, md_map_p);
+    return status;
+
 }
 
 /**
@@ -135,14 +162,14 @@ static int ucp_is_md_selected_by_config(ucp_context_h context,
                                         unsigned config_method_index,
                                         unsigned md_index)
 {
-    const char *cfg_mdc_name;
-    const char *mdc_name;
+    const char *cfg_cmpt_name;
+    const char *cmpt_name;
 
-    cfg_mdc_name = context->config.alloc_methods[config_method_index].mdc_name;
-    mdc_name     = context->tl_mds[md_index].attr.component_name;
+    cfg_cmpt_name = context->config.alloc_methods[config_method_index].cmpt_name;
+    cmpt_name     = context->tl_mds[md_index].attr.component_name;
 
-    return !strncmp(cfg_mdc_name, "*",      UCT_MD_COMPONENT_NAME_MAX) ||
-           !strncmp(cfg_mdc_name, mdc_name, UCT_MD_COMPONENT_NAME_MAX);
+    return !strncmp(cfg_cmpt_name, "*",      UCT_COMPONENT_NAME_MAX) ||
+           !strncmp(cfg_cmpt_name, cmpt_name, UCT_COMPONENT_NAME_MAX);
 }
 
 static ucs_status_t ucp_mem_alloc(ucp_context_h context, size_t length,
@@ -196,8 +223,9 @@ allocated:
     memh->alloc_md     = mem.md;
     memh->md_map       = 0;
     status = ucp_mem_rereg_mds(context, UCS_MASK(context->num_mds), memh->address,
-                               memh->length, uct_flags, memh->alloc_md, memh->mem_type,
-                               &mem.memh, memh->uct, &memh->md_map);
+                               memh->length, uct_flags | UCT_MD_MEM_FLAG_HIDE_ERRORS,
+                               memh->alloc_md, memh->mem_type, &mem.memh,
+                               memh->uct, &memh->md_map);
     if (status != UCS_OK) {
         uct_mem_free(&mem);
     }
@@ -290,7 +318,8 @@ static inline int ucp_mem_map_is_allocate(ucp_mem_map_params_t *params)
 
 static ucs_status_t ucp_mem_map_common(ucp_context_h context, void *address,
                                        size_t length, unsigned uct_flags,
-                                       int is_allocate, ucp_mem_h *memh_p)
+                                       int is_allocate, const char *alloc_name,
+                                       ucp_mem_h *memh_p)
 {
     ucs_status_t            status;
     ucp_mem_h               memh;
@@ -308,21 +337,24 @@ static ucs_status_t ucp_mem_map_common(ucp_context_h context, void *address,
     memh->length  = length;
 
     if (is_allocate) {
-        ucs_debug("allocation user memory at %p length %zu", address, length);
-        status = ucp_mem_alloc(context, length, uct_flags,
-                               "user allocation", memh);
+        ucs_debug("allocating %s at %p length %zu", alloc_name, address, length);
+        status = ucp_mem_alloc(context, length, uct_flags, alloc_name, memh);
         if (status != UCS_OK) {
             goto err_free_memh;
         }
     } else {
-        ucs_debug("registering user memory at %p length %zu", address, length);
+        memh->mem_type     = ucp_memory_type_detect(context, address, length);
         memh->alloc_method = UCT_ALLOC_METHOD_LAST;
-        memh->mem_type     = UCT_MD_MEM_TYPE_HOST;
         memh->alloc_md     = NULL;
         memh->md_map       = 0;
+
+        ucs_debug("registering %s %p length %zu mem_type %s", alloc_name,
+                  address, length, ucs_memory_type_names[memh->mem_type]);
         status = ucp_mem_rereg_mds(context, UCS_MASK(context->num_mds),
-                                   memh->address, memh->length, uct_flags, NULL,
-                                   memh->mem_type, NULL, memh->uct, &memh->md_map);
+                                   memh->address, memh->length,
+                                   uct_flags | UCT_MD_MEM_FLAG_HIDE_ERRORS,
+                                   NULL, memh->mem_type, NULL, memh->uct,
+                                   &memh->md_map);
         if (status != UCS_OK) {
             goto err_free_memh;
         }
@@ -401,7 +433,8 @@ ucs_status_t ucp_mem_map(ucp_context_h context, const ucp_mem_map_params_t *para
 
     status = ucp_mem_map_common(context, mem_params.address, mem_params.length,
                                 ucp_mem_map_params2uct_flags(&mem_params),
-                                ucp_mem_map_is_allocate(&mem_params), memh_p);
+                                ucp_mem_map_is_allocate(&mem_params),
+                                "user memory", memh_p);
 out:
     UCP_THREAD_CS_EXIT(&context->mt_lock);
     return status;
@@ -427,66 +460,72 @@ out:
 }
 
 ucs_status_t ucp_mem_type_reg_buffers(ucp_worker_h worker, void *remote_addr,
-                                      size_t length, uct_memory_type_t mem_type,
-                                      unsigned md_index, uct_mem_h *memh,
+                                      size_t length, ucs_memory_type_t mem_type,
+                                      ucp_md_index_t md_index, uct_mem_h *memh,
                                       ucp_md_map_t *md_map,
                                       uct_rkey_bundle_t *rkey_bundle)
 {
-    ucp_context_h context = worker->context;
-    uct_md_h md;
-    const uct_md_attr_t *md_attr;
+    ucp_context_h context        = worker->context;
+    const uct_md_attr_t *md_attr = &context->tl_mds[md_index].attr;
+    uct_component_h cmpt;
+    ucp_tl_md_t *tl_md;
     ucs_status_t status;
     char *rkey_buffer;
 
-
-    *memh = UCT_MEM_HANDLE_NULL;
-    status = ucp_mem_rereg_mds(context, UCS_BIT(md_index), remote_addr, length,
-                               UCT_MD_MEM_ACCESS_ALL, NULL, mem_type,
-                               NULL, memh, md_map);
-    if (status != UCS_OK) {
-        goto err;
-    }
-
-    md_attr = &context->tl_mds[md_index].attr;
-    if (md_attr->cap.flags & UCT_MD_FLAG_NEED_RKEY) {
-        rkey_buffer = ucs_alloca(md_attr->rkey_packed_size);
-        md = context->tl_mds[md_index].md;
-        status = uct_md_mkey_pack(md, memh[0], rkey_buffer);
-        if (status != UCS_OK) {
-            ucs_error("failed to pack key from md[%d]: %s",
-                      md_index, ucs_status_string(status));
-            goto err_dreg_mem;
-        }
-
-        status = uct_rkey_unpack(rkey_buffer, rkey_bundle);
-        if (status != UCS_OK) {
-            ucs_error("failed to unpack key from md[%d]: %s",
-                      md_index, ucs_status_string(status));
-            goto err_dreg_mem;
-        }
-    } else {
+    if (!(md_attr->cap.flags & UCT_MD_FLAG_NEED_RKEY)) {
         rkey_bundle->handle = NULL;
         rkey_bundle->rkey   = UCT_INVALID_RKEY;
-        rkey_bundle->type   = NULL;
+        status              = UCS_OK;
+        goto out;
+    }
+
+    tl_md  = &context->tl_mds[md_index];
+    cmpt   = context->tl_cmpts[tl_md->cmpt_index].cmpt;
+
+    status = ucp_mem_rereg_mds(context, UCS_BIT(md_index), remote_addr, length,
+                               UCT_MD_MEM_ACCESS_ALL |
+                               UCT_MD_MEM_FLAG_HIDE_ERRORS,
+                               NULL, mem_type, NULL, memh, md_map);
+    if (status != UCS_OK) {
+        goto out;
+    }
+
+    rkey_buffer = ucs_alloca(md_attr->rkey_packed_size);
+    status      = uct_md_mkey_pack(tl_md->md, memh[0], rkey_buffer);
+    if (status != UCS_OK) {
+        ucs_error("failed to pack key from md[%d]: %s",
+                  md_index, ucs_status_string(status));
+        goto out_dereg_mem;
+    }
+
+    status = uct_rkey_unpack(cmpt, rkey_buffer, rkey_bundle);
+    if (status != UCS_OK) {
+        ucs_error("failed to unpack key from md[%d]: %s",
+                  md_index, ucs_status_string(status));
+        goto out_dereg_mem;
     }
 
     return UCS_OK;
 
-err_dreg_mem:
+out_dereg_mem:
     ucp_mem_rereg_mds(context, 0, NULL, 0, 0, NULL, mem_type, NULL,
                       memh, md_map);
-err:
+out:
+    *memh = UCT_MEM_HANDLE_NULL;
     return status;
 }
 
-void ucp_mem_type_unreg_buffers(ucp_worker_h worker, uct_memory_type_t mem_type,
-                                uct_mem_h *memh, ucp_md_map_t *md_map,
+void ucp_mem_type_unreg_buffers(ucp_worker_h worker, ucs_memory_type_t mem_type,
+                                ucp_md_index_t md_index, uct_mem_h *memh,
+                                ucp_md_map_t *md_map,
                                 uct_rkey_bundle_t *rkey_bundle)
 {
     ucp_context_h context = worker->context;
+    ucp_rsc_index_t cmpt_index;
 
     if (rkey_bundle->rkey != UCT_INVALID_RKEY) {
-        uct_rkey_release(rkey_bundle);
+        cmpt_index = context->tl_mds[md_index].cmpt_index;
+        uct_rkey_release(context->tl_cmpts[cmpt_index].cmpt, rkey_bundle);
     }
 
     ucp_mem_rereg_mds(context, 0, NULL, 0, 0, NULL, mem_type, NULL,
@@ -506,7 +545,7 @@ ucs_status_t ucp_mem_query(const ucp_mem_h memh, ucp_mem_attr_t *attr)
     return UCS_OK;
 }
 
-static ucs_status_t ucp_advice2uct(unsigned ucp_advice, unsigned *uct_advice) 
+static ucs_status_t ucp_advice2uct(unsigned ucp_advice, uct_mem_advice_t *uct_advice)
 {
     switch(ucp_advice) {
     case UCP_MADV_NORMAL:
@@ -519,13 +558,13 @@ static ucs_status_t ucp_advice2uct(unsigned ucp_advice, unsigned *uct_advice)
     return UCS_ERR_INVALID_PARAM;
 }
 
-ucs_status_t 
-ucp_mem_advise(ucp_context_h context, ucp_mem_h memh, 
+ucs_status_t
+ucp_mem_advise(ucp_context_h context, ucp_mem_h memh,
                ucp_mem_advise_params_t *params)
 {
     ucs_status_t status, tmp_status;
     int md_index;
-    unsigned uct_advice;
+    uct_mem_advice_t uct_advice;
     uct_mem_h uct_memh;
 
     if (!ucs_test_all_flags(params->field_mask,
@@ -536,7 +575,8 @@ ucp_mem_advise(ucp_context_h context, ucp_mem_h memh,
     }
 
     if ((params->address < memh->address) ||
-        (params->address + params->length > memh->address + memh->length)) {
+        (UCS_PTR_BYTE_OFFSET(params->address, params->length) >
+         UCS_PTR_BYTE_OFFSET(memh->address, memh->length))) {
         return UCS_ERR_INVALID_PARAM;
     }
 
@@ -586,7 +626,7 @@ ucp_mpool_malloc(ucp_worker_h worker, ucs_mpool_t *mp, size_t *size_p, void **ch
     status = ucp_mem_map_common(worker->context, NULL,
                                 *size_p + sizeof(*chunk_hdr),
                                 ucp_mem_map_params2uct_flags(&mem_params),
-                                1, &memh);
+                                1, ucs_mpool_name(mp), &memh);
     if (status != UCS_OK) {
         goto out;
     }
@@ -641,4 +681,75 @@ void ucp_frag_mpool_free(ucs_mpool_t *mp, void *chunk)
     ucp_worker_h worker = ucs_container_of(mp, ucp_worker_t, rndv_frag_mp);
 
     ucp_mpool_free(worker, mp, chunk);
+}
+
+void ucp_mem_print_info(const char *mem_size, ucp_context_h context, FILE *stream)
+{
+    size_t min_page_size, max_page_size;
+    ucp_mem_map_params_t mem_params;
+    size_t mem_size_value;
+    char memunits_str[32];
+    ucs_status_t status;
+    unsigned md_index;
+    ucp_mem_h memh;
+
+    status = ucs_str_to_memunits(mem_size, &mem_size_value);
+    if (status != UCS_OK) {
+        printf("<Failed to convert a memunits string>\n");
+        return;
+    }
+
+    mem_params.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS |
+                            UCP_MEM_MAP_PARAM_FIELD_LENGTH  |
+                            UCP_MEM_MAP_PARAM_FIELD_FLAGS;
+    mem_params.address    = NULL;
+    mem_params.length     = mem_size_value;
+    mem_params.flags      = UCP_MEM_MAP_ALLOCATE;
+
+    status = ucp_mem_map(context, &mem_params, &memh);
+    if (status != UCS_OK) {
+        printf("<Failed to map memory of size %s>\n", mem_size);
+        return;
+    }
+
+    fprintf(stream, "#\n");
+    fprintf(stream, "# UCP memory allocation\n");
+    fprintf(stream, "#\n");
+
+    ucs_memunits_to_str(memh->length, memunits_str, sizeof(memunits_str));
+    fprintf(stream, "#  allocated %s at address %p with ", memunits_str,
+            memh->address);
+
+    if (memh->alloc_md == NULL) {
+        fprintf(stream, "%s", uct_alloc_method_names[memh->alloc_method]);
+    } else {
+        for (md_index = 0; md_index < context->num_mds; ++md_index) {
+            if (memh->alloc_md == context->tl_mds[md_index].md) {
+                fprintf(stream, "%s", context->tl_mds[md_index].rsc.md_name);
+                break;
+            }
+        }
+    }
+
+    ucs_get_mem_page_size(memh->address, memh->length, &min_page_size,
+                          &max_page_size);
+    ucs_memunits_to_str(min_page_size, memunits_str, sizeof(memunits_str));
+    fprintf(stream, ", pagesize: %s", memunits_str);
+    if (min_page_size != max_page_size) {
+        ucs_memunits_to_str(max_page_size, memunits_str, sizeof(memunits_str));
+        fprintf(stream, "-%s", memunits_str);
+    }
+
+    fprintf(stream, "\n");
+    fprintf(stream, "#  registered on: ");
+    ucs_for_each_bit(md_index, memh->md_map) {
+        fprintf(stream, "%s ", context->tl_mds[md_index].rsc.md_name);
+    }
+    fprintf(stream, "\n");
+    fprintf(stream, "#\n");
+
+    status = ucp_mem_unmap(context, memh);
+    if (status != UCS_OK) {
+        printf("<Failed to unmap memory of size %s>\n", mem_size);
+    }
 }

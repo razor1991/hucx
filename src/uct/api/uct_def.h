@@ -15,8 +15,8 @@
 #include <sys/types.h>
 
 
+#define UCT_COMPONENT_NAME_MAX     16
 #define UCT_TL_NAME_MAX            10
-#define UCT_MD_COMPONENT_NAME_MAX  16
 #define UCT_MD_NAME_MAX            16
 #define UCT_DEVICE_NAME_MAX        32
 #define UCT_PENDING_REQ_PRIV_LEN   40
@@ -45,10 +45,10 @@ enum uct_am_trace_type {
  * @ingroup UCT_RESOURCE
  * @brief Flags for active message and tag-matching offload callbacks (callback's parameters).
  *
- * If this flag is enabled, then data is part of a descriptor which includes
- * the user-defined rx_headroom, and the callback may return UCS_INPROGRESS
- * and hold on to that descriptor. Otherwise, the data can't be used outside
- * the callback. If needed, the data must be copied-out.
+ * If UCT_CB_PARAM_FLAG_DESC flag is enabled, then data is part of a descriptor
+ * which includes the user-defined rx_headroom, and the callback may return
+ * UCS_INPROGRESS and hold on to that descriptor. Otherwise, the data can't be
+ * used outside the callback. If needed, the data must be copied-out.
  *
    @verbatim
     descriptor    data
@@ -58,40 +58,55 @@ enum uct_am_trace_type {
     +-------------+-------------------------+
    @endverbatim
  *
+ * UCT_CB_PARAM_FLAG_FIRST and UCT_CB_PARAM_FLAG_MORE flags are relevant for
+ * @ref uct_tag_unexp_eager_cb_t callback only. The former value indicates that
+ * the data is the first fragment of the message. The latter value means that
+ * more fragments of the message yet to be delivered.
  */
 enum uct_cb_param_flags {
-    UCT_CB_PARAM_FLAG_DESC = UCS_BIT(0)
+    UCT_CB_PARAM_FLAG_DESC  = UCS_BIT(0),
+    UCT_CB_PARAM_FLAG_FIRST = UCS_BIT(1),
+    UCT_CB_PARAM_FLAG_MORE  = UCS_BIT(2)
 };
 
 /**
  * @addtogroup UCT_RESOURCE
  * @{
  */
-typedef struct uct_iface         *uct_iface_h;
-typedef struct uct_iface_config  uct_iface_config_t;
-typedef struct uct_md_config     uct_md_config_t;
-typedef struct uct_ep            *uct_ep_h;
-typedef void *                   uct_mem_h;
-typedef uintptr_t                uct_rkey_t;
-typedef struct uct_md            *uct_md_h;          /**< @brief Memory domain handler */
-typedef struct uct_md_ops        uct_md_ops_t;
-typedef void                     *uct_rkey_ctx_h;
-typedef struct uct_iface_attr    uct_iface_attr_t;
-typedef struct uct_iface_params  uct_iface_params_t;
-typedef struct uct_md_attr       uct_md_attr_t;
-typedef struct uct_completion    uct_completion_t;
-typedef struct uct_pending_req   uct_pending_req_t;
-typedef struct uct_worker        *uct_worker_h;
-typedef struct uct_md            uct_md_t;
-typedef enum uct_am_trace_type   uct_am_trace_type_t;
-typedef struct uct_device_addr   uct_device_addr_t;
-typedef struct uct_iface_addr    uct_iface_addr_t;
-typedef struct uct_ep_addr       uct_ep_addr_t;
-typedef struct uct_ep_params     uct_ep_params_t;
-typedef struct uct_tag_context   uct_tag_context_t;
-typedef uint64_t                 uct_tag_t;  /* tag type - 64 bit */
-typedef int                      uct_worker_cb_id_t;
-typedef void*                    uct_conn_request_h;
+typedef struct uct_component       *uct_component_h;
+typedef struct uct_iface           *uct_iface_h;
+typedef struct uct_iface_config    uct_iface_config_t;
+typedef struct uct_md_config       uct_md_config_t;
+typedef struct uct_cm_config       uct_cm_config_t;
+typedef struct uct_ep              *uct_ep_h;
+typedef void *                     uct_mem_h;
+typedef uintptr_t                  uct_rkey_t;
+typedef struct uct_md              *uct_md_h;          /**< @brief Memory domain handler */
+typedef struct uct_md_ops          uct_md_ops_t;
+typedef void                       *uct_rkey_ctx_h;
+typedef struct uct_iface_attr      uct_iface_attr_t;
+typedef struct uct_iface_params    uct_iface_params_t;
+typedef struct uct_md_attr         uct_md_attr_t;
+typedef struct uct_completion      uct_completion_t;
+typedef struct uct_pending_req     uct_pending_req_t;
+typedef struct uct_worker          *uct_worker_h;
+typedef struct uct_md              uct_md_t;
+typedef enum uct_am_trace_type     uct_am_trace_type_t;
+typedef struct uct_device_addr     uct_device_addr_t;
+typedef struct uct_iface_addr      uct_iface_addr_t;
+typedef struct uct_ep_addr         uct_ep_addr_t;
+typedef struct uct_ep_params       uct_ep_params_t;
+typedef struct uct_cm_attr         uct_cm_attr_t;
+typedef struct uct_cm              uct_cm_t;
+typedef uct_cm_t                   *uct_cm_h;
+typedef struct uct_listener_attr   uct_listener_attr_t;
+typedef struct uct_listener        *uct_listener_h;
+typedef struct uct_listener_params uct_listener_params_t;
+typedef struct uct_tag_context     uct_tag_context_t;
+typedef uint64_t                   uct_tag_t;  /* tag type - 64 bit */
+typedef int                        uct_worker_cb_id_t;
+typedef void*                      uct_conn_request_h;
+
 /**
  * @}
  */
@@ -133,6 +148,273 @@ typedef struct uct_iov {
                              the buffer in bytes */
     unsigned  count;    /**< Number of payload elements in the buffer */
 } uct_iov_t;
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Client-Server private data pack callback arguments field mask.
+ *
+ * The enumeration allows specifying which fields in
+ * @ref uct_cm_ep_priv_data_pack_args are present, for backward compatibility support.
+ */
+enum uct_cm_ep_priv_data_pack_args_field {
+    /** Enables @ref uct_cm_ep_priv_data_pack_args::dev_name
+     *  Indicates that dev_name field in uct_cm_ep_priv_data_pack_args_t is valid.
+     */
+    UCT_CM_EP_PRIV_DATA_PACK_ARGS_FIELD_DEVICE_NAME = UCS_BIT(0)
+};
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Arguments to the client-server private data pack callback.
+ *
+ * Used with the client-server API on a connection manager.
+ */
+typedef struct uct_cm_ep_priv_data_pack_args {
+    /**
+     * Mask of valid fields in this structure, using bits from
+     * @ref uct_cm_ep_priv_data_pack_args_field.
+     * Fields not specified by this mask should not be accessed by the callback.
+     */
+    uint64_t                   field_mask;
+
+    /**
+     * Device name. This routine may fill the user's private data according to
+     * the given device name. The device name that is passed to this routine,
+     * corresponds to @ref uct_tl_resource_desc_t::dev_name as returned from
+     * @ref uct_md_query_tl_resources.
+     */
+    char                       dev_name[UCT_DEVICE_NAME_MAX];
+} uct_cm_ep_priv_data_pack_args_t;
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Remote data attributes field mask.
+ *
+ * The enumeration allows specifying which fields in @ref uct_cm_remote_data are
+ * present, for backward compatibility support.
+ */
+enum uct_cm_remote_data_field {
+    /** Enables @ref uct_cm_remote_data::dev_addr */
+    UCT_CM_REMOTE_DATA_FIELD_DEV_ADDR              = UCS_BIT(0),
+
+    /** Enables @ref uct_cm_remote_data::dev_addr_length */
+    UCT_CM_REMOTE_DATA_FIELD_DEV_ADDR_LENGTH       = UCS_BIT(1),
+
+    /** Enables @ref uct_cm_remote_data::conn_priv_data */
+    UCT_CM_REMOTE_DATA_FIELD_CONN_PRIV_DATA        = UCS_BIT(2),
+
+    /** Enables @ref uct_cm_remote_data::conn_priv_data_length */
+    UCT_CM_REMOTE_DATA_FIELD_CONN_PRIV_DATA_LENGTH = UCS_BIT(3)
+};
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Data received from the remote peer.
+ *
+ * The remote peer's device address, the data received from it and their lengths.
+ * Used with the client-server API on a connection manager.
+ */
+typedef struct uct_cm_remote_data {
+    /**
+     * Mask of valid fields in this structure, using bits from
+     * @ref uct_cm_remote_data_field. Fields not specified by this mask
+     * will be ignored.
+     */
+    uint64_t                field_mask;
+
+    /**
+     * Device address of the remote peer.
+     */
+    const uct_device_addr_t *dev_addr;
+
+    /**
+     * Length of the remote device address.
+     */
+    size_t                  dev_addr_length;
+
+    /**
+     * Pointer to the received data. This is the private data that was passed to
+     * @ref uct_ep_params_t::sockaddr_pack_cb.
+     */
+    const void              *conn_priv_data;
+
+    /**
+     * Length of the received data from the peer.
+     */
+    size_t                  conn_priv_data_length;
+} uct_cm_remote_data_t;
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Listener's connection request callback arguments field mask.
+ *
+ * The enumeration allows specifying which fields in
+ * @ref uct_cm_listener_conn_request_args are present, for backward compatibility
+ * support.
+ */
+enum uct_cm_listener_conn_request_args_field {
+    /** Enables @ref uct_cm_listener_conn_request_args::dev_name
+     *  Indicates that dev_name field in uct_cm_listener_conn_request_args_t is
+     *  valid.
+     */
+    UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_DEV_NAME     = UCS_BIT(0),
+
+    /** Enables @ref uct_cm_listener_conn_request_args::conn_request
+     *  Indicates that conn_request field in uct_cm_listener_conn_request_args_t
+     *  is valid.
+     */
+    UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_CONN_REQUEST = UCS_BIT(1),
+
+    /** Enables @ref uct_cm_listener_conn_request_args::remote_data
+     *  Indicates that remote_data field in uct_cm_listener_conn_request_args_t
+     *  is valid.
+     */
+    UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_REMOTE_DATA  = UCS_BIT(2),
+
+    /** Enables @ref uct_cm_listener_conn_request_args::client_address
+     *  Indicates that client_address field in uct_cm_listener_conn_request_args_t
+     *  is valid.
+     */
+    UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_CLIENT_ADDR  = UCS_BIT(3)
+};
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Arguments to the listener's connection request callback.
+ *
+ * The local device name, connection request handle and the data the client sent.
+ * Used with the client-server API on a connection manager.
+ */
+typedef struct uct_cm_listener_conn_request_args {
+    /**
+     * Mask of valid fields in this structure, using bits from
+     * @ref uct_cm_listener_conn_request_args_field.
+     * Fields not specified by this mask should not be acceessed by the callback.
+     */
+    uint64_t                   field_mask;
+
+    /**
+     * Local device name which handles the incoming connection request.
+     */
+    char                       dev_name[UCT_DEVICE_NAME_MAX];
+
+    /**
+     * Connection request handle. Can be passed to this callback from the
+     * transport and will be used by it to accept or reject the connection
+     * request from the client.
+     */
+    uct_conn_request_h         conn_request;
+
+    /**
+     * Remote data from the client.
+     */
+    const uct_cm_remote_data_t *remote_data;
+
+    /**
+     * Client's address.
+     */
+    ucs_sock_addr_t            client_address;
+} uct_cm_listener_conn_request_args_t;
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Field mask flags for client-side connection established callback.
+ *
+ * The enumeration allows specifying which fields in
+ * @ref uct_cm_ep_client_connect_args are present, for backward compatibility
+ * support.
+ */
+enum uct_cm_ep_client_connect_args_field {
+    /** Enables @ref uct_cm_ep_client_connect_args::remote_data */
+    UCT_CM_EP_CLIENT_CONNECT_ARGS_FIELD_REMOTE_DATA = UCS_BIT(0),
+
+    /** Enables @ref uct_cm_ep_client_connect_args::status */
+    UCT_CM_EP_CLIENT_CONNECT_ARGS_FIELD_STATUS      = UCS_BIT(1)
+};
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Arguments to the client's connect callback.
+ *
+ * Used with the client-server API on a connection manager.
+ */
+typedef struct uct_cm_ep_client_connect_args {
+    /**
+     * Mask of valid fields in this structure, using bits from
+     * @ref uct_cm_ep_client_connect_args_field.
+     * Fields not specified by this mask should not be accessed by the callback.
+     */
+    uint64_t                   field_mask;
+
+    /**
+     * Remote data from the server.
+     */
+    const uct_cm_remote_data_t *remote_data;
+
+    /**
+     * Indicates the connection establishment response from the remote server:
+     * UCS_OK                   - the remote server accepted the connection request.
+     * UCS_ERR_REJECTED         - the remote server rejected the connection request.
+     * UCS_ERR_CONNECTION_RESET - the server's connection was reset during
+     *                            the connection establishment to the client.
+     * Otherwise                - indicates an internal connection establishment
+     *                            error on the local (client) side.
+     */
+    ucs_status_t               status;
+} uct_cm_ep_client_connect_args_t;
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Field mask flags for server-side connection established notification
+ *        callback.
+ *
+ * The enumeration allows specifying which fields in
+ * @ref uct_cm_ep_server_conn_notify_args are present, for backward compatibility
+ * support.
+ */
+enum uct_cm_ep_server_conn_notify_args_field {
+    /** Enables @ref uct_cm_ep_server_conn_notify_args::status
+     *  Indicates that status field in uct_cm_ep_server_conn_notify_args_t is valid.
+     */
+    UCT_CM_EP_SERVER_CONN_NOTIFY_ARGS_FIELD_STATUS = UCS_BIT(0)
+};
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Arguments to the server's notify callback.
+ *
+ * Used with the client-server API on a connection manager.
+ */
+typedef struct uct_cm_ep_server_conn_notify_args {
+    /**
+     * Mask of valid fields in this structure, using bits from
+     * @ref uct_cm_ep_server_conn_notify_args_field.
+     * Fields not specified by this mask should not be accessed by the callback.
+     */
+    uint64_t                   field_mask;
+
+    /**
+     * Indicates the client's @ref ucs_status_t status:
+     * UCS_OK                   - the client completed its connection
+     *                            establishment and called
+     *                            @ref uct_cm_client_ep_conn_notify
+     * UCS_ERR_CONNECTION_RESET - the client's connection was reset during
+     *                            the connection establishment to the server.
+     * Otherwise                - indicates an internal connection establishment
+     *                            error on the local (server) side.
+     */
+    ucs_status_t               status;
+} uct_cm_ep_server_conn_notify_args_t;
 
 
 /**
@@ -269,9 +551,8 @@ typedef void (*uct_unpack_callback_t)(void *arg, const void *data, size_t length
 
 
 /**
- * @ingroup UCT_RESOURCE
- * @brief Callback to process an incoming connection request message on the server
- *        side.
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Callback to process an incoming connection request on the server side.
  *
  * This callback routine will be invoked on the server side upon receiving an
  * incoming connection request. It should be set by the server side while
@@ -287,6 +568,8 @@ typedef void (*uct_unpack_callback_t)(void *arg, const void *data, size_t length
  *                               should accept or reject the request by calling
  *                               @ref uct_iface_accept or @ref uct_iface_reject
  *                               routines respectively.
+ *                               conn_request should not be used outside the
+ *                               scope of this callback.
  * @param [in]  conn_priv_data   Points to the received data.
  *                               This is the private data that was passed to the
  *                               @ref uct_ep_params_t::sockaddr_pack_cb on the
@@ -302,35 +585,131 @@ typedef void
 
 
 /**
- * @ingroup UCT_RESOURCE
- * @brief Callback to fill the user's private data on the client side.
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Callback to process an incoming connection request on the server side
+ *        listener in a connection manager.
  *
- * This callback routine will be invoked on the client side before sending the
- * transport's connection request to the server.
- * The callback routine must be set by the client when creating an endpoint.
+ * This callback routine will be invoked on the server side upon receiving an
+ * incoming connection request. It should be set by the server side while
+ * initializing a listener in a connection manager.
+ * This callback has to be thread safe.
+ * Other than communication progress routines, it is allowed to call other UCT
+ * communication routines from this callback.
+ *
+ * @param [in]  listener         Transport listener.
+ * @param [in]  arg              User argument for this callback as defined in
+ *                               @ref uct_listener_params_t::user_data
+ * @param [in]  conn_req_args    Listener's arguments to handle the connection
+ *                               request from the client.
+ */
+typedef void
+(*uct_cm_listener_conn_request_callback_t)(uct_listener_h listener, void *arg,
+                                           const uct_cm_listener_conn_request_args_t
+                                           *conn_req_args);
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Callback to process an incoming connection establishment acknowledgment
+ *        on the server side listener, from the client, which indicates that the
+ *        client side is connected.
+ *        The callback also notifies the server side of a local error on a
+ *        not-yet-connected endpoint.
+ *
+ * This callback routine will be invoked on the server side upon receiving an
+ * incoming connection establishment acknowledgment from the client, which is sent
+ * from it once the client is connected to the server. Used to connect the server
+ * side to the client or handle an error from it - depending on the status field.
+ * This callback will also be invoked in the event of an internal local error
+ * with a failed @ref uct_cm_ep_server_conn_notify_args::status if the endpoint
+ * was not connected yet.
+ * This callback has to be thread safe.
+ * Other than communication progress routines, it is permissible to call other UCT
+ * communication routines from this callback.
+ *
+ * @param [in]  ep               Transport endpoint.
+ * @param [in]  arg              User argument for this callback as defined in
+ *                               @ref uct_ep_params_t::user_data
+ * @param [in]  connect_args     Server's connect callback arguments.
+ */
+typedef void (*uct_cm_ep_server_conn_notify_callback_t)
+                (uct_ep_h ep, void *arg,
+                 const uct_cm_ep_server_conn_notify_args_t *connect_args);
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Callback to process an incoming connection response on the client side
+ *        from the server or handle a local error on a not-yet-connected endpoint.
+ *
+ * This callback routine will be invoked on the client side upon receiving an
+ * incoming connection response from the server. Used to connect the client side
+ * to the server or handle an error from it - depending on the status field.
+ * This callback will also be invoked in the event of an internal local error
+ * with a failed @ref uct_cm_ep_client_connect_args::status if the endpoint was
+ * not connected yet.
+ * This callback has to be thread safe.
+ * Other than communication progress routines, it is permissible to call other UCT
+ * communication routines from this callback.
+ *
+ * @param [in]  ep               Transport endpoint.
+ * @param [in]  arg              User argument for this callback as defined in
+ *                               @ref uct_ep_params_t::user_data.
+ * @param [in]  connect_args     Client's connect callback arguments
+ */
+typedef void (*uct_cm_ep_client_connect_callback_t)(uct_ep_h ep, void *arg,
+                                                    const uct_cm_ep_client_connect_args_t
+                                                    *connect_args);
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Callback to handle the disconnection of the remote peer.
+ *
+ * This callback routine will be invoked on the client and server sides upon
+ * a disconnect of the remote peer. It will disconnect the given endpoint from
+ * the remote peer.
+ * This callback won't be invoked if the endpoint was not connected to the remote
+ * peer yet.
+ * This callback has to be thread safe.
+ * Other than communication progress routines, it is permissible to call other UCT
+ * communication routines from this callback.
+ *
+ * @param [in]  ep               Transport endpoint to disconnect.
+ * @param [in]  arg              User argument for this callback as defined in
+ *                               @ref uct_ep_params_t::user_data.
+ */
+typedef void (*uct_ep_disconnect_cb_t)(uct_ep_h ep, void *arg);
+
+
+/**
+ * @ingroup UCT_CLIENT_SERVER
+ * @brief Callback to fill the user's private data in a client-server flow.
+ *
+ * This callback routine will be invoked on the client side, before sending the
+ * transport's connection request to the server, or on the server side before
+ * sending a connection response to the client.
+ * The callback routine must be set when creating an endpoint.
  * The user's private data should be placed inside the priv_data buffer to be
- * sent to the server side.
+ * sent to the remote side.
  * The maximal allowed length of the private data is indicated by the field
- * max_conn_priv inside @ref uct_iface_attr.
+ * max_conn_priv inside @ref uct_iface_attr or inside @ref uct_cm_attr when using a
+ * connection manager.
  * Communication progress routines should not be called from this callback.
  * It is allowed to call other UCT communication routines from this callback.
  *
- * @param [in]  arg        User defined argument for this callback.
- * @param [in]  dev_name   Device name. This routine may fill the user's private
- *                         data according to the given device name.
- *                         The device name that is passed to this routine,
- *                         corresponds to the dev_name field inside
- *                         @ref uct_tl_resource_desc_t as returned from
- *                         @ref uct_md_query_tl_resources.
- * @param [out] priv_data  User's private data to be passed to the server side.
+ * @param [in]  arg          User defined argument for this callback.
+ * @param [in]  pack_args    Handle for the the private data packing.
+ * @param [out] priv_data    User's private data to be passed to the remote side.
  *
  * @return Negative value indicates an error according to @ref ucs_status_t.
- *         On success, non-negative value indicates actual number of
+ *         On success, a non-negative value indicates actual number of
  *         bytes written to the @a priv_data buffer.
  */
-typedef ssize_t (*uct_sockaddr_priv_pack_callback_t)(void *arg,
-                                                     const char *dev_name,
-                                                     void *priv_data);
+typedef ssize_t
+(*uct_cm_ep_priv_data_pack_callback_t)(void *arg,
+                                       const uct_cm_ep_priv_data_pack_args_t
+                                       *pack_args, void *priv_data);
 
 
 /**
@@ -345,26 +724,44 @@ typedef ssize_t (*uct_sockaddr_priv_pack_callback_t)(void *arg,
  *
  * @note It is allowed to call other communication routines from the callback.
  *
- * @param [in]  arg     User-defined argument
- * @param [in]  data    Points to the received unexpected data.
- * @param [in]  length  Length of data.
- * @param [in]  desc    Points to the received descriptor, at the beginning of
- *                      the user-defined rx_headroom.
- * @param [in]  stag    Tag from sender.
- * @param [in]  imm     Immediate data from sender.
+ * @param [in]     arg     User-defined argument
+ * @param [in]     data    Points to the received unexpected data.
+ * @param [in]     length  Length of data.
+ * @param [in]     flags   Mask with @ref uct_cb_param_flags flags. If it
+ *                         contains @ref UCT_CB_PARAM_FLAG_DESC value, this means
+ *                         @a data is part of a descriptor which must be released
+ *                         later using @ref uct_iface_release_desc by the user if
+ *                         the callback returns @ref UCS_INPROGRESS.
+ * @param [in]     stag    Tag from sender.
+ * @param [in]     imm     Immediate data from sender.
  *
- * @warning If the user became the owner of the @a desc (by returning
- *          @ref UCS_INPROGRESS) the descriptor must be released later by
- *          @ref uct_iface_release_desc by the user.
+ * @param [inout]  context Storage for a per-message user-defined context. In
+ *                         this context, the message is defined by the sender
+ *                         side as a single call to uct_ep_tag_eager_short/bcopy/zcopy.
+ *                         On the transport level the message can be fragmented
+ *                         and delivered to the target over multiple fragments.
+ *                         The fragments will preserve the original order of the
+ *                         message. Each fragment will result in invocation of
+ *                         the above callback. The user can use
+ *                         UCT_CB_PARAM_FLAG_FIRST to identify the first fragment,
+ *                         allocate the context object and use the context as a
+ *                         token that is set by the user and passed to subsequent
+ *                         callbacks of the same message. The user is responsible
+ *                         for allocation and release of the context.
  *
- * @retval UCS_OK         - descriptor was consumed, and can be released
- *                          by the caller.
- * @retval UCS_INPROGRESS - descriptor is owned by the callee, and would be
- *                          released later.
+ * @note No need to allocate the context in the case of a single fragment message
+ *       (i.e. @a flags contains @ref UCT_CB_PARAM_FLAG_FIRST, but does not
+ *       contain @ref UCT_CB_PARAM_FLAG_MORE).
+ *
+ * @retval UCS_OK          - data descriptor was consumed, and can be released
+ *                           by the caller.
+ * @retval UCS_INPROGRESS  - data descriptor is owned by the callee, and will be
+ *                           released later.
  */
 typedef ucs_status_t (*uct_tag_unexp_eager_cb_t)(void *arg, void *data,
                                                  size_t length, unsigned flags,
-                                                 uct_tag_t stag, uint64_t imm);
+                                                 uct_tag_t stag, uint64_t imm,
+                                                 void **context);
 
 
 /**
@@ -403,6 +800,17 @@ typedef ucs_status_t (*uct_tag_unexp_rndv_cb_t)(void *arg, unsigned flags,
                                                 unsigned header_length,
                                                 uint64_t remote_addr, size_t length,
                                                 const void *rkey_buf);
+
+
+/**
+ * @ingroup UCT_RESOURCE
+ * @brief Callback to process asynchronous events.
+ *
+ * @param [in]  arg      User argument to be passed to the callback.
+ * @param [in]  flags    Flags to be passed to the callback (reserved for
+ *                       future use).
+ */
+typedef void (*uct_async_event_cb_t)(void *arg, unsigned flags);
 
 
 #endif

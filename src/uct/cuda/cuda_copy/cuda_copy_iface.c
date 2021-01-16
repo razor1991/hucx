@@ -3,10 +3,15 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "cuda_copy_iface.h"
 #include "cuda_copy_md.h"
 #include "cuda_copy_ep.h"
 
+#include <uct/cuda/base/cuda_iface.h>
 #include <ucs/type/class.h>
 #include <ucs/sys/string.h>
 #include <ucs/arch/cpu.h>
@@ -22,7 +27,7 @@ static ucs_config_field_t uct_cuda_copy_iface_config_table[] = {
      "Max number of event completions to pick during cuda events polling",
      ucs_offsetof(uct_cuda_copy_iface_config_t, max_poll), UCS_CONFIG_TYPE_UINT},
 
-    {"MAX_EVENTS", "1024",
+    {"MAX_EVENTS", "inf",
      "Max number of cuda events. -1 is infinite",
      ucs_offsetof(uct_cuda_copy_iface_config_t, max_cuda_events), UCS_CONFIG_TYPE_UINT},
 
@@ -53,10 +58,12 @@ static int uct_cuda_copy_iface_is_reachable(const uct_iface_h tl_iface,
     return (addr != NULL) && (iface->id == *addr);
 }
 
-static ucs_status_t uct_cuda_copy_iface_query(uct_iface_h iface,
+static ucs_status_t uct_cuda_copy_iface_query(uct_iface_h tl_iface,
                                               uct_iface_attr_t *iface_attr)
 {
-    memset(iface_attr, 0, sizeof(uct_iface_attr_t));
+    uct_cuda_copy_iface_t *iface = ucs_derived_of(tl_iface, uct_cuda_copy_iface_t);
+
+    uct_base_iface_query(&iface->super, iface_attr);
 
     iface_attr->iface_addr_len          = sizeof(uct_cuda_copy_iface_addr_t);
     iface_attr->device_addr_len         = 0;
@@ -93,9 +100,9 @@ static ucs_status_t uct_cuda_copy_iface_query(uct_iface_h iface,
     iface_attr->cap.am.max_hdr          = 0;
     iface_attr->cap.am.max_iov          = 1;
 
-    iface_attr->latency.overhead        = 10e-6; /* 10 us */
-    iface_attr->latency.growth          = 0;
-    iface_attr->bandwidth               = 6911 * 1024.0 * 1024.0;
+    iface_attr->latency                 = ucs_linear_func_make(10e-6, 0);
+    iface_attr->bandwidth.dedicated     = 0;
+    iface_attr->bandwidth.shared        = 6911.0 * UCS_MBYTE;
     iface_attr->overhead                = 0;
     iface_attr->priority                = 0;
 
@@ -179,7 +186,7 @@ static uct_iface_ops_t uct_cuda_copy_iface_ops = {
     .iface_progress           = uct_cuda_copy_iface_progress,
     .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_cuda_copy_iface_t),
     .iface_query              = uct_cuda_copy_iface_query,
-    .iface_get_device_address = (void*)ucs_empty_function_return_success,
+    .iface_get_device_address = (uct_iface_get_device_address_func_t)ucs_empty_function_return_success,
     .iface_get_address        = uct_cuda_copy_iface_get_address,
     .iface_is_reachable       = uct_cuda_copy_iface_is_reachable,
 };
@@ -190,8 +197,8 @@ static void uct_cuda_copy_event_desc_init(ucs_mpool_t *mp, void *obj, void *chun
     ucs_status_t status;
 
     memset(base, 0 , sizeof(*base));
-    status = UCT_CUDA_FUNC(cudaEventCreateWithFlags(&(base->event),
-                           cudaEventDisableTiming));
+    status = UCT_CUDA_FUNC_LOG_ERR(cudaEventCreateWithFlags(&base->event,
+                                                            cudaEventDisableTiming));
     if (UCS_OK != status) {
         ucs_error("cudaEventCreateWithFlags Failed");
     }
@@ -200,11 +207,12 @@ static void uct_cuda_copy_event_desc_init(ucs_mpool_t *mp, void *obj, void *chun
 static void uct_cuda_copy_event_desc_cleanup(ucs_mpool_t *mp, void *obj)
 {
     uct_cuda_copy_event_desc_t *base = (uct_cuda_copy_event_desc_t *) obj;
-    ucs_status_t status;
+    int active;
 
-    status = UCT_CUDA_FUNC(cudaEventDestroy(base->event));
-    if (UCS_OK != status) {
-        ucs_error("cudaEventDestroy Failed");
+    UCT_CUDADRV_CTX_ACTIVE(active);
+
+    if (active) {
+        UCT_CUDA_FUNC_LOG_ERR(cudaEventDestroy(base->event));
     }
 }
 
@@ -225,7 +233,7 @@ static UCS_CLASS_INIT_FUNC(uct_cuda_copy_iface_t, uct_md_h md, uct_worker_h work
 
     UCS_CLASS_CALL_SUPER_INIT(uct_base_iface_t, &uct_cuda_copy_iface_ops, md, worker,
                               params, tl_config UCS_STATS_ARG(params->stats_root)
-                              UCS_STATS_ARG(UCT_CUDA_COPY_TL_NAME));
+                              UCS_STATS_ARG("cuda_copy"));
 
     if (strncmp(params->mode.device.dev_name,
                 UCT_CUDA_DEV_NAME, strlen(UCT_CUDA_DEV_NAME)) != 0) {
@@ -263,14 +271,20 @@ static UCS_CLASS_INIT_FUNC(uct_cuda_copy_iface_t, uct_md_h md, uct_worker_h work
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cuda_copy_iface_t)
 {
+    int active;
+
+    UCT_CUDADRV_CTX_ACTIVE(active);
+
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
-    if (self->stream_h2d != 0) {
-        UCT_CUDA_FUNC(cudaStreamDestroy(self->stream_h2d));
-    }
+    if (active) {
+        if (self->stream_h2d != 0) {
+            UCT_CUDA_FUNC_LOG_ERR(cudaStreamDestroy(self->stream_h2d));
+        }
 
-    if (self->stream_d2h != 0) {
-        UCT_CUDA_FUNC(cudaStreamDestroy(self->stream_d2h));
+        if (self->stream_d2h != 0) {
+            UCT_CUDA_FUNC_LOG_ERR(cudaStreamDestroy(self->stream_d2h));
+        }
     }
 
     ucs_mpool_cleanup(&self->cuda_event_desc, 1);
@@ -282,34 +296,6 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_cuda_copy_iface_t, uct_iface_t, uct_md_h, uct_work
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_cuda_copy_iface_t, uct_iface_t);
 
 
-static ucs_status_t uct_cuda_copy_query_tl_resources(uct_md_h md,
-                                                     uct_tl_resource_desc_t **resource_p,
-                                                     unsigned *num_resources_p)
-{
-    uct_tl_resource_desc_t *resource;
-
-    resource = ucs_calloc(1, sizeof(uct_tl_resource_desc_t), "resource desc");
-    if (NULL == resource) {
-        ucs_error("Failed to allocate memory");
-        return UCS_ERR_NO_MEMORY;
-    }
-
-    ucs_snprintf_zero(resource->tl_name, sizeof(resource->tl_name), "%s",
-                      UCT_CUDA_COPY_TL_NAME);
-    ucs_snprintf_zero(resource->dev_name, sizeof(resource->dev_name), "%s",
-                      UCT_CUDA_DEV_NAME);
-    resource->dev_type = UCT_DEVICE_TYPE_ACC;
-
-    *num_resources_p = 1;
-    *resource_p      = resource;
-    return UCS_OK;
-}
-
-UCT_TL_COMPONENT_DEFINE(uct_cuda_copy_tl,
-                        uct_cuda_copy_query_tl_resources,
-                        uct_cuda_copy_iface_t,
-                        UCT_CUDA_COPY_TL_NAME,
-                        "CUDA_COPY_",
-                        uct_cuda_copy_iface_config_table,
-                        uct_cuda_copy_iface_config_t);
-UCT_MD_REGISTER_TL(&uct_cuda_copy_md_component, &uct_cuda_copy_tl);
+UCT_TL_DEFINE(&uct_cuda_copy_component, cuda_copy, uct_cuda_base_query_devices,
+              uct_cuda_copy_iface_t, "CUDA_COPY_",
+              uct_cuda_copy_iface_config_table, uct_cuda_copy_iface_config_t);

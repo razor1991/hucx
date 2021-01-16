@@ -10,6 +10,8 @@
 #include <ucs/config/global_opts.h>
 #include <ucs/sys/sys.h>
 
+#include <memory>
+
 namespace ucs {
 
 pthread_mutex_t test_base::m_logger_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -86,7 +88,7 @@ void test_base::get_config(const std::string& name, std::string& value, size_t m
                                        max);
     if (status != UCS_OK) {
         GTEST_FAIL() << "Invalid UCS configuration for " << name
-                     << ", error message: " << ucs_status_string(status)
+                     << ": " << ucs_status_string(status)
                      << "(" << status << ")";
     }
 }
@@ -126,7 +128,9 @@ void test_base::pop_config()
 
 ucs_log_func_rc_t
 test_base::count_warns_logger(const char *file, unsigned line, const char *function,
-                              ucs_log_level_t level, const char *message, va_list ap)
+                              ucs_log_level_t level,
+                              const ucs_log_component_config_t *comp_conf,
+                              const char *message, va_list ap)
 {
     pthread_mutex_lock(&m_logger_mutex);
     if (level == UCS_LOG_LEVEL_ERROR) {
@@ -141,14 +145,28 @@ test_base::count_warns_logger(const char *file, unsigned line, const char *funct
 std::string test_base::format_message(const char *message, va_list ap)
 {
     const size_t buffer_size = ucs_log_get_buffer_size();
-    char buf[buffer_size];
-    vsnprintf(buf, buffer_size, message, ap);
-    return std::string(buf);
+    std::string buf(buffer_size, '\0');
+    vsnprintf(&buf[0], buffer_size, message, ap);
+    buf.resize(strlen(buf.c_str()));
+    return buf;
+}
+
+void test_base::push_debug_message_with_limit(std::vector<std::string>& vec,
+                                              const std::string& message,
+                                              const size_t limit) {
+    if (vec.size() >= limit) {
+        UCS_TEST_ABORT("aborting after " + ucs::to_string(vec.size()) +
+                       " error messages (" + message + ")");
+    }
+
+    vec.push_back(message);
 }
 
 ucs_log_func_rc_t
 test_base::hide_errors_logger(const char *file, unsigned line, const char *function,
-                              ucs_log_level_t level, const char *message, va_list ap)
+                              ucs_log_level_t level,
+                              const ucs_log_component_config_t *comp_conf,
+                              const char *message, va_list ap)
 {
     if (level == UCS_LOG_LEVEL_ERROR) {
         pthread_mutex_lock(&m_logger_mutex);
@@ -160,13 +178,16 @@ test_base::hide_errors_logger(const char *file, unsigned line, const char *funct
         pthread_mutex_unlock(&m_logger_mutex);
     }
 
-    ucs_log_default_handler(file, line, function, level, message, ap);
+    ucs_log_default_handler(file, line, function, level,
+                            &ucs_global_opts.log_component, message, ap);
     return UCS_LOG_FUNC_RC_STOP;
 }
 
 ucs_log_func_rc_t
 test_base::hide_warns_logger(const char *file, unsigned line, const char *function,
-                             ucs_log_level_t level, const char *message, va_list ap)
+                             ucs_log_level_t level,
+                             const ucs_log_component_config_t *comp_conf,
+                             const char *message, va_list ap)
 {
     if (level == UCS_LOG_LEVEL_WARN) {
         pthread_mutex_lock(&m_logger_mutex);
@@ -178,13 +199,16 @@ test_base::hide_warns_logger(const char *file, unsigned line, const char *functi
         pthread_mutex_unlock(&m_logger_mutex);
     }
 
-    ucs_log_default_handler(file, line, function, level, message, ap);
+    ucs_log_default_handler(file, line, function, level,
+                            &ucs_global_opts.log_component, message, ap);
     return UCS_LOG_FUNC_RC_STOP;
 }
 
 ucs_log_func_rc_t
 test_base::wrap_errors_logger(const char *file, unsigned line, const char *function,
-                              ucs_log_level_t level, const char *message, va_list ap)
+                              ucs_log_level_t level,
+                              const ucs_log_component_config_t *comp_conf,
+                              const char *message, va_list ap)
 {
     /* Ignore warnings about empty memory pool */
     if (level == UCS_LOG_LEVEL_ERROR) {
@@ -192,7 +216,7 @@ test_base::wrap_errors_logger(const char *file, unsigned line, const char *funct
         std::istringstream iss(format_message(message, ap));
         std::string text;
         while (getline(iss, text, '\n')) {
-            m_errors.push_back(text);
+            push_debug_message_with_limit(m_errors, text, 1000);
             UCS_TEST_MESSAGE << "< " << text << " >";
         }
         pthread_mutex_unlock(&m_logger_mutex);
@@ -209,10 +233,12 @@ void test_base::SetUpProxy() {
     m_num_errors_before          = m_total_errors;
 
     m_errors.clear();
+    m_warnings.clear();
     m_num_log_handlers_before    = ucs_log_num_handlers();
     ucs_log_push_handler(count_warns_logger);
 
     try {
+        check_skip_test();
         init();
         m_initialized = true;
         m_state = RUNNING;
@@ -228,6 +254,8 @@ void test_base::TearDownProxy() {
                        m_state == SKIPPED ||
                        m_state == ABORTED,
                        "state=%d", m_state);
+
+    watchdog_signal();
 
     if (m_initialized) {
         cleanup();
@@ -307,11 +335,7 @@ void test_base::TestBodyProxy() {
             m_state = ABORTED;
             throw;
         }
-    } else if (m_state == SKIPPED) {
-    } else if (m_state == ABORTED) {
     }
-
-    watchdog_signal();
 }
 
 void test_base::skipped(const test_skip_exception& e) {
@@ -322,6 +346,8 @@ void test_base::skipped(const test_skip_exception& e) {
         detail::message_stream("SKIP") << "(" << reason << ")";
     }
     m_state = SKIPPED;
+    skipped_tests.insert(::testing::UnitTest::
+                         GetInstance()->current_test_info());
 }
 
 void test_base::init() {

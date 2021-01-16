@@ -4,7 +4,10 @@
  * See file LICENSE for terms.
  */
 
-#define _GNU_SOURCE
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include <sys/mman.h>
 #include <dlfcn.h>
 #include <stdio.h>
@@ -24,12 +27,17 @@ static void vm_unmap_cb(ucm_event_type_t event_type, ucm_event_t *event,
 
 int test_ucm_set_event_handler(void *handle)
 {
-    ucs_status_t (*ucm_set_event_handler_f)(int events, int priority,
-                                            ucm_event_callback_t cb, void *arg);
+    typedef ucs_status_t (*ucm_set_event_handler_func_t)(int events,
+                                                         int priority,
+                                                         ucm_event_callback_t cb,
+                                                         void *arg);
+
+    ucm_set_event_handler_func_t ucm_set_event_handler_f;
     ucs_status_t status;
 
     dlerror();
-    ucm_set_event_handler_f = dlsym(handle, "ucm_set_event_handler");
+    ucm_set_event_handler_f = (ucm_set_event_handler_func_t)dlsym(handle,
+                                                                  "ucm_set_event_handler");
     if (ucm_set_event_handler_f == NULL) {
         fprintf(stderr, "failed to resolve ucm_set_event_handler(): %s\n",
                 dlerror());
@@ -73,7 +81,8 @@ int main(int argc, char **argv)
                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ptr2 == MAP_FAILED) {
         fprintf(stderr, "mmmap() failed: %m\n");
-        return -1;
+        ret = -1;
+        goto failed_mmap;
     }
 
     /* load ucm */
@@ -82,23 +91,23 @@ int main(int argc, char **argv)
     handle = dlopen(filename, RTLD_NOW);
     if (handle == NULL) {
         fprintf(stderr, "failed to open %s: %s\n", filename, dlerror());
-        return -1;
+        ret = -1;
+        goto failed_dlopen;
     }
 
     /* init ucm */
     ret = test_ucm_set_event_handler(handle);
-    if (ret < 0) {
-        return ret;
-    }
 
     /* unload ucp */
     dlclose(handle);
 
+failed_dlopen:
     /* release the memory - could break if UCM is unloaded */
     munmap(ptr2, alloc_size);
+failed_mmap:
     free(ptr1);
 
     printf("done\n");
-    return 0;
+    return ret;
 }
 

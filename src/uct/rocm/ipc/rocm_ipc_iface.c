@@ -1,15 +1,22 @@
 /*
  * Copyright (C) Advanced Micro Devices, Inc. 2019. ALL RIGHTS RESERVED.
+ * Copyright (C) Mellanox Technologies Ltd. 2020.  ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include "rocm_ipc_iface.h"
 #include "rocm_ipc_md.h"
 #include "rocm_ipc_ep.h"
 
+#include <uct/rocm/base/rocm_base.h>
 #include <ucs/arch/cpu.h>
 #include <ucs/type/class.h>
 #include <ucs/sys/string.h>
+
 
 static ucs_config_field_t uct_rocm_ipc_iface_config_table[] = {
 
@@ -55,7 +62,9 @@ static int uct_rocm_ipc_iface_is_reachable(const uct_iface_h tl_iface,
 static ucs_status_t uct_rocm_ipc_iface_query(uct_iface_h tl_iface,
                                              uct_iface_attr_t *iface_attr)
 {
-    memset(iface_attr, 0, sizeof(uct_iface_attr_t));
+    uct_rocm_ipc_iface_t *iface = ucs_derived_of(tl_iface, uct_rocm_ipc_iface_t);
+
+    uct_base_iface_query(&iface->super, iface_attr);
 
     iface_attr->cap.put.min_zcopy       = 0;
     iface_attr->cap.put.max_zcopy       = SIZE_MAX;
@@ -79,9 +88,9 @@ static ucs_status_t uct_rocm_ipc_iface_query(uct_iface_h tl_iface,
                                           UCT_IFACE_FLAG_CONNECT_TO_IFACE;
 
     /* TODO: get accurate info */
-    iface_attr->latency.overhead        = 80e-9; /* 80 ns */
-    iface_attr->latency.growth          = 0;
-    iface_attr->bandwidth               = 10240 * 1024.0 * 1024.0; /* 10240 MB*/
+    iface_attr->latency                 = ucs_linear_func_make(80e-9, 0);
+    iface_attr->bandwidth.dedicated     = 10.0 * UCS_GBYTE; /* 10 GB */
+    iface_attr->bandwidth.shared        = 0;
     iface_attr->overhead                = 0.4e-6; /* 0.4 us */
 
     return UCS_OK;
@@ -233,36 +242,6 @@ static UCS_CLASS_DEFINE_NEW_FUNC(uct_rocm_ipc_iface_t, uct_iface_t, uct_md_h,
                                  const uct_iface_config_t *);
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_rocm_ipc_iface_t, uct_iface_t);
 
-static ucs_status_t uct_rocm_ipc_query_tl_resources(uct_md_h md,
-                                                    uct_tl_resource_desc_t **resource_p,
-                                                    unsigned *num_resources_p)
-{
-    uct_tl_resource_desc_t *resource;
-
-    resource = ucs_calloc(1, sizeof(uct_tl_resource_desc_t), "ROCm IPC resource desc");
-    if (NULL == resource) {
-        ucs_error("Failed to allocate memory");
-        return UCS_ERR_NO_MEMORY;
-    }
-
-    ucs_snprintf_zero(resource->tl_name, sizeof(resource->tl_name), "%s",
-                      UCT_ROCM_IPC_TL_NAME);
-    ucs_snprintf_zero(resource->dev_name, sizeof(resource->dev_name), "%s",
-                      md->component->name);
-
-    resource->dev_type = UCT_DEVICE_TYPE_ACC;
-
-    *num_resources_p = 1;
-    *resource_p = resource;
-    return UCS_OK;
-}
-
-UCT_TL_COMPONENT_DEFINE(uct_rocm_ipc_tl,
-                        uct_rocm_ipc_query_tl_resources,
-                        uct_rocm_ipc_iface_t,
-                        UCT_ROCM_IPC_TL_NAME,
-                        "ROCM_IPC_",
-                        uct_rocm_ipc_iface_config_table,
-                        uct_rocm_ipc_iface_config_t);
-
-UCT_MD_REGISTER_TL(&uct_rocm_ipc_md_component, &uct_rocm_ipc_tl);
+UCT_TL_DEFINE(&uct_rocm_ipc_component, rocm_ipc, uct_rocm_base_query_devices,
+              uct_rocm_ipc_iface_t, "ROCM_IPC_",
+              uct_rocm_ipc_iface_config_table, uct_rocm_ipc_iface_config_t);

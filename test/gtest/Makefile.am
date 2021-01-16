@@ -2,7 +2,9 @@
 # Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
 # Copyright (C) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
 # Copyright (C) The University of Tennessee and the University of Tennessee Research Foundation. 2016. ALL RIGHTS RESERVED.
-# Copyright (C) Huawei Technologies Co.,Ltd. 2020. ALL RIGHTS RESERVED.
+# Copyright (C) Los Alamos National Security, LLC. 2018 ALL RIGHTS RESERVED.
+# Copyright (C) Advanced Micro Devices, Inc. 2019. ALL RIGHTS RESERVED.
+# Copyright (C) Huawei Technologies Co.,Ltd. 2019-2021. ALL RIGHTS RESERVED.
 #
 # See file LICENSE for terms.
 #
@@ -11,7 +13,7 @@ if HAVE_GTEST
 
 # Set default configuration for running tests
 UCX_HANDLE_ERRORS        ?= freeze
-UCX_LOG_LEVEL            ?= info
+UCX_LOG_LEVEL            ?= warn
 UCX_LOG_PRINT_ENABLE     ?= y
 GTEST_FILTER             ?= *
 GTEST_EXTRA_ARGS         ?=
@@ -34,6 +36,8 @@ VALGRIND_ARGS = \
 	--track-origins=yes \
 	--fair-sched=try \
 	--num-callers=25 \
+	--error-exitcode=1 \
+	--child-silent-after-fork=yes \
 	--suppressions=$(top_srcdir)/contrib/valgrind.supp \
 	$(VALGRIND_EXTRA_ARGS)
 
@@ -44,8 +48,14 @@ gtest_LDADD = \
 	$(top_builddir)/src/ucs/libucs.la \
 	$(top_builddir)/src/uct/libuct.la \
 	$(top_builddir)/src/ucm/libucm.la \
-	$(top_builddir)/src/ucp/libucp.la \
-	$(top_builddir)/src/ucg/libucg.la \
+	$(top_builddir)/src/ucp/libucp.la
+
+if HAVE_UCG
+gtest_LDADD += \
+	$(top_builddir)/src/ucg/libucg.la
+endif
+
+gtest_LDADD += \
 	$(top_builddir)/src/tools/perf/lib/libucxperf.la \
 	$(OPENMP_CFLAGS) \
 	$(GTEST_LIBS)
@@ -62,12 +72,15 @@ gtest_CPPFLAGS = \
 
 gtest_LDFLAGS  = $(GTEST_LDFLAGS) -no-install -Wl,-dynamic-list-data
 gtest_CFLAGS   = $(BASE_CFLAGS)
-gtest_CXXFLAGS = $(BASE_CXXFLAGS) $(GTEST_CXXFLAGS) -fno-tree-vectorize \
-				 -DGTEST_UCM_HOOK_LIB_DIR="\"${abs_builddir}/ucm/test_dlopen/.libs\""
+gtest_CXXFLAGS = \
+	$(BASE_CXXFLAGS) $(GTEST_CXXFLAGS) \
+	-DGTEST_UCM_HOOK_LIB_DIR="\"${abs_builddir}/ucm/test_dlopen/.libs\""
 
 gtest_SOURCES = \
 	common/gtest-all.cc \
 	common/main.cc \
+	common/test_gtest_cmn.cc \
+	common/mem_buffer.cc \
 	common/test_helpers.cc \
 	common/test_obj_size.cc \
 	common/test_watchdog.cc \
@@ -102,10 +115,13 @@ gtest_SOURCES = \
 	uct/uct_p2p_test.cc \
 	uct/uct_test.cc \
 	uct/test_stats.cc \
+	ucs/test_event_set.cc \
 	ucs/test_stats_filter.cc \
 	uct/test_peer_failure.cc \
 	uct/test_tag.cc \
+	uct/tcp/test_tcp.cc \
 	\
+	ucp/test_ucp_am.cc \
 	ucp/test_ucp_stream.cc \
 	ucp/test_ucp_peer_failure.cc \
 	ucp/test_ucp_atomic.cc \
@@ -114,6 +130,7 @@ gtest_SOURCES = \
 	ucp/test_ucp_mmap.cc \
 	ucp/test_ucp_mem_type.cc \
 	ucp/test_ucp_perf.cc \
+	ucp/test_ucp_proto.cc \
 	ucp/test_ucp_rma.cc \
 	ucp/test_ucp_rma_mt.cc \
 	ucp/test_ucp_tag_cancel.cc \
@@ -123,6 +140,7 @@ gtest_SOURCES = \
 	ucp/test_ucp_tag_perf.cc \
 	ucp/test_ucp_tag_probe.cc \
 	ucp/test_ucp_tag_xfer.cc \
+	ucp/test_ucp_tag_mem_type.cc \
 	ucp/test_ucp_tag.cc \
 	ucp/test_ucp_context.cc \
 	ucp/test_ucp_wireup.cc \
@@ -152,12 +170,18 @@ gtest_SOURCES = \
 	ucs/test_strided_alloc.cc \
 	ucs/test_string.cc \
 	ucs/test_sys.cc \
+	ucs/test_topo.cc \
 	ucs/test_sock.cc \
 	ucs/test_time.cc \
 	ucs/test_twheel.cc \
 	ucs/test_frag_list.cc \
 	ucs/test_type.cc \
 	ucs/test_log.cc \
+	ucs/test_iov.cc \
+	ucs/arch/test_x86_64.cc
+
+if HAVE_UCG
+gtest_SOURCES += \
 	ucg/ucg_test.cc \
 	ucg/test_plan.cc \
 	ucg/test_topo_info.cc \
@@ -169,26 +193,30 @@ gtest_SOURCES = \
 	ucg/test_ucg_context.cc \
 	ucg/test_builtin.cc \
 	ucg/test_cb.cc
+endif
 
 if HAVE_IB
 gtest_SOURCES += \
 	uct/ib/test_ib.cc \
+	uct/ib/test_ib_md.cc \
 	uct/ib/test_cq_moderation.cc \
-	uct/ib/test_ib_xfer.cc
+	uct/ib/test_ib_xfer.cc \
+	uct/ib/test_ib_pkey.cc \
+	uct/ib/test_ib_event.cc
 gtest_CPPFLAGS += \
 	$(IBVERBS_CPPFLAGS)
 gtest_LDADD += \
 	$(IBVERBS_LDFLAGS) \
 	$(top_builddir)/src/uct/ib/libuct_ib.la
-if HAVE_MLX5_HW
+if HAVE_DEVX
 gtest_SOURCES += \
-	uct/ib/test_ib_md.cc
+	uct/ib/test_devx.cc
 endif
 if HAVE_TL_UD
 gtest_SOURCES += \
 	uct/ib/ud_base.cc \
 	uct/ib/test_ud.cc \
-	uct/ib/test_ud_slow_timer.cc \
+	uct/ib/test_ud_timer.cc \
 	uct/ib/test_ud_pending.cc \
 	uct/ib/test_ud_ds.cc
 endif
@@ -209,13 +237,31 @@ endif # HAVE_IB
 if HAVE_CUDA
 gtest_SOURCES += \
 	ucm/cuda_hooks.cc
+gtest_CPPFLAGS += \
+	$(CUDA_CPPFLAGS)
 gtest_LDADD += \
 	$(CUDA_LDFLAGS) \
 	$(top_builddir)/src/uct/cuda/libuct_cuda.la
 endif
 
+if HAVE_HIP
+if HAVE_GNUXX11
+gtest_SOURCES += \
+	ucm/rocm_hooks.cc
+gtest_CPPFLAGS += \
+	$(HIP_CPPFLAGS)
+gtest_CXXFLAGS += \
+	$(HIP_CXXFLAGS)
+gtest_LDADD += \
+	$(HIP_LDFLAGS) \
+	$(HIP_LIBS) \
+	$(top_builddir)/src/uct/rocm/libuct_rocm.la
+endif
+endif
+
 noinst_HEADERS = \
 	common/gtest.h \
+	common/mem_buffer.h \
 	common/test.h \
 	common/test_helpers.h \
 	common/test_perf.h \
@@ -223,6 +269,7 @@ noinst_HEADERS = \
 	\
 	uct/ib/test_rc.h \
 	uct/ib/ud_base.h \
+	uct/ib/test_ib.h \
 	uct/test_amo.h \
 	uct/test_p2p_mix.h \
 	uct/test_p2p_rma.h \
@@ -234,10 +281,14 @@ noinst_HEADERS = \
 	ucp/test_ucp_memheap.h \
 	ucp/test_ucp_tag.h \
 	ucp/ucp_test.h \
-	ucp/ucp_datatype.h \
+	ucp/ucp_datatype.h
+
+if HAVE_UCG
+noinst_HEADERS += \
 	ucg/ucg_test.h \
 	ucg/ucg_plan_test.h \
 	ucg/test_op.h
+endif
 
 .PHONY: test test gdb valgrind fix_rpath ucx
 

@@ -4,15 +4,15 @@
  */
 
 #include "jucx_common_def.h"
-#include "org_ucx_jucx_ucp_UcpWorker.h"
+#include "org_openucx_jucx_ucp_UcpWorker.h"
 
 /**
  * Bridge method for creating ucp_worker from java
  */
 JNIEXPORT jlong JNICALL
-Java_org_ucx_jucx_ucp_UcpWorker_createWorkerNative(JNIEnv *env, jclass cls,
-                                                   jobject jucx_worker_params,
-                                                   jlong context_ptr)
+Java_org_openucx_jucx_ucp_UcpWorker_createWorkerNative(JNIEnv *env, jclass cls,
+                                                       jobject jucx_worker_params,
+                                                       jlong context_ptr)
 {
     ucp_worker_params_t worker_params = { 0 };
     ucp_worker_h ucp_worker;
@@ -68,8 +68,136 @@ Java_org_ucx_jucx_ucp_UcpWorker_createWorkerNative(JNIEnv *env, jclass cls,
 }
 
 JNIEXPORT void JNICALL
-Java_org_ucx_jucx_ucp_UcpWorker_releaseWorkerNative(JNIEnv *env, jclass cls,
-                                                    jlong ucp_worker_ptr)
+Java_org_openucx_jucx_ucp_UcpWorker_releaseWorkerNative(JNIEnv *env, jclass cls,
+                                                        jlong ucp_worker_ptr)
 {
     ucp_worker_destroy((ucp_worker_h)ucp_worker_ptr);
+}
+
+
+JNIEXPORT jobject JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_workerGetAddressNative(JNIEnv *env, jclass cls,
+                                                           jlong ucp_worker_ptr)
+{
+    ucp_address_t *addr;
+    size_t len;
+    ucs_status_t status;
+
+    status = ucp_worker_get_address((ucp_worker_h)ucp_worker_ptr, &addr, &len);
+
+    if (status != UCS_OK) {
+        JNU_ThrowExceptionByStatus(env, status);
+        return NULL;
+    }
+
+    return env->NewDirectByteBuffer(addr, len);
+}
+
+JNIEXPORT void JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_releaseAddressNative(JNIEnv *env, jclass cls,
+                                                         jlong ucp_worker_ptr,
+                                                         jobject ucp_address)
+{
+
+    ucp_worker_release_address((ucp_worker_h)ucp_worker_ptr,
+                               (ucp_address_t *)env->GetDirectBufferAddress(ucp_address));
+}
+
+JNIEXPORT jint JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_progressWorkerNative(JNIEnv *env, jclass cls, jlong ucp_worker_ptr)
+{
+    return ucp_worker_progress((ucp_worker_h)ucp_worker_ptr);
+}
+
+JNIEXPORT jobject JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_flushNonBlockingNative(JNIEnv *env, jclass cls,
+                                                           jlong ucp_worker_ptr,
+                                                           jobject callback)
+{
+    ucs_status_ptr_t request = ucp_worker_flush_nb((ucp_worker_h)ucp_worker_ptr, 0,
+                                                   jucx_request_callback);
+
+    return process_request(request, callback);
+}
+
+JNIEXPORT void JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_waitWorkerNative(JNIEnv *env, jclass cls, jlong ucp_worker_ptr)
+{
+    ucs_status_t status = ucp_worker_wait((ucp_worker_h)ucp_worker_ptr);
+
+    if (status != UCS_OK) {
+        JNU_ThrowExceptionByStatus(env, status);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_signalWorkerNative(JNIEnv *env, jclass cls, jlong ucp_worker_ptr)
+{
+    ucs_status_t status = ucp_worker_signal((ucp_worker_h)ucp_worker_ptr);
+
+    if (status != UCS_OK) {
+        JNU_ThrowExceptionByStatus(env, status);
+    }
+}
+
+JNIEXPORT jobject JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_recvTaggedNonBlockingNative(JNIEnv *env, jclass cls,
+                                                                jlong ucp_worker_ptr,
+                                                                jlong laddr, jlong size,
+                                                                jlong tag, jlong tagMask,
+                                                                jobject callback)
+{
+    ucs_status_ptr_t request = ucp_tag_recv_nb((ucp_worker_h)ucp_worker_ptr,
+                                                (void *)laddr, size,
+                                                ucp_dt_make_contig(1), tag, tagMask,
+                                                recv_callback);
+
+    ucs_trace_req("JUCX: tag_recv_nb request %p, msg size: %zu, tag: %ld", request, size, tag);
+
+    return process_request(request, callback);
+}
+
+JNIEXPORT jobject JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_tagProbeNonBlockingNative(JNIEnv *env, jclass cls,
+                                                              jlong ucp_worker_ptr,
+                                                              jlong tag, jlong tag_mask,
+                                                              jboolean remove)
+{
+    ucp_tag_recv_info_t info_tag;
+    ucp_tag_message_h msg_tag = ucp_tag_probe_nb((ucp_worker_h)ucp_worker_ptr, tag, tag_mask,
+                                                 remove, &info_tag);
+    jobject result = NULL;
+
+    if (msg_tag != NULL) {
+        result = new_tag_msg_instance(env, msg_tag, &info_tag);
+    }
+
+    return result;
+}
+
+JNIEXPORT jobject JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_recvTaggedMessageNonBlockingNative(JNIEnv *env, jclass cls,
+                                                                       jlong ucp_worker_ptr,
+                                                                       jlong laddr, jlong size,
+                                                                       jlong msg_ptr,
+                                                                       jobject callback)
+{
+    ucs_status_ptr_t request = ucp_tag_msg_recv_nb((ucp_worker_h)ucp_worker_ptr,
+                                                   (void *)laddr, size,
+                                                   ucp_dt_make_contig(1),
+                                                   (ucp_tag_message_h)msg_ptr,
+                                                   recv_callback);
+
+    ucs_trace_req("JUCX: tag_msg_recv_nb request %p, msg size: %zu, msg: %p", request, size,
+                  (ucp_tag_message_h)msg_ptr);
+
+    return process_request(request, callback);
+}
+
+JNIEXPORT void JNICALL
+Java_org_openucx_jucx_ucp_UcpWorker_cancelRequestNative(JNIEnv *env, jclass cls,
+                                                        jlong ucp_worker_ptr,
+                                                        jlong ucp_request_ptr)
+{
+    ucp_request_cancel((ucp_worker_h)ucp_worker_ptr, (void *)ucp_request_ptr);
 }

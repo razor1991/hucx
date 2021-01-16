@@ -8,8 +8,9 @@
 #include "ucp_datatype.h"
 
 extern "C" {
-#include <ucp/core/ucp_worker.h> /* for testing memory consumption */
-#include <ucp/core/ucp_request.h> // for debug
+#include <ucp/core/ucp_ep.inl>    /* for testing EP RNDV configuration */
+#include <ucp/core/ucp_request.h> /* for debug */
+#include <ucp/core/ucp_worker.h>  /* for testing memory consumption */
 }
 
 class test_ucp_peer_failure : public ucp_test {
@@ -44,6 +45,12 @@ protected:
     entity& failing_receiver();
     void *send_nb(ucp_ep_h ep, ucp_rkey_h rkey);
     void *recv_nb(entity& e);
+    static ucs_log_func_rc_t
+    warn_unreleased_rdesc_handler(const char *file, unsigned line,
+                                  const char *function,
+                                  ucs_log_level_t level,
+                                  const ucs_log_component_config_t *comp_conf,
+                                  const char *message, va_list ap);
     void fail_receiver();
     void smoke_test(bool stable_pair);
     static void unmap_memh(ucp_mem_h memh, ucp_context_h context);
@@ -118,8 +125,6 @@ void test_ucp_peer_failure::set_timeouts() {
     m_env.push_back(new ucs::scoped_setenv("UCX_RC_TIMEOUT",     "10ms"));
     m_env.push_back(new ucs::scoped_setenv("UCX_RC_RNR_TIMEOUT", "10ms"));
     m_env.push_back(new ucs::scoped_setenv("UCX_RC_RETRY_COUNT", "2"));
-    std::string ud_timeout = ucs::to_string<int>(3 * ucs::test_time_multiplier()) + "s";
-    m_env.push_back(new ucs::scoped_setenv("UCX_UD_TIMEOUT", ud_timeout.c_str()));
 }
 
 void test_ucp_peer_failure::err_cb(void *arg, ucp_ep_h ep, ucs_status_t status) {
@@ -169,6 +174,24 @@ void *test_ucp_peer_failure::recv_nb(entity& e) {
     }
 }
 
+ucs_log_func_rc_t
+test_ucp_peer_failure::warn_unreleased_rdesc_handler(const char *file, unsigned line,
+                                                     const char *function,
+                                                     ucs_log_level_t level,
+                                                     const ucs_log_component_config_t *comp_conf,
+                                                     const char *message, va_list ap)
+{
+    if (level == UCS_LOG_LEVEL_WARN) {
+        std::string err_str = format_message(message, ap);
+
+        if (err_str.find("unexpected tag-receive descriptor") != std::string::npos) {
+            return UCS_LOG_FUNC_RC_STOP;
+        }
+    }
+
+    return UCS_LOG_FUNC_RC_CONTINUE;
+}
+
 void test_ucp_peer_failure::fail_receiver() {
     /* TODO: need to handle non-empty TX window in UD EP destructor",
      *       see debug message (ud_ep.c:220)
@@ -179,7 +202,13 @@ void test_ucp_peer_failure::fail_receiver() {
     // TODO use force-close to close connections
     flush_worker(failing_receiver());
     m_failing_memh.reset();
-    failing_receiver().cleanup();
+    {
+        /* transform warning messages about unreleased TM rdescs to test
+         * message that are expected here, since we closed receiver w/o
+         * reading the messages that were potentially received */
+        scoped_log_handler slh(warn_unreleased_rdesc_handler);
+        failing_receiver().cleanup();
+    }
 }
 
 void test_ucp_peer_failure::smoke_test(bool stable_pair) {
@@ -269,6 +298,11 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
 
     set_rkeys();
 
+    /* Since we don't want to test peer failure on a stable pair
+     * and don't expect EP timeout error on those EPs,
+     * run traffic on a stable pair to connect it */
+    smoke_test(true);
+
     if (!(GetParam().variant & FAIL_IMM)) {
         /* if not fail immediately, run traffic on failing pair to connect it */
         smoke_test(false);
@@ -286,6 +320,11 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
     }
 
     EXPECT_EQ(UCS_OK, m_err_status);
+    
+    /* Since UCT/UD EP has a SW implementation of reliablity on which peer
+     * failure mechanism is based, we should set small UCT/UD EP timeout
+     * for UCT/UD EPs for sender's UCP EP to reduce testing time */
+    double prev_ib_ud_timeout = sender().set_ib_ud_timeout(3.);
 
     {
         scoped_log_handler slh(wrap_errors_logger);
@@ -326,6 +365,8 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
 
             ucp_ep_h ep = sender().revoke_ep(0, FAILING_EP_INDEX);
 
+            m_failing_rkey.reset();
+
             void *creq = ucp_ep_close_nb(ep, UCP_EP_CLOSE_MODE_FORCE);
             wait(creq);
 
@@ -346,11 +387,20 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
         }
     }
 
+    /* Since we won't test peer failure anymore, reset UCT/UD EP timeout to the
+     * default value to avoid possible UD EP timeout errors under high load */
+    sender().set_ib_ud_timeout(prev_ib_ud_timeout);
+
     /* Check workability of stable pair */
     smoke_test(true);
 
     /* Check that TX polling is working well */
     while (sender().progress());
+
+    /* Destroy rkeys before destroying the worker (which also destroys the
+     * endpoints) */
+    m_failing_rkey.reset();
+    m_stable_rkey.reset();
 
     /* When all requests on sender are done we need to prevent LOCAL_FLUSH
      * in test teardown. Receiver is killed and doesn't respond on FC requests
@@ -359,21 +409,31 @@ void test_ucp_peer_failure::do_test(size_t msg_size, int pre_msg_count,
 }
 
 UCS_TEST_P(test_ucp_peer_failure, basic) {
-    do_test(1024, /* msg_size */
+    do_test(UCS_KBYTE, /* msg_size */
             0, /* pre_msg_cnt */
             false, /* force_close */
             false /* must_fail */);
 }
 
+UCS_TEST_P(test_ucp_peer_failure, rndv_disable) {
+    const size_t size_max = std::numeric_limits<size_t>::max();
+
+    sender().connect(&receiver(), get_ep_params(), STABLE_EP_INDEX);
+    EXPECT_EQ(size_max, ucp_ep_config(sender().ep())->tag.rndv.am_thresh);
+    EXPECT_EQ(size_max, ucp_ep_config(sender().ep())->tag.rndv.rma_thresh);
+    EXPECT_EQ(size_max, ucp_ep_config(sender().ep())->tag.rndv_send_nbr.am_thresh);
+    EXPECT_EQ(size_max, ucp_ep_config(sender().ep())->tag.rndv_send_nbr.rma_thresh);
+}
+
 UCS_TEST_P(test_ucp_peer_failure, zcopy, "ZCOPY_THRESH=1023") {
-    do_test(1024, /* msg_size */
+    do_test(UCS_KBYTE, /* msg_size */
             0, /* pre_msg_cnt */
             false, /* force_close */
             true /* must_fail */);
 }
 
-UCS_TEST_P(test_ucp_peer_failure, bcopy_multi, "MAX_BCOPY?=512", "RC_TM_ENABLE?=n") {
-    do_test(1024, /* msg_size */
+UCS_TEST_P(test_ucp_peer_failure, bcopy_multi, "SEG_SIZE?=512", "RC_TM_ENABLE?=n") {
+    do_test(UCS_KBYTE, /* msg_size */
             0, /* pre_msg_cnt */
             false, /* force_close */
             false /* must_fail */);
@@ -386,14 +446,11 @@ UCS_TEST_P(test_ucp_peer_failure, force_close, "RC_FC_ENABLE?=n") {
             false /* must_fail */);
 }
 
-UCS_TEST_P(test_ucp_peer_failure, disable_sync_send) {
+UCS_TEST_SKIP_COND_P(test_ucp_peer_failure, disable_sync_send,
+                     !(GetParam().variant & TEST_TAG)) {
     const size_t        max_size = UCS_MBYTE;
     std::vector<char>   buf(max_size, 0);
     void                *req;
-
-    if (!(GetParam().variant & TEST_TAG)) {
-        UCS_TEST_SKIP_R("Skip non-tagged variant");
-    }
 
     sender().connect(&receiver(), get_ep_params());
 

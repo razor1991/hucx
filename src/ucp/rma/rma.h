@@ -7,7 +7,9 @@
 #ifndef UCP_RMA_H_
 #define UCP_RMA_H_
 
-#include <ucp/proto/proto.h>
+#include <ucp/core/ucp_types.h>
+#include <ucp/proto/proto_am.h>
+#include <uct/api/uct.h>
 
 
 /**
@@ -64,7 +66,7 @@ typedef struct {
 
 typedef struct {
     uint64_t                  address;
-    ucp_request_hdr_t         req; // NULL if no reply
+    ucp_request_hdr_t         req; /* NULL if no reply */
     uint8_t                   length;
     uint8_t                   opcode;
 } UCS_S_PACKED ucp_atomic_req_hdr_t;

@@ -1,6 +1,6 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-* Copyright (c) UT-Battelle, LLC. 2014-2015. ALL RIGHTS RESERVED.
+* Copyright (c) UT-Battelle, LLC. 2014-2019. ALL RIGHTS RESERVED.
 * Copyright (C) ARM Ltd. 2016.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
@@ -15,6 +15,7 @@
 
 #include <ucs/sys/compiler.h>
 #include <ucs/type/status.h>
+#include <ucs/type/cpu_set.h>
 #include <ucs/debug/memtrack.h>
 #include <ucs/config/types.h>
 
@@ -24,7 +25,6 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/fcntl.h>
-#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/param.h>
@@ -48,10 +48,64 @@
 #include <net/if_arp.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <dirent.h>
+
+
+#include <sys/types.h>
+#if defined(__linux__) || defined(HAVE_CPU_SET_T)
+#include <sched.h>
+typedef cpu_set_t ucs_sys_cpuset_t;
+#elif defined(__FreeBSD__) || defined(HAVE_CPUSET_T)
+#include <sys/cpuset.h>
+typedef cpuset_t ucs_sys_cpuset_t;
+#else
+#error "Port me"
+#endif
+
 
 BEGIN_C_DECLS
 
 /** @file sys.h */
+
+
+typedef ino_t ucs_sys_ns_t;
+
+
+/* namespace type used in @ref ucs_sys_get_ns and @ref ucs_sys_ns_is_default */
+typedef enum {
+    UCS_SYS_NS_TYPE_IPC,
+    UCS_SYS_NS_TYPE_MNT,
+    UCS_SYS_NS_TYPE_NET,
+    UCS_SYS_NS_TYPE_PID,
+    UCS_SYS_NS_TYPE_USER,
+    UCS_SYS_NS_TYPE_UTS,
+    UCS_SYS_NS_TYPE_LAST
+} ucs_sys_namespace_type_t;
+
+
+/**
+ * Callback function type used in ucs_sys_readdir.
+ */
+typedef ucs_status_t (*ucs_sys_readdir_cb_t)(struct dirent *entry, void *ctx);
+
+
+/**
+ * Callback function type used in ucs_sys_enum_threads.
+ */
+typedef ucs_status_t (*ucs_sys_enum_threads_cb_t)(pid_t pid, void *ctx);
+
+
+/**
+ * Callback function type used in ucs_sys_enum_pfn.
+ */
+typedef void (*ucs_sys_enum_pfn_cb_t)(unsigned page_number, unsigned long pfn,
+                                      void *ctx);
+
+
+/**
+ * @return TMPDIR environment variable if set. Otherwise, return "/tmp".
+ */
+const char *ucs_get_tmpdir();
 
 /**
  * @return Host name.
@@ -115,14 +169,26 @@ uint64_t ucs_generate_uuid(uint64_t seed);
  *   - stdout
  *   - stderr
  *
- * *p_fstream is filled with the stream handle, *p_need_close is set to whether
- * fclose() should be called to release resources, *p_next_token to the remainder
- * of config_str.
+ * @param [in]  config_str     The file name or name of the output stream
+ *                             (stdout/stderr).
+ * @param [in]  err_log_level  Logging level that should be used for printing
+ *                             errors.
+ * @param [out] p_fstream      Pointer that is filled with the stream handle.
+ *                             User is responsible to close tha stream handle then.
+ * @param [out] p_need_close   Pointer to the variable that is set to whether
+ *                             fclose() should be called to release resources (1)
+ *                             or not (0).
+ * @param [out] p_next_token   Pointer that is set to remainder of @config_str.
+ * @oaram [out] p_filename     Pointer to the variable that is filled with the
+ *                             resulted name of the log file (if it is not NULL).
+ *                             Caller is responsible to release memory then.
+ *
+ * @return UCS_OK if successful, or error code otherwise.
  */
 ucs_status_t
 ucs_open_output_stream(const char *config_str, ucs_log_level_t err_log_level,
                        FILE **p_fstream, int *p_need_close,
-                       const char **p_next_token);
+                       const char **p_next_token, char **p_filename);
 
 
 /**
@@ -154,15 +220,35 @@ ucs_status_t ucs_read_file_number(long *value, int silent,
 
 
 /**
- * @return Regular _SC_IOV_MAX on the system.
+ * Read file contents into a string closed by null terminator.
+ *
+ * @param buffer        Buffer to fill with file contents.
+ * @param max           Maximal buffer size.
+ * @param filename_fmt  File name printf-like format string.
+ *
+ * @return Number of bytes read, or -1 in case of error.
  */
-size_t ucs_get_max_iov();
+ssize_t ucs_read_file_str(char *buffer, size_t max, int silent,
+                          const char *filename_fmt, ...)
+    UCS_F_PRINTF(4, 5);
 
 
 /**
  * @return Regular page size on the system.
  */
 size_t ucs_get_page_size();
+
+
+/**
+ * Get page size of a memory region.
+ *
+ * @param [in]  address          Memory region start address,
+ * @param [in]  size             Memory region size.
+ * @param [out] min_page_size_p  Set to the minimal page size in the memory region.
+ * @param [out] max_page_size_p  Set to the maximal page size in the memory region.
+ */
+void ucs_get_mem_page_size(void *address, size_t size, size_t *min_page_size_p,
+                           size_t *max_page_size_p);
 
 
 /**
@@ -223,7 +309,7 @@ ucs_status_t ucs_mmap_alloc(size_t *size, void **address_p,
  * Release memory allocated via mmap API.
  *
  * @param address   Address of memory to release as returned from @ref ucs_mmap_alloc.
- * @param length    Length of memory to release as returned from @ref ucs_mmap_alloc.
+ * @param length    Length of memory to release passed to @ref ucs_mmap_alloc.
  */
 ucs_status_t ucs_mmap_free(void *address, size_t length);
 
@@ -245,10 +331,28 @@ int ucs_get_mem_prot(unsigned long start, unsigned long end);
  * If the page map file is non-readable (for example, due to permissions), or
  * the page is not present, this function returns 0.
  *
- * @param address  Virtual address to get the PFN for
- * @return PFN number, or 0 if failed.
+ * @param address    Virtual address to get the. PFN for.
+ * @param page_count Number of pages to process
+ * @param data       Result buffer.
+ * @return UCS_OK if all pages are processed, else error code.
  */
-unsigned long ucs_sys_get_pfn(uintptr_t address);
+ucs_status_t ucs_sys_get_pfn(uintptr_t address, unsigned page_count,
+                             unsigned long *data);
+
+
+/**
+ * Enums the physical page frame numbers of a given virtual address range.
+ * If the page map file is non-readable (for example, due to permissions), or
+ * the page is not present, this function returns error.
+ *
+ * @param address     Virtual address to get the PFN for.
+ * @param page_number Number of pages to process.
+ * @param cb          Callback function which is called for every page.
+ * @param ctx         Context argument passed to @a cb call.
+ * @return error code if failed to enumerate or UCS_OK.
+ */
+ucs_status_t ucs_sys_enum_pfn(uintptr_t address, unsigned page_count,
+                              ucs_sys_enum_pfn_cb_t cb, void *ctx);
 
 
 /**
@@ -337,21 +441,107 @@ void *ucs_sys_realloc(void *old_ptr, size_t old_length, size_t new_length);
  */
 void ucs_sys_free(void *ptr, size_t length);
 
+/**
+ * Fill human readable cpu set representation
+ *
+ * @param [in]  cpuset      Set of CPUs
+ * @param [in]  str         String to fill
+ * @param [in]  len         String length
+ *
+ * @return Filled string
+ */
+char *ucs_make_affinity_str(const ucs_sys_cpuset_t *cpuset, char *str, size_t len);
 
 /**
- * Empty function which can be casted to a no-operation callback in various situations.
+ * Sets affinity for the current process.
+ *
+ * @param [in] cpuset      Pointer to the cpuset to assign
+ *
+ * @return -1 on error with errno set, 0 on success
  */
-void ucs_empty_function();
-unsigned ucs_empty_function_return_zero();
-int64_t ucs_empty_function_return_zero_int64();
-ucs_status_t ucs_empty_function_return_success();
-ucs_status_t ucs_empty_function_return_unsupported();
-ucs_status_t ucs_empty_function_return_inprogress();
-ucs_status_t ucs_empty_function_return_no_resource();
-ucs_status_ptr_t ucs_empty_function_return_ptr_no_resource();
-ucs_status_t ucs_empty_function_return_ep_timeout();
-ssize_t ucs_empty_function_return_bc_ep_timeout();
-ucs_status_t ucs_empty_function_return_busy();
+int ucs_sys_setaffinity(ucs_sys_cpuset_t *cpuset);
+
+/**
+ * Queries affinity for the current process.
+ *
+ * @param [out] cpuset      Pointer to the cpuset to return result
+ *
+ * @return -1 on error with errno set, 0 on success
+ */
+int ucs_sys_getaffinity(ucs_sys_cpuset_t *cpuset);
+
+/**
+ * Copies ucs_sys_cpuset_t to ucs_cpu_set_t.
+ *
+ * @param [in]  src         Source
+ * @param [out] dst         Destination
+ */
+void ucs_sys_cpuset_copy(ucs_cpu_set_t *dst, const ucs_sys_cpuset_t *src);
+
+/**
+ * Get namespace id for resource.
+ *
+ * @param [in]  name        Namespace to get value
+ *
+ * @return namespace value or 0 if namespaces are not supported
+ */
+ucs_sys_ns_t ucs_sys_get_ns(ucs_sys_namespace_type_t name);
+
+
+/**
+ * Check if namespace is namespace of host system.
+ *
+ * @param [in]  name        Namespace to evaluate
+ *
+ * @return 1 in case if namespace is root, 0 - in other cases
+ */
+int ucs_sys_ns_is_default(ucs_sys_namespace_type_t name);
+
+
+/**
+ * Get 128-bit boot ID value.
+ *
+ * @param [out]  high       Pointer to high 64 bit of 128 boot ID
+ * @param [out]  low        Pointer to low 64 bit of 128 boot ID
+ *
+ * @return UCS_OK or error in case of failure.
+ */
+ucs_status_t ucs_sys_get_boot_id(uint64_t *high, uint64_t *low);
+
+
+/**
+ * Read directory
+ *
+ * @param [in]  path       Path to directory to read
+ * @param [in]  cb         Callback function, see NOTES
+ * @param [in]  ctx        Context pointer passed to callback
+ *
+ * @return UCS_OK if directory is found and successfully iterated thought all
+ *         entries, error code in all other cases, see NOTES.
+ * 
+ * @note ucs_sys_readdir function reads directory pointed by @a path argument
+ *       and calls @a cb function for every entry in directory, including
+ *       '.' and '..'. In case if @a cb function returns value different from
+ *       UCS_OK then function breaks immediately and this value is returned
+ *       from ucs_sys_readdir.
+ */
+ucs_status_t ucs_sys_readdir(const char *path, ucs_sys_readdir_cb_t cb, void *ctx);
+
+/**
+ * Enumerate process threads
+ *
+ * @param [in]  cb         Callback function, see NOTES
+ * @param [in]  ctx        Context pointer passed to callback
+ *
+ * @return UCS_OK if directory is found and successfully iterated thought all
+ *         entries, error code in all other cases, see NOTES.
+ * 
+ * @note ucs_sys_enum_threads function enumerates current process threads
+ *       and calls @a cb function for every thread. In case if @a cb function
+ *       returns value different from UCS_OK then function breaks
+ *       immediately and this value is returned from ucs_sys_enum_threads.
+ */
+ucs_status_t ucs_sys_enum_threads(ucs_sys_enum_threads_cb_t cb, void *ctx);
 
 END_C_DECLS
 

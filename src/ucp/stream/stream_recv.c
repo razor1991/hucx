@@ -4,6 +4,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include <ucp/core/ucp_ep.h>
 #include <ucp/core/ucp_worker.h>
 #include <ucp/core/ucp_context.h>
@@ -38,7 +42,7 @@
  * rdesc          pointer to 'ucp_recv_desc_t *', it's needed to get access to
  *                'ucp_recv_desc_t *' inside @ref ucp_stream_release_data after
  *                the buffer was returned to user by
- *                @ref ucp_stream_recv_data_nb as a pointer to 'paylod'
+ *                @ref ucp_stream_recv_data_nb as a pointer to 'payload'
  */
 
 
@@ -181,7 +185,7 @@ ucp_stream_rdesc_advance(ucp_recv_desc_t *rdesc, ssize_t offset,
     ucs_assert(offset <= rdesc->length);
 
     if (ucs_unlikely(offset < 0)) {
-        return offset;
+        return (ucs_status_t)offset;
     } else if (ucs_likely(offset == rdesc->length)) {
         ucp_stream_rdesc_dequeue_and_release(rdesc, ep_ext);
     } else {
@@ -197,16 +201,13 @@ ucp_stream_process_rdesc_inplace(ucp_recv_desc_t *rdesc, ucp_datatype_t dt,
                                  void *buffer, size_t count, size_t length,
                                  ucp_ep_ext_proto_t *ep_ext)
 {
+    ucp_worker_h worker = ucp_ep_from_ext_proto(ep_ext)->worker;
     ucs_status_t status;
     ssize_t unpacked;
-    uct_memory_type_t mem_type;
+    ucs_memory_type_t mem_type;
 
-
-    ucp_memory_type_detect_mds(ucp_ep_from_ext_proto(ep_ext)->worker->context, buffer,
-                               length, &mem_type);
-
-    status   = ucp_dt_unpack_only(ucp_ep_from_ext_proto(ep_ext)->worker, buffer,
-                                  count, dt, mem_type,
+    mem_type = ucp_memory_type_detect(worker->context, buffer, length);
+    status   = ucp_dt_unpack_only(worker, buffer, count, dt, mem_type,
                                   ucp_stream_rdesc_payload(rdesc), length, 0);
 
     unpacked = ucs_likely(status == UCS_OK) ? length : status;
@@ -231,15 +232,16 @@ static UCS_F_ALWAYS_INLINE void
 ucp_stream_recv_request_init(ucp_request_t *req, ucp_ep_h ep, void *buffer,
                              size_t count, size_t length,
                              ucp_datatype_t datatype,
-                             ucp_stream_recv_callback_t cb,
-                             uint16_t request_flags)
+                             const ucp_request_param_t *param)
 {
-    req->flags              = UCP_REQUEST_FLAG_CALLBACK | request_flags;
-#if ENABLE_ASSERT
-    req->flags             |= UCP_REQUEST_FLAG_STREAM_RECV;
+    uint32_t flags = ucp_request_param_flags(param);
+
+    req->flags              = UCP_REQUEST_FLAG_STREAM_RECV |
+                              ((flags & UCP_STREAM_RECV_FLAG_WAITALL) ?
+                               UCP_REQUEST_FLAG_STREAM_RECV_WAITALL : 0);
+#if UCS_ENABLE_ASSERT
     req->status             = UCS_OK; /* for ucp_request_recv_data_unpack() */
 #endif
-    req->recv.stream.cb     = cb;
     req->recv.stream.length = 0;
     req->recv.stream.offset = 0;
 
@@ -250,8 +252,15 @@ ucp_stream_recv_request_init(ucp_request_t *req, ucp_ep_h ep, void *buffer,
     req->recv.datatype = datatype;
     req->recv.length   = ucs_likely(!UCP_DT_IS_GENERIC(datatype)) ? length :
                          ucp_dt_length(datatype, count, NULL, &req->recv.state);
-    ucp_memory_type_detect_mds(ep->worker->context, (void *)buffer,
-                               req->recv.length, &req->recv.mem_type);
+    req->recv.mem_type = ucp_memory_type_detect(ep->worker->context,
+                                                (void*)buffer, req->recv.length);
+
+    if (param->op_attr_mask & UCP_OP_ATTR_FIELD_CALLBACK) {
+        req->flags         |= UCP_REQUEST_FLAG_CALLBACK;
+        req->recv.stream.cb = param->cb.recv_stream;
+        req->user_data      = (param->op_attr_mask & UCP_OP_ATTR_FIELD_USER_DATA) ?
+                              param->user_data : NULL;
+    }
 }
 
 static UCS_F_ALWAYS_INLINE int
@@ -267,38 +276,79 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_stream_recv_nb,
                  ucp_datatype_t datatype, ucp_stream_recv_callback_t cb,
                  size_t *length, unsigned flags)
 {
-    ucs_status_t        status     = UCS_OK;
-    ucp_ep_ext_proto_t  *ep_ext    = ucp_ep_ext_proto(ep);
+    ucp_request_param_t param = {
+        .op_attr_mask   = UCP_OP_ATTR_FIELD_DATATYPE |
+                          UCP_OP_ATTR_FIELD_CALLBACK |
+                          UCP_OP_ATTR_FIELD_FLAGS,
+        .cb.recv_stream = (ucp_stream_recv_nbx_callback_t)cb,
+        .flags          = flags,
+        .datatype       = datatype
+    };
+
+    return ucp_stream_recv_nbx(ep, buffer, count, length, &param);
+}
+
+UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_stream_recv_nbx,
+                 (ep, buffer, count, length, param),
+                 ucp_ep_h ep, void *buffer, size_t count, size_t *length,
+                 const ucp_request_param_t *param)
+{
+    ucs_status_t        status  = UCS_OK;
+    ucp_ep_ext_proto_t  *ep_ext = ucp_ep_ext_proto(ep);
+    ucp_datatype_t      datatype;
     size_t              dt_length;
     ucp_request_t       *req;
     ucp_recv_desc_t     *rdesc;
+    uint32_t            attr_mask;
 
     UCP_CONTEXT_CHECK_FEATURE_FLAGS(ep->worker->context, UCP_FEATURE_STREAM,
                                     return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM));
     UCP_WORKER_THREAD_CS_ENTER_CONDITIONAL(ep->worker);
 
-    if (ucs_likely(!UCP_DT_IS_GENERIC(datatype))) {
-        dt_length = ucp_dt_length(datatype, count, buffer, NULL);
-        if (ucs_likely(ucp_stream_recv_nb_is_inplace(ep_ext, dt_length))) {
-            status = ucp_stream_process_rdesc_inplace(ucp_stream_rdesc_get(ep_ext),
-                                                      datatype, buffer, count,
-                                                      dt_length, ep_ext);
-            *length = dt_length;
+    attr_mask = param->op_attr_mask &
+                (UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FLAG_NO_IMM_CMPL);
+    if (ucs_likely(attr_mask == 0)) {
+        datatype  = ucp_dt_make_contig(1);
+        dt_length = count; /* use dt_lendth to suppress coverity false positive */
+        if (ucs_likely(ucp_stream_recv_nb_is_inplace(ep_ext, count))) {
+            status  = ucp_stream_process_rdesc_inplace(ucp_stream_rdesc_get(ep_ext),
+                                                       datatype, buffer, count,
+                                                       dt_length, ep_ext);
+            *length = count;
             goto out_status;
         }
+    } else if (attr_mask == UCP_OP_ATTR_FIELD_DATATYPE) {
+        datatype  = param->datatype;
+        if (!UCP_DT_IS_GENERIC(datatype)) {
+            dt_length = ucp_dt_length(datatype, count, buffer, NULL);
+            if (ucp_stream_recv_nb_is_inplace(ep_ext, dt_length)) {
+                status  = ucp_stream_process_rdesc_inplace(ucp_stream_rdesc_get(ep_ext),
+                                                           datatype, buffer, count,
+                                                           dt_length, ep_ext);
+                *length = dt_length;
+                goto out_status;
+            }
+        } else {
+            dt_length = 0;
+        }
     } else {
-        dt_length = 0; /* Suppress warnings of paranoid compilers */
+        datatype  = ucp_dt_make_contig(1);
+        dt_length = count;
     }
 
-    req = ucp_request_get(ep->worker);
-    if (ucs_unlikely(req == NULL)) {
-        status = UCS_ERR_NO_MEMORY;
+    if (ucs_unlikely(param->op_attr_mask & UCP_OP_ATTR_FLAG_FORCE_IMM_CMPL)) {
+        status = UCS_ERR_NO_RESOURCE;
         goto out_status;
     }
 
+    req = ucp_request_get_param(ep->worker, param,
+                                {
+                                    status = UCS_ERR_NO_MEMORY;
+                                    goto out_status;
+                                });
+
     ucp_stream_recv_request_init(req, ep, buffer, count, dt_length, datatype,
-                                 cb, (flags & UCP_STREAM_RECV_FLAG_WAITALL) ?
-                                 UCP_REQUEST_FLAG_STREAM_RECV_WAITALL : 0);
+                                 param);
 
     /* OK, lets obtain all arrived data which matches the recv size */
     while ((req->recv.stream.offset < req->recv.length) &&
@@ -333,7 +383,7 @@ UCS_PROFILE_FUNC(ucs_status_ptr_t, ucp_stream_recv_nb,
     }
 
 out_put_request:
-    ucp_request_put(req);
+    ucp_request_put_param(param, req);
 
 out_status:
     req = UCS_STATUS_PTR(status);
@@ -398,11 +448,11 @@ ucp_stream_am_data_process(ucp_worker_t *worker, ucp_ep_ext_proto_t *ep_ext,
                rdesc_tmp.length);
     } else {
         /* slowpath */
-        rdesc                 = (ucp_recv_desc_t *)am_data - 1;
-        rdesc->length         = rdesc_tmp.length;
-        rdesc->payload_offset = rdesc_tmp.payload_offset + sizeof(*rdesc);
-        rdesc->priv_length    = 0;
-        rdesc->flags          = UCP_RECV_DESC_FLAG_UCT_DESC;
+        rdesc                  = (ucp_recv_desc_t *)am_data - 1;
+        rdesc->length          = rdesc_tmp.length;
+        rdesc->payload_offset  = rdesc_tmp.payload_offset + sizeof(*rdesc);
+        rdesc->uct_desc_offset = UCP_WORKER_HEADROOM_PRIV_SIZE;
+        rdesc->flags           = UCP_RECV_DESC_FLAG_UCT_DESC;
     }
 
     ucp_ep_from_ext_proto(ep_ext)->flags |= UCP_EP_FLAG_STREAM_HAS_DATA;
@@ -424,18 +474,33 @@ void ucp_stream_ep_init(ucp_ep_h ep)
 
 void ucp_stream_ep_cleanup(ucp_ep_h ep)
 {
+    ucp_ep_ext_proto_t* ep_ext;
+    ucp_request_t *req;
     size_t length;
     void *data;
 
-    if (ep->worker->context->config.features & UCP_FEATURE_STREAM) {
-        while ((data = ucp_stream_recv_data_nb_nolock(ep, &length)) != NULL) {
-            ucs_assert_always(!UCS_PTR_IS_ERR(data));
-            ucp_stream_data_release(ep, data);
-        }
+    if (!(ep->worker->context->config.features & UCP_FEATURE_STREAM)) {
+        return;
+    }
 
-        if (ucp_stream_ep_is_queued(ucp_ep_ext_proto(ep))) {
-            ucp_stream_ep_dequeue(ucp_ep_ext_proto(ep));
-        }
+    /* drop unmatched data */
+    while ((data = ucp_stream_recv_data_nb_nolock(ep, &length)) != NULL) {
+        ucs_assert_always(!UCS_PTR_IS_ERR(data));
+        ucp_stream_data_release(ep, data);
+    }
+
+    ep_ext = ucp_ep_ext_proto(ep);
+
+    if (ucp_stream_ep_is_queued(ep_ext)) {
+        ucp_stream_ep_dequeue(ep_ext);
+    }
+
+    /* cancel not completed requests */
+    ucs_assert(!ucp_stream_ep_has_data(ep_ext));
+    while (!ucs_queue_is_empty(&ep_ext->stream.match_q)) {
+        req = ucs_queue_head_elem_non_empty(&ep_ext->stream.match_q,
+                                            ucp_request_t, recv.queue);
+        ucp_request_complete_stream_recv(req, ep_ext, UCS_ERR_CANCELED);
     }
 }
 
@@ -499,8 +564,8 @@ static void ucp_stream_am_dump(ucp_worker_h worker, uct_am_trace_type_t type,
     p = buffer + strlen(buffer);
 
     ucs_assert(hdr->ep_ptr != 0);
-    ucp_dump_payload(worker->context, p, buffer + max - p, data + hdr_len,
-                     length - hdr_len);
+    ucp_dump_payload(worker->context, p, buffer + max - p,
+                     UCS_PTR_BYTE_OFFSET(data, hdr_len), length - hdr_len);
 }
 
 UCP_DEFINE_AM(UCP_FEATURE_STREAM, UCP_AM_ID_STREAM_DATA, ucp_stream_am_handler,

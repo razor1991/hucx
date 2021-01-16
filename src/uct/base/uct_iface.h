@@ -10,12 +10,14 @@
 #include "uct_worker.h"
 
 #include <uct/api/uct.h>
+#include <uct/base/uct_component.h>
 #include <ucs/config/parser.h>
 #include <ucs/datastruct/arbiter.h>
 #include <ucs/datastruct/mpool.h>
 #include <ucs/datastruct/queue.h>
 #include <ucs/debug/log.h>
 #include <ucs/stats/stats.h>
+#include <ucs/sys/compiler.h>
 #include <ucs/sys/sys.h>
 #include <ucs/type/class.h>
 
@@ -120,6 +122,10 @@ enum {
                     "UCT_EP_PARAM_FIELD_DEV_ADDR and UCT_EP_PARAM_FIELD_IFACE_ADDR are not defined")
 
 
+#define UCT_EP_PARAMS_GET_PATH_INDEX(_params) \
+    (((_params)->field_mask & UCT_EP_PARAM_FIELD_PATH_INDEX) ? \
+     (_params)->path_index : 0)
+
 /**
  * Check the condition and return status as a pointer if not true.
  */
@@ -214,9 +220,10 @@ typedef struct uct_base_iface {
         unsigned            num_alloc_methods;
         uct_alloc_method_t  alloc_methods[UCT_ALLOC_METHOD_LAST];
         ucs_log_level_t     failure_level;
+        size_t              max_num_eps;
     } config;
 
-    UCS_STATS_NODE_DECLARE(stats);           /* Statistics */
+    UCS_STATS_NODE_DECLARE(stats)            /* Statistics */
 } uct_base_iface_t;
 
 UCS_CLASS_DECLARE(uct_base_iface_t, uct_iface_ops_t*,  uct_md_h, uct_worker_h,
@@ -238,47 +245,70 @@ typedef struct uct_failed_iface {
  */
 typedef struct uct_base_ep {
     uct_ep_t          super;
-    UCS_STATS_NODE_DECLARE(stats);
+    UCS_STATS_NODE_DECLARE(stats)
 } uct_base_ep_t;
 UCS_CLASS_DECLARE(uct_base_ep_t, uct_base_iface_t*);
 
 
 /**
- * Transport component.
+ * Internal resource descriptor of a transport device
  */
-typedef struct uct_tl_component {
-    ucs_status_t           (*query_resources)(uct_md_h md,
-                                              uct_tl_resource_desc_t **resources_p,
-                                              unsigned *num_resources_p);
+typedef struct uct_tl_device_resource {
+    char                     name[UCT_DEVICE_NAME_MAX]; /**< Hardware device name */
+    uct_device_type_t        type;       /**< The device represented by this resource
+                                              (e.g. UCT_DEVICE_TYPE_NET for a network interface) */
+    ucs_sys_device_t         sys_device; /**< The identifier associated with the device
+                                              bus_id as captured in ucs_sys_bus_id_t struct */
+} uct_tl_device_resource_t;
+
+
+/**
+ * UCT transport definition. This structure should not be used directly; use
+ * @ref UCT_TL_DEFINE macro to define a transport.
+ */
+typedef struct uct_tl {
+    char                   name[UCT_TL_NAME_MAX]; /**< Transport name */
+
+    ucs_status_t           (*query_devices)(uct_md_h md,
+                                            uct_tl_device_resource_t **tl_devices_p,
+                                            unsigned *num_tl_devices_p);
 
     ucs_status_t           (*iface_open)(uct_md_h md, uct_worker_h worker,
                                          const uct_iface_params_t *params,
                                          const uct_iface_config_t *config,
                                          uct_iface_h *iface_p);
 
-    char                   name[UCT_TL_NAME_MAX];/**< Transport name */
-    const char             *cfg_prefix;         /**< Prefix for configuration environment vars */
-    ucs_config_field_t     *iface_config_table; /**< Defines transport configuration options */
-    size_t                 iface_config_size;   /**< Transport configuration structure size */
-} uct_tl_component_t;
+    ucs_config_global_list_entry_t config; /**< Transport configuration entry */
+    ucs_list_link_t                list;   /**< Entry in component's transports list */
+} uct_tl_t;
 
 
 /**
- * Define a transport component.
+ * Define a transport
+ *
+ * @param _component      Component to add the transport to
+ * @param _name           Name of the transport (should be a token, not a string)
+ * @param _query_devices  Function to query the list of available devices
+ * @param _iface_class    Struct type defining the uct_iface class
  */
-#define UCT_TL_COMPONENT_DEFINE(_tlc, _query, _iface_struct, _name, \
-                                _cfg_prefix, _cfg_table, _cfg_struct) \
+#define UCT_TL_DEFINE(_component, _name, _query_devices, _iface_class, \
+                      _cfg_prefix, _cfg_table, _cfg_struct) \
     \
-    uct_tl_component_t _tlc = { \
-        .query_resources     = _query, \
-        .iface_open          = UCS_CLASS_NEW_FUNC_NAME(_iface_struct), \
-        .name                = _name, \
-        .cfg_prefix          = _cfg_prefix, \
-        .iface_config_table  = _cfg_table, \
-        .iface_config_size   = sizeof(_cfg_struct) \
+    uct_tl_t uct_##_name##_tl = { \
+        .name               = #_name, \
+        .query_devices      = _query_devices, \
+        .iface_open         = UCS_CLASS_NEW_FUNC_NAME(_iface_class), \
+        .config = { \
+            .name           = #_name" transport", \
+            .prefix         = _cfg_prefix, \
+            .table          = _cfg_table, \
+            .size           = sizeof(_cfg_struct), \
+         } \
     }; \
-    UCS_CONFIG_REGISTER_TABLE(_cfg_table, _name" transport", _cfg_prefix, \
-                              _cfg_struct)
+    UCS_CONFIG_REGISTER_TABLE_ENTRY(&(uct_##_name##_tl).config); \
+    UCS_STATIC_INIT { \
+        ucs_list_add_tail(&(_component)->tl_list, &(uct_##_name##_tl).list); \
+    }
 
 
 /**
@@ -286,15 +316,13 @@ typedef struct uct_tl_component {
  * Specific transport extend this structure.
  */
 struct uct_iface_config {
-    size_t            max_short;
-    size_t            max_bcopy;
-
     struct {
         uct_alloc_method_t  *methods;
         unsigned            count;
     } alloc_methods;
 
     int               failure;   /* Level of failure reports */
+    size_t            max_num_eps;
 };
 
 
@@ -367,7 +395,7 @@ typedef struct uct_iface_mpool_config {
  * TL Memory pool object initialization callback.
  */
 typedef void (*uct_iface_mpool_init_obj_cb_t)(uct_iface_h iface, void *obj,
-                uct_mem_h memh);
+                                              uct_mem_h memh);
 
 
 /**
@@ -395,8 +423,8 @@ uct_pending_req_priv_arb_elem(uct_pending_req_t *req)
 #define uct_pending_req_arb_group_push(_arbiter_group, _req) \
     do { \
         ucs_arbiter_elem_init(uct_pending_req_priv_arb_elem(_req)); \
-        ucs_arbiter_group_push_elem(_arbiter_group, \
-                                    uct_pending_req_priv_arb_elem(_req)); \
+        ucs_arbiter_group_push_elem_always(_arbiter_group, \
+                                           uct_pending_req_priv_arb_elem(_req)); \
     } while (0)
 
 
@@ -406,8 +434,8 @@ uct_pending_req_priv_arb_elem(uct_pending_req_t *req)
 #define uct_pending_req_arb_group_push_head(_arbiter, _arbiter_group, _req) \
     do { \
         ucs_arbiter_elem_init(uct_pending_req_priv_arb_elem(_req)); \
-        ucs_arbiter_group_push_head_elem(_arbiter, _arbiter_group, \
-                                         uct_pending_req_priv_arb_elem(_req)); \
+        ucs_arbiter_group_push_head_elem_always(_arbiter_group, \
+                                                uct_pending_req_priv_arb_elem(_req)); \
     } while (0)
 
 
@@ -557,6 +585,13 @@ void uct_iface_mpool_empty_warn(uct_base_iface_t *iface, ucs_mpool_t *mp);
 ucs_status_t uct_set_ep_failed(ucs_class_t* cls, uct_ep_h tl_ep, uct_iface_h
                                tl_iface, ucs_status_t status);
 
+void uct_base_iface_query(uct_base_iface_t *iface, uct_iface_attr_t *iface_attr);
+
+ucs_status_t uct_single_device_resource(uct_md_h md, const char *dev_name,
+                                        uct_device_type_t dev_type,
+                                        uct_tl_device_resource_t **tl_devices_p,
+                                        unsigned *num_tl_devices_p);
+
 ucs_status_t uct_base_iface_flush(uct_iface_h tl_iface, unsigned flags,
                                   uct_completion_t *comp);
 
@@ -588,11 +623,15 @@ uct_iface_invoke_am(uct_base_iface_t *iface, uint8_t id, void *data,
                     unsigned length, unsigned flags)
 {
     ucs_status_t     status;
-    uct_am_handler_t *handler = &iface->am[id];
+    uct_am_handler_t *handler;
 
-    ucs_assert(id < UCT_AM_ID_MAX);
+    ucs_assertv(id < UCT_AM_ID_MAX, "invalid am id: %d (max: %lu)",
+                id, UCT_AM_ID_MAX - 1);
+
     UCS_STATS_UPDATE_COUNTER(iface->stats, UCT_IFACE_STAT_RX_AM, 1);
     UCS_STATS_UPDATE_COUNTER(iface->stats, UCT_IFACE_STAT_RX_AM_BYTES, length);
+
+    handler = &iface->am[id];
     status = handler->cb(handler->arg, data, length, flags);
     ucs_assert((status == UCS_OK) ||
                ((status == UCS_INPROGRESS) && (flags & UCT_CB_PARAM_FLAG_DESC)));
@@ -610,35 +649,33 @@ static UCS_F_ALWAYS_INLINE
 void uct_invoke_completion(uct_completion_t *comp, ucs_status_t status)
 {
     ucs_trace_func("comp=%p, count=%d, status=%d", comp, comp->count, status);
+    ucs_assertv(comp->count > 0, "comp=%p count=%d", comp, comp->count);
     if (--comp->count == 0) {
         comp->func(comp, status);
     }
 }
 
-/**
- * Calculates total length of particular iov data buffer.
- * Currently has no support for stride.
- * If stride supported it should be like: length + ((count - 1) * stride)
- */
-static UCS_F_ALWAYS_INLINE
-size_t uct_iov_get_length(const uct_iov_t *iov)
-{
-    return iov->count * iov->length;
-}
 
 /**
- * Calculates total length of the iov array buffers.
+ * Copy data to target am_short buffer
  */
 static UCS_F_ALWAYS_INLINE
-size_t uct_iov_total_length(const uct_iov_t *iov, size_t iovcnt)
+void uct_am_short_fill_data(void *buffer, uint64_t header, const void *payload,
+                            size_t length)
 {
-    size_t iov_it, total_length = 0;
+    /**
+     * Helper structure to fill send buffer of short messages for
+     * non-accelerated transports
+     */
+    struct uct_am_short_packet {
+        uint64_t header;
+        char     payload[];
+    } UCS_S_PACKED *packet = (struct uct_am_short_packet*)buffer;
 
-    for (iov_it = 0; iov_it < iovcnt; ++iov_it) {
-        total_length += uct_iov_get_length(&iov[iov_it]);
-    }
-
-    return total_length;
+    packet->header = header;
+    /* suppress false positive diagnostic from uct_mm_ep_am_common_send call */
+    /* cppcheck-suppress ctunullpointer */
+    memcpy(packet->payload, payload, length);
 }
 
 #endif

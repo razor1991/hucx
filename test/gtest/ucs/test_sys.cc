@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2012.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -11,6 +11,7 @@ extern "C" {
 #include <ucs/sys/sock.h>
 #include <ucs/type/spinlock.h>
 #include <ucs/time/time.h>
+#include <ucs/arch/cpu.h>
 }
 
 #include <sys/mman.h>
@@ -27,6 +28,17 @@ protected:
 
         ucs_memunits_to_str(size, buf, sizeof(buf));
         EXPECT_EQ(std::string(expected), buf);
+    }
+
+    static void check_cache_type(ucs_cpu_cache_type_t type, const char *name)
+    {
+        size_t cache;
+        char memunits[32];
+
+        cache = ucs_cpu_get_cache_size(type);
+
+        ucs_memunits_to_str(cache, memunits, sizeof(memunits));
+        UCS_TEST_MESSAGE << name << " cache: " << memunits;
     }
 };
 
@@ -46,25 +58,26 @@ UCS_TEST_F(test_sys, machine_guid) {
 }
 
 UCS_TEST_F(test_sys, spinlock) {
-    ucs_spinlock_t lock;
+    ucs_recursive_spinlock_t lock;
     pthread_t self;
 
     self = pthread_self();
 
-    ucs_spinlock_init(&lock);
+    ucs_recursive_spinlock_init(&lock, 0);
 
-    ucs_spin_lock(&lock);
-    EXPECT_TRUE(ucs_spin_is_owner(&lock, self));
+    ucs_recursive_spin_lock(&lock);
+    EXPECT_TRUE(ucs_recursive_spin_is_owner(&lock, self));
 
     /* coverity[double_lock] */
-    ucs_spin_lock(&lock);
-    EXPECT_TRUE(ucs_spin_is_owner(&lock, self));
+    ucs_recursive_spin_lock(&lock);
+    EXPECT_TRUE(ucs_recursive_spin_is_owner(&lock, self));
 
-    ucs_spin_unlock(&lock);
-    EXPECT_TRUE(ucs_spin_is_owner(&lock, self));
+    ucs_recursive_spin_unlock(&lock);
+    EXPECT_TRUE(ucs_recursive_spin_is_owner(&lock, self));
 
-    ucs_spin_unlock(&lock);
-    EXPECT_FALSE(ucs_spin_is_owner(&lock, self));
+    /* coverity[double_unlock] */
+    ucs_recursive_spin_unlock(&lock);
+    EXPECT_FALSE(ucs_recursive_spin_is_owner(&lock, self));
 }
 
 UCS_TEST_F(test_sys, get_mem_prot) {
@@ -134,5 +147,12 @@ UCS_TEST_F(test_sys, memunits_to_str) {
     test_memunits(UCS_GBYTE, "1G");
     test_memunits(2 * UCS_GBYTE, "2G");
     test_memunits(UCS_TBYTE, "1T");
-    test_memunits(UCS_TBYTE * 1024, "1024T");
+    test_memunits(UCS_TBYTE * 1024, "1P");
+}
+
+UCS_TEST_F(test_sys, cpu_cache) {
+    check_cache_type(UCS_CPU_CACHE_L1d, "L1d");
+    check_cache_type(UCS_CPU_CACHE_L1i, "L1i");
+    check_cache_type(UCS_CPU_CACHE_L2, "L2");
+    check_cache_type(UCS_CPU_CACHE_L3, "L3");
 }

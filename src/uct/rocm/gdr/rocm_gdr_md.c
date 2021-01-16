@@ -3,6 +3,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "rocm_gdr_md.h"
 
 #include <uct/rocm/base/rocm_base.h>
@@ -26,15 +30,15 @@ static ucs_config_field_t uct_rocm_gdr_md_config_table[] = {
 
 static ucs_status_t uct_rocm_gdr_md_query(uct_md_h md, uct_md_attr_t *md_attr)
 {
-    md_attr->cap.flags         = UCT_MD_FLAG_REG |
-                                 UCT_MD_FLAG_NEED_RKEY;
-    md_attr->cap.reg_mem_types = UCS_BIT(UCT_MD_MEM_TYPE_ROCM);
-    md_attr->cap.mem_type      = UCT_MD_MEM_TYPE_ROCM;
-    md_attr->cap.max_alloc     = 0;
-    md_attr->cap.max_reg       = ULONG_MAX;
-    md_attr->rkey_packed_size  = sizeof(uct_rocm_gdr_key_t);
-    md_attr->reg_cost.overhead = 0;
-    md_attr->reg_cost.growth   = 0;
+    md_attr->cap.flags            = UCT_MD_FLAG_REG |
+                                    UCT_MD_FLAG_NEED_RKEY;
+    md_attr->cap.reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_ROCM);
+    md_attr->cap.access_mem_type  = UCS_MEMORY_TYPE_ROCM;
+    md_attr->cap.detect_mem_types = 0;
+    md_attr->cap.max_alloc        = 0;
+    md_attr->cap.max_reg          = ULONG_MAX;
+    md_attr->rkey_packed_size     = sizeof(uct_rocm_gdr_key_t);
+    md_attr->reg_cost             = ucs_linear_func_make(0, 0);
     memset(&md_attr->local_cpus, 0xff, sizeof(md_attr->local_cpus));
     return UCS_OK;
 }
@@ -48,9 +52,9 @@ static ucs_status_t uct_rocm_gdr_mkey_pack(uct_md_h md, uct_mem_h memh,
     return UCS_OK;
 }
 
-static ucs_status_t uct_rocm_gdr_rkey_unpack(uct_md_component_t *mdc,
-                                             const void *rkey_buffer, uct_rkey_t *rkey_p,
-                                             void **handle_p)
+static ucs_status_t uct_rocm_gdr_rkey_unpack(uct_component_t *component,
+                                             const void *rkey_buffer,
+                                             uct_rkey_t *rkey_p, void **handle_p)
 {
     //uct_rocm_gdr_key_t *packed = (uct_rocm_gdr_key_t *)rkey_buffer;
     uct_rocm_gdr_key_t *key;
@@ -69,8 +73,8 @@ static ucs_status_t uct_rocm_gdr_rkey_unpack(uct_md_component_t *mdc,
     return UCS_OK;
 }
 
-static ucs_status_t uct_rocm_gdr_rkey_release(uct_md_component_t *mdc, uct_rkey_t rkey,
-                                              void *handle)
+static ucs_status_t uct_rocm_gdr_rkey_release(uct_component_t *component,
+                                              uct_rkey_t rkey, void *handle)
 {
     ucs_assert(NULL == handle);
     ucs_free((void *)rkey);
@@ -100,13 +104,6 @@ static ucs_status_t uct_rocm_gdr_mem_dereg(uct_md_h md, uct_mem_h memh)
     return UCS_OK;
 }
 
-static ucs_status_t uct_rocm_gdr_query_md_resources(uct_md_resource_desc_t **resources_p,
-                                                    unsigned *num_resources_p)
-{
-    return uct_single_md_resource(&uct_rocm_gdr_md_component, resources_p,
-                                  num_resources_p);
-}
-
 static void uct_rocm_gdr_md_close(uct_md_h uct_md) {
     uct_rocm_gdr_md_t *md = ucs_derived_of(uct_md, uct_rocm_gdr_md_t);
 
@@ -114,16 +111,17 @@ static void uct_rocm_gdr_md_close(uct_md_h uct_md) {
 }
 
 static uct_md_ops_t md_ops = {
-    .close              = uct_rocm_gdr_md_close,
-    .query              = uct_rocm_gdr_md_query,
-    .mkey_pack          = uct_rocm_gdr_mkey_pack,
-    .mem_reg            = uct_rocm_gdr_mem_reg,
-    .mem_dereg          = uct_rocm_gdr_mem_dereg,
-    .is_mem_type_owned  = uct_rocm_base_is_mem_type_owned,
+    .close               = uct_rocm_gdr_md_close,
+    .query               = uct_rocm_gdr_md_query,
+    .mkey_pack           = uct_rocm_gdr_mkey_pack,
+    .mem_reg             = uct_rocm_gdr_mem_reg,
+    .mem_dereg           = uct_rocm_gdr_mem_dereg,
+    .detect_memory_type  = ucs_empty_function_return_unsupported,
 };
 
-static ucs_status_t uct_rocm_gdr_md_open(const char *md_name, const uct_md_config_t *md_config,
-                                         uct_md_h *md_p)
+static ucs_status_t
+uct_rocm_gdr_md_open(uct_component_h component, const char *md_name,
+                     const uct_md_config_t *md_config, uct_md_h *md_p)
 {
     uct_rocm_gdr_md_t *md;
 
@@ -133,14 +131,30 @@ static ucs_status_t uct_rocm_gdr_md_open(const char *md_name, const uct_md_confi
         return UCS_ERR_NO_MEMORY;
     }
 
-    md->super.ops = &md_ops;
-    md->super.component = &uct_rocm_gdr_md_component;
+    md->super.ops       = &md_ops;
+    md->super.component = &uct_rocm_gdr_component;
 
     *md_p = (uct_md_h) md;
     return UCS_OK;
 }
 
-UCT_MD_COMPONENT_DEFINE(uct_rocm_gdr_md_component, UCT_ROCM_GDR_MD_NAME,
-                        uct_rocm_gdr_query_md_resources, uct_rocm_gdr_md_open, NULL,
-                        uct_rocm_gdr_rkey_unpack, uct_rocm_gdr_rkey_release, "ROCM_GDR_",
-                        uct_rocm_gdr_md_config_table, uct_rocm_gdr_md_config_t);
+uct_component_t uct_rocm_gdr_component = {
+    .query_md_resources = uct_md_query_single_md_resource,
+    .md_open            = uct_rocm_gdr_md_open,
+    .cm_open            = ucs_empty_function_return_unsupported,
+    .rkey_unpack        = uct_rocm_gdr_rkey_unpack,
+    .rkey_ptr           = ucs_empty_function_return_unsupported,
+    .rkey_release       = uct_rocm_gdr_rkey_release,
+    .name               = "rocm_gdr",
+    .md_config          = {
+        .name           = "ROCm-gdr memory domain",
+        .prefix         = "ROCM_GDR_",
+        .table          = uct_rocm_gdr_md_config_table,
+        .size           = sizeof(uct_rocm_gdr_md_config_t),
+    },
+    .cm_config          = UCS_CONFIG_EMPTY_GLOBAL_LIST_ENTRY,
+    .tl_list            = UCT_COMPONENT_TL_LIST_INITIALIZER(&uct_rocm_gdr_component),
+    .flags              = 0
+};
+UCT_COMPONENT_REGISTER(&uct_rocm_gdr_component);
+

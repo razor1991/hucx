@@ -31,12 +31,7 @@ std::vector<const resource*> uct_p2p_test::enum_resources(const std::string& tl_
     if (all_resources.empty()) {
         std::vector<const resource*> r = uct_test::enum_resources("");
         for (std::vector<const resource*>::iterator iter = r.begin(); iter != r.end(); ++iter) {
-            p2p_resource res;
-            res.md_name    = (*iter)->md_name;
-            res.local_cpus = (*iter)->local_cpus;
-            res.tl_name    = (*iter)->tl_name;
-            res.dev_name   = (*iter)->dev_name;
-            res.dev_type   = (*iter)->dev_type;
+            p2p_resource res(**iter);
 
             if (UCT_DEVICE_TYPE_SELF != res.dev_type) {
                 res.loopback = false;
@@ -70,14 +65,14 @@ void uct_p2p_test::init() {
     ucs_assert_always(r != NULL);
 
     /* Create 2 connected endpoints */
-    if (r->loopback) {
-        entity *e = uct_test::create_entity(m_rx_headroom, m_err_handler);
-        m_entities.push_back(e);
-        e->connect(0, *e, 0);
-    } else {
-        entity *e1 = uct_test::create_entity(m_rx_headroom, m_err_handler);
-        m_entities.push_back(e1);
+    entity *e1 = uct_test::create_entity(m_rx_headroom, m_err_handler);
+    m_entities.push_back(e1);
 
+    check_skip_test();
+
+    if (r->loopback) {
+        e1->connect(0, *e1, 0);
+    } else {
         entity *e2 = uct_test::create_entity(m_rx_headroom, m_err_handler);
         m_entities.push_back(e2);
 
@@ -98,13 +93,15 @@ void uct_p2p_test::cleanup() {
 }
 
 void uct_p2p_test::test_xfer(send_func_t send, size_t length, unsigned flags,
-                             uct_memory_type_t mem_type) {
+                             ucs_memory_type_t mem_type) {
     UCS_TEST_SKIP;
 }
 
 ucs_log_func_rc_t
 uct_p2p_test::log_handler(const char *file, unsigned line, const char *function,
-                          ucs_log_level_t level, const char *message, va_list ap)
+                          ucs_log_level_t level,
+                          const ucs_log_component_config_t *comp_conf,
+                          const char *message, va_list ap)
 {
     if (level == UCS_LOG_LEVEL_TRACE_DATA) {
         ++log_data_count;
@@ -117,7 +114,7 @@ uct_p2p_test::log_handler(const char *file, unsigned line, const char *function,
 
 template <typename O>
 void uct_p2p_test::test_xfer_print(O& os, send_func_t send, size_t length,
-                                   unsigned flags, uct_memory_type_t mem_type)
+                                   unsigned flags, ucs_memory_type_t mem_type)
 {
     if (!ucs_log_is_enabled(UCS_LOG_LEVEL_TRACE_DATA)) {
         os << ucs::size_value(length) << " " << std::flush;
@@ -129,13 +126,13 @@ void uct_p2p_test::test_xfer_print(O& os, send_func_t send, size_t length,
      */
     int count_before = log_data_count;
     ucs_log_push_handler(log_handler);
-    orig_log_level = ucs_global_opts.log_level;
-    ucs_global_opts.log_level = UCS_LOG_LEVEL_TRACE_DATA;
+    orig_log_level = ucs_global_opts.log_component.log_level;
+    ucs_global_opts.log_component.log_level = UCS_LOG_LEVEL_TRACE_DATA;
     bool expect_log = ucs_log_is_enabled(UCS_LOG_LEVEL_TRACE_DATA);
 
     UCS_TEST_SCOPE_EXIT() {
         /* Restore logging */
-        ucs_global_opts.log_level = orig_log_level;
+        ucs_global_opts.log_component.log_level = orig_log_level;
         ucs_log_pop_handler();
     } UCS_TEST_SCOPE_EXIT_END
 
@@ -150,35 +147,35 @@ void uct_p2p_test::test_xfer_multi(send_func_t send, size_t min_length,
                                    size_t max_length, unsigned flags)
 {
 
-    for (int mem_type = 0; mem_type < UCT_MD_MEM_TYPE_LAST; mem_type++) {
+    for (int mem_type = 0; mem_type < UCS_MEMORY_TYPE_LAST; mem_type++) {
         /* test mem type if md supports mem type
          * (or) if HOST MD can register mem type
          */
-        if (!((sender().md_attr().cap.mem_type == mem_type) ||
-            (sender().md_attr().cap.mem_type == UCT_MD_MEM_TYPE_HOST &&
+        if (!((sender().md_attr().cap.access_mem_type == mem_type) ||
+            (sender().md_attr().cap.access_mem_type == UCS_MEMORY_TYPE_HOST &&
 		sender().md_attr().cap.reg_mem_types & UCS_BIT(mem_type)))) {
             continue;
         }
-        if (mem_type == UCT_MD_MEM_TYPE_CUDA) {
+        if (mem_type == UCS_MEMORY_TYPE_CUDA) {
             if (!(flags & (TEST_UCT_FLAG_RECV_ZCOPY | TEST_UCT_FLAG_SEND_ZCOPY))) {
                 continue;
             }
         }
         test_xfer_multi_mem_type(send, min_length, max_length, flags,
-                                 (uct_memory_type_t) mem_type);
+                                 (ucs_memory_type_t) mem_type);
     }
 }
 
 void uct_p2p_test::test_xfer_multi_mem_type(send_func_t send, size_t min_length,
                                             size_t max_length, unsigned flags,
-                                            uct_memory_type_t mem_type) {
+                                            ucs_memory_type_t mem_type) {
 
     ucs::detail::message_stream ms("INFO");
 
-    ms << "memory_type:" << uct_test::uct_mem_type_names[mem_type] << " " << std::flush;
+    ms << "memory_type:" << ucs_memory_type_names[mem_type] << " " << std::flush;
 
-    /* Trim at 4GB */
-    max_length = ucs_min(max_length, 4ull * 1124 * 1024 * 1024);
+    /* Trim at 4.1 GB */
+    max_length = ucs_min(max_length, (size_t)(4.1 * (double)UCS_GBYTE));
 
     /* Trim at max. phys memory */
     max_length = ucs_min(max_length, ucs_get_phys_mem_size() / 8);
@@ -190,10 +187,10 @@ void uct_p2p_test::test_xfer_multi_mem_type(send_func_t send, size_t min_length,
     max_length = ucs_min(max_length, ucs_get_memfree_size() / 4);
 
     /* For large size, slow down if needed */
-    if (max_length > 1 * 1024 * 1024) {
+    if (max_length > UCS_MBYTE) {
         max_length = max_length / ucs::test_time_multiplier();
         if (RUNNING_ON_VALGRIND) {
-            max_length = ucs_min(max_length, 20u * 1024 * 1024);
+            max_length = ucs_min(max_length, 20u * UCS_MBYTE);
         }
     }
 
@@ -215,7 +212,7 @@ void uct_p2p_test::test_xfer_multi_mem_type(send_func_t send, size_t min_length,
 
     /* How many times to repeat */
     int repeat_count;
-    repeat_count = (256 * 1024) / ((max_length + min_length) / 2);
+    repeat_count = (256 * UCS_KBYTE) / ((max_length + min_length) / 2);
     if (repeat_count > 1000) {
         repeat_count = 1000;
     }
@@ -252,12 +249,23 @@ void uct_p2p_test::blocking_send(send_func_t send, uct_ep_h ep,
 {
     unsigned prev_comp_count = m_completion_count;
 
+    ucs_assert(m_completion.uct.count == 0);
+
     ucs_status_t status;
     do {
+        if (!m_null_completion) {
+            ++m_completion.uct.count;
+        }
         status = (this->*send)(ep, sendbuf, recvbuf);
         if (status == UCS_OK) {
+            if (!m_null_completion) {
+                --m_completion.uct.count;
+            }
             return;
         } else if (status == UCS_ERR_NO_RESOURCE) {
+            if (!m_null_completion) {
+                --m_completion.uct.count;
+            }
             progress();
         } else if (status == UCS_INPROGRESS) {
             break;
@@ -271,10 +279,12 @@ void uct_p2p_test::blocking_send(send_func_t send, uct_ep_h ep,
     if (wait_for_completion) {
         if (comp() == NULL) {
             /* implicit non-blocking mode */
-            sender().flush();
+            /* Call flush on local and remote ifaces to progress data
+             * (e.g. if call flush only on local iface, a target side may
+             *  not be able to send PUT ACK to an initiator in case of TCP) */
+            flush(); 
         } else {
             /* explicit non-blocking mode */
-            ++m_completion.uct.count;
             while (m_completion_count <= prev_comp_count) {
                 progress();
             }
@@ -284,7 +294,10 @@ void uct_p2p_test::blocking_send(send_func_t send, uct_ep_h ep,
 }
 
 void uct_p2p_test::wait_for_remote() {
-    sender().flush();
+    /* Call flush on local and remote ifaces to progress data
+     * (e.g. if call flush only on local iface, a target side may
+     *  not be able to send PUT ACK to an initiator in case of TCP) */
+    flush();
 }
 
 uct_test::entity& uct_p2p_test::sender() {

@@ -1,7 +1,7 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2015.  ALL RIGHTS RESERVED.
-* Copyright (C) ARM Ltd. 2016-2017.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) ARM Ltd. 2016-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -11,11 +11,13 @@
 
 #include "config.h"
 #include <time.h>
+#include <string.h>
 #include <sys/times.h>
 #include <ucs/sys/compiler_def.h>
 #include <ucs/arch/generic/cpu.h>
 #include <ucs/sys/math.h>
-#if __ARM_NEON
+#include <ucs/type/status.h>
+#ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
 
@@ -29,14 +31,41 @@ BEGIN_C_DECLS
 /**
  * Assume the worst - weak memory ordering.
  */
-#define ucs_memory_bus_fence()        asm volatile ("dsb sy" ::: "memory");
-#define ucs_memory_bus_store_fence()  asm volatile ("dsb st" ::: "memory");
-#define ucs_memory_bus_load_fence()   asm volatile ("dsb ld" ::: "memory");
-#define ucs_memory_bus_wc_flush()
-#define ucs_memory_cpu_fence()        asm volatile ("dmb ish" ::: "memory");
-#define ucs_memory_cpu_store_fence()  asm volatile ("dmb ishst" ::: "memory");
-#define ucs_memory_cpu_load_fence()   asm volatile ("dmb ishld" ::: "memory");
-#define ucs_memory_cpu_wc_fence()     asm volatile ("dmb st" ::: "memory");
+
+#define ucs_aarch64_dmb(_op)          asm volatile ("dmb " #_op ::: "memory")
+#define ucs_aarch64_isb(_op)          asm volatile ("isb " #_op ::: "memory")
+#define ucs_aarch64_dsb(_op)          asm volatile ("dsb " #_op ::: "memory")
+
+/* The macro is used to serialize stores across Normal NC (or Device) and WB
+ * memory, (see Arm Spec, B2.7.2).  Based on recent changes in Linux kernel:
+ * https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=22ec71615d824f4f11d38d0e55a88d8956b7e45f
+ *
+ * The underlying barrier code was changed to use lighter weight DMB instead
+ * of DSB. The barrier used for synchronization of access between write back
+ * and device mapped memory (PCIe BAR).
+ */
+#define ucs_memory_bus_fence()        ucs_aarch64_dmb(oshsy)
+#define ucs_memory_bus_store_fence()  ucs_aarch64_dmb(oshst)
+#define ucs_memory_bus_load_fence()   ucs_aarch64_dmb(oshld)
+
+/* The macro is used to flush all pending stores from write combining buffer.
+ * Some uarch "auto" flush the stores once cache line is full (no need for additional barrier).
+ */
+#if defined(HAVE_AARCH64_THUNDERX2)
+#define ucs_memory_bus_cacheline_wc_flush()
+#else
+/* The macro is used to flush stores to Normal NC or Device memory */
+#define ucs_memory_bus_cacheline_wc_flush()     ucs_aarch64_dmb(oshst)
+#endif
+
+#define ucs_memory_cpu_fence()        ucs_aarch64_dmb(ish)
+#define ucs_memory_cpu_store_fence()  ucs_aarch64_dmb(ishst)
+#define ucs_memory_cpu_load_fence()   ucs_aarch64_dmb(ishld)
+
+/* The macro is used to serialize stores to Normal NC or Device memory
+ * (see Arm Spec, B2.7.2)
+ */
+#define ucs_memory_cpu_wc_fence()     ucs_aarch64_dmb(oshst)
 
 
 /*
@@ -55,6 +84,11 @@ typedef struct ucs_aarch64_cpuid {
  * Get ARM CPU identifier and version
  */
 void ucs_aarch64_cpuid(ucs_aarch64_cpuid_t *cpuid);
+
+
+#if defined(HAVE_AARCH64_THUNDERX2)
+extern void *__memcpy_thunderx2(void *, const void *, size_t);
+#endif
 
 
 #if HAVE_HW_TIMER
@@ -85,9 +119,25 @@ static inline ucs_cpu_model_t ucs_arch_get_cpu_model()
     return UCS_CPU_MODEL_ARM_AARCH64;
 }
 
+static inline ucs_cpu_vendor_t ucs_arch_get_cpu_vendor()
+{
+    ucs_aarch64_cpuid_t cpuid;
+    ucs_aarch64_cpuid(&cpuid);
+
+    if ((cpuid.implementer == 0x46) && (cpuid.architecture == 8)) {
+        return UCS_CPU_VENDOR_FUJITSU_ARM;
+    }
+
+    return UCS_CPU_VENDOR_GENERIC_ARM;
+}
+
 static inline int ucs_arch_get_cpu_flag()
 {
     return UCS_CPU_FLAG_UNKNOWN;
+}
+
+static inline void ucs_cpu_init()
+{
 }
 
 static inline void ucs_arch_wait_mem(void *address)
@@ -111,14 +161,19 @@ static inline void ucs_arch_clear_cache(void *start, void *end)
     uintptr_t ptr;
     unsigned icache;
     unsigned dcache;
+    unsigned dic;
+    unsigned idc;
     unsigned ctr_el0;
 
     /* Get cache line size, using ctr_el0 register
      *
      * Bits    Name      Function
      * *****************************
-     * [31]    -         Reserved, res1.
-     * [30:28] -         Reserved, res0.
+     * [31]    -         Reserved, RES1.
+     * [30]    -         Reserved, RES0.
+     * [29]    DIC       Instruction cache invalidation requirements for data to instruction
+     *                   coherence.
+     * [28]    IDC       Data cache clean requirements for instruction to data coherence.
      * [27:24] CWG       Cache Write-Back granule. Log2 of the number of words of the
      *                   maximum size of memory that can be overwritten as a result of
      *                   the eviction of a cache entry that has had a memory location
@@ -147,19 +202,59 @@ static inline void ucs_arch_clear_cache(void *start, void *end)
     asm volatile ("mrs\t%0, ctr_el0":"=r" (ctr_el0));
     icache = sizeof(int) << (ctr_el0 & 0xf);
     dcache = sizeof(int) << ((ctr_el0 >> 16) & 0xf);
+    dic = (ctr_el0 >> 29) & 0x1;
+    idc = (ctr_el0 >> 28) & 0x1;
 
-    for (ptr = ucs_align_down((uintptr_t)start, dcache); ptr < (uintptr_t)end; ptr += dcache) {
-        asm volatile ("dc cvau, %0" :: "r" (ptr) : "memory");
+    /* 
+     * Check if Data cache clean to the Point of Unification is required for instruction to
+     * data coherence
+     */
+    if (idc == 0) {
+        for (ptr = ucs_align_down((uintptr_t)start, dcache); ptr < (uintptr_t)end; ptr += dcache) {
+            asm volatile ("dc cvau, %0" :: "r" (ptr) : "memory");
+        }
     }
-    asm volatile ("dsb ish" ::: "memory");
 
-    for (ptr = ucs_align_down((uintptr_t)start, icache); ptr < (uintptr_t)end; ptr += icache) {
-        asm volatile ("ic ivau, %0" :: "r" (ptr) : "memory");
+    /*
+     * Check if Instruction cache invalidation to the Point of Unification is required for
+     * data to instruction coherence.
+     */
+    if (dic == 0) {
+        ucs_aarch64_dsb(ish);
+        for (ptr = ucs_align_down((uintptr_t)start, icache); ptr < (uintptr_t)end; ptr += icache) {
+            asm volatile ("ic ivau, %0" :: "r" (ptr) : "memory");
+        }
     }
-    asm volatile ("dsb ish; isb" ::: "memory");
+    ucs_aarch64_dsb(ish);
+    ucs_aarch64_isb();
 #endif
 }
 #endif
+
+static inline void *ucs_memcpy_relaxed(void *dst, const void *src, size_t len)
+{
+#if defined(HAVE_AARCH64_THUNDERX2)
+    return __memcpy_thunderx2(dst, src,len);
+#else
+    return memcpy(dst, src, len);
+#endif
+}
+
+static UCS_F_ALWAYS_INLINE void
+ucs_memcpy_nontemporal(void *dst, const void *src, size_t len)
+{
+#if defined(HAVE_AARCH64_THUNDERX2)
+    __memcpy_thunderx2(dst, src,len);
+#else
+    memcpy(dst, src, len);
+#endif
+
+}
+
+static inline ucs_status_t ucs_arch_get_cache_size(size_t *cache_sizes)
+{
+    return UCS_ERR_UNSUPPORTED;
+}
 
 static inline void ucs_arch_clear_cache(void *start, void *end)
 {
@@ -173,6 +268,7 @@ static inline void ucs_arch_clear_cache(void *start, void *end)
     }
     asm volatile ("dsb ish" ::: "memory");
 }
+
 // copy from ucs/arch/x86_64/cpu.h for compiling successfully.
 static inline void ucs_arch_writeback_cache(void *start, void *end)
 {
@@ -182,7 +278,6 @@ static inline void ucs_arch_writeback_cache(void *start, void *end)
     }
 #endif
 }
-
 
 END_C_DECLS
 

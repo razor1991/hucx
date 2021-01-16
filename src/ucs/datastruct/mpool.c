@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "mpool.h"
 #include "mpool.inl"
 #include "queue.h"
@@ -23,7 +27,8 @@ static inline ucs_mpool_elem_t *ucs_mpool_chunk_elem(ucs_mpool_data_t *data,
                                                      ucs_mpool_chunk_t *chunk,
                                                      unsigned elem_index)
 {
-    return chunk->elems + elem_index * ucs_mpool_elem_total_size(data);
+    return UCS_PTR_BYTE_OFFSET(chunk->elems,
+                               elem_index * ucs_mpool_elem_total_size(data));
 }
 
 static void ucs_mpool_chunk_leak_check(ucs_mpool_t *mp, ucs_mpool_chunk_t *chunk)
@@ -192,7 +197,7 @@ void ucs_mpool_grow(ucs_mpool_t *mp, unsigned num_elems)
     chunk            = ptr;
     chunk_padding    = ucs_padding((uintptr_t)(chunk + 1) + data->align_offset,
                                    data->alignment);
-    chunk->elems     = (void*)(chunk + 1) + chunk_padding;
+    chunk->elems     = UCS_PTR_BYTE_OFFSET(chunk + 1, chunk_padding);
     chunk->num_elems = ucs_min(data->quota, (chunk_size - chunk_padding - sizeof(*chunk)) /
                        ucs_mpool_elem_total_size(data));
 
@@ -286,11 +291,14 @@ typedef struct ucs_hugetlb_mpool_chunk_hdr {
 ucs_status_t ucs_mpool_hugetlb_malloc(ucs_mpool_t *mp, size_t *size_p, void **chunk_p)
 {
     ucs_hugetlb_mpool_chunk_hdr_t *chunk;
+    size_t real_size;
+#ifdef SHM_HUGETLB
     void *ptr;
     ucs_status_t status;
-    size_t real_size;
     int shmid;
+#endif
 
+#ifdef SHM_HUGETLB
     ptr = NULL;
 
     /* First, try hugetlb */
@@ -302,6 +310,7 @@ ucs_status_t ucs_mpool_hugetlb_malloc(ucs_mpool_t *mp, size_t *size_p, void **ch
         chunk->hugetlb = 1;
         goto out_ok;
     }
+#endif
 
     /* Fallback to glibc */
     real_size = *size_p;

@@ -46,7 +46,7 @@ ucs_status_t ucm_reloc_modify(ucm_reloc_patch_t* patch);
  * If the replacement function is defined in a loadbale module, the symbols it
  * imports from other libraries may not be available in global scope.
  *
- * @param [in]  symbol       Symbol name,
+ * @param [in]  symbol       Symbol name.
  * @param [in]  replacement  Symbol replacement, which should be ignored.
  *
  * @return Original function pointer for 'symbol'.

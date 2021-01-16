@@ -1,6 +1,7 @@
 #
 # Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
 # Copyright (c) UT-Battelle, LLC. 2017. ALL RIGHTS RESERVED.
+# Copyright (C) Los Alamos National Security, LLC. 2019. ALL RIGHTS RESERVED.
 # See file LICENSE for terms.
 #
 
@@ -20,6 +21,8 @@ nobase_dist_libucp_la_HEADERS = \
 	api/ucp.h
 
 noinst_HEADERS = \
+	core/ucp_am.h \
+	core/ucp_am.inl \
 	core/ucp_context.h \
 	core/ucp_ep.h \
 	core/ucp_ep.inl \
@@ -36,8 +39,11 @@ noinst_HEADERS = \
 	dt/dt_contig.h \
 	dt/dt_iov.h \
 	dt/dt_generic.h \
-	proto/proto.h \
+	proto/lane_type.h \
+	proto/proto_am.h \
 	proto/proto_am.inl \
+	proto/proto_select.h \
+	proto/proto.h \
 	rma/rma.h \
 	rma/rma.inl \
 	tag/eager.h \
@@ -49,6 +55,7 @@ noinst_HEADERS = \
 	wireup/ep_match.h \
 	wireup/wireup_ep.h \
 	wireup/wireup.h \
+	wireup/wireup_cm.h \
 	stream/stream.h
 
 devel_headers = \
@@ -68,6 +75,7 @@ endif
 
 libucp_la_SOURCES = \
 	core/ucp_context.c \
+	core/ucp_am.c \
 	core/ucp_ep.c \
 	core/ucp_listener.c \
 	core/ucp_mm.c \
@@ -80,7 +88,9 @@ libucp_la_SOURCES = \
 	dt/dt_iov.c \
 	dt/dt_generic.c \
 	dt/dt.c \
+	proto/lane_type.c \
 	proto/proto_am.c \
+	proto/proto.c \
 	rma/amo_basic.c \
 	rma/amo_send.c \
 	rma/amo_sw.c \
@@ -102,6 +112,7 @@ libucp_la_SOURCES = \
 	wireup/signaling_ep.c \
 	wireup/wireup_ep.c \
 	wireup/wireup.c \
+	wireup/wireup_cm.c \
 	stream/stream_send.c \
 	stream/stream_recv.c
 

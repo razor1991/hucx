@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2019. ALL RIGHTS RESERVED.
 * Copyright (C) UT-Battelle, LLC. 2014. ALL RIGHTS RESERVED.
 * See file LICENSE for terms.
 */
@@ -80,8 +80,13 @@ typedef struct {
     double          bw_mbits;
     double          bw_gbits;
     double          bw_tbits;
+    double          bw_auto;
 
     ucs_config_bw_spec_t can_pci_bw; /* CAN-bus */
+
+    int             air_conditioning;
+    int             abs;
+    int             transmission;
 } car_opts_t;
 
 
@@ -121,6 +126,9 @@ ucs_config_field_t engine_opts_table[] = {
   {"POWER_ALIAS", NULL, "Engine power",
    ucs_offsetof(engine_opts_t, power), UCS_CONFIG_TYPE_ULUNITS},
 
+  {"FUEL_LEVEL", "", "This is electric car",
+   UCS_CONFIG_DEPRECATED_FIELD_OFFSET, UCS_CONFIG_TYPE_DEPRECATED},
+
   {NULL}
 };
 
@@ -136,6 +144,9 @@ ucs_config_field_t car_opts_table[] = {
 
   {"PRICE_ALIAS", NULL, "Price",
    ucs_offsetof(car_opts_t, price), UCS_CONFIG_TYPE_UINT},
+
+  {"DRIVER", "", "AI drives a car",
+   UCS_CONFIG_DEPRECATED_FIELD_OFFSET, UCS_CONFIG_TYPE_DEPRECATED},
 
   {"BRAND", "Chevy", "Car brand",
    ucs_offsetof(car_opts_t, brand), UCS_CONFIG_TYPE_STRING},
@@ -179,14 +190,48 @@ ucs_config_field_t car_opts_table[] = {
   {"BW_TBITS", "1024Tbs", "Bandwidth in tbits",
    ucs_offsetof(car_opts_t, bw_tbits), UCS_CONFIG_TYPE_BW},
 
+  {"BW_AUTO", "auto", "Auto bandwidth value",
+   ucs_offsetof(car_opts_t, bw_auto), UCS_CONFIG_TYPE_BW},
+
   {"CAN_BUS_BW", "mlx5_0:1024Tbs", "Bandwidth in tbits of CAN-bus",
    ucs_offsetof(car_opts_t, can_pci_bw), UCS_CONFIG_TYPE_BW_SPEC},
+
+  {"AIR_CONDITIONING", "on", "Air conditioning mode",
+   ucs_offsetof(car_opts_t, air_conditioning), UCS_CONFIG_TYPE_ON_OFF},
+
+  {"ABS", "off", "ABS mode",
+   ucs_offsetof(car_opts_t, abs), UCS_CONFIG_TYPE_ON_OFF},
+
+  {"TRANSMISSION", "auto", "Transmission mode",
+   ucs_offsetof(car_opts_t, transmission), UCS_CONFIG_TYPE_ON_OFF_AUTO},
 
   {NULL}
 };
 
+static std::vector<std::string> config_err_exp_str;
+
 class test_config : public ucs::test {
 protected:
+    static ucs_log_func_rc_t
+    config_error_handler(const char *file, unsigned line, const char *function,
+                         ucs_log_level_t level,
+                         const ucs_log_component_config_t *comp_conf,
+                         const char *message, va_list ap)
+    {
+        // Ignore errors that invalid input parameters as it is expected
+        if (level == UCS_LOG_LEVEL_WARN) {
+            std::string err_str = format_message(message, ap);
+
+            for (size_t i = 0; i < config_err_exp_str.size(); i++) {
+                if (err_str.find(config_err_exp_str[i]) != std::string::npos) {
+                    UCS_TEST_MESSAGE << err_str;
+                    return UCS_LOG_FUNC_RC_STOP;
+                }
+            }
+        }
+
+        return UCS_LOG_FUNC_RC_CONTINUE;
+    }
 
     /*
      * Wrapper class for car options parser.
@@ -263,7 +308,7 @@ protected:
         size_t dump_size;
         char line_buf[1024];
         char alias[128];
-        car_opts opts(NULL, NULL);
+        car_opts opts(UCS_DEFAULT_ENV_PREFIX, NULL);
 
         memset(alias, 0, sizeof(alias));
 
@@ -271,7 +316,7 @@ protected:
         dump_data = NULL;
         FILE *file = open_memstream(&dump_data, &dump_size);
         ucs_config_parser_print_opts(file, "", *opts, car_opts_table,
-                                     prefix,
+                                     prefix, UCS_DEFAULT_ENV_PREFIX,
                                      (ucs_config_print_flags_t)flags);
 
         /* Sanity check - all lines begin with UCS_ */
@@ -320,7 +365,7 @@ protected:
 };
 
 UCS_TEST_F(test_config, parse_default) {
-    car_opts opts(NULL, "TEST");
+    car_opts opts(UCS_DEFAULT_ENV_PREFIX, "TEST");
 
     EXPECT_EQ(999U, opts->price);
     EXPECT_EQ(std::string("Chevy"), opts->brand);
@@ -330,7 +375,7 @@ UCS_TEST_F(test_config, parse_default) {
     EXPECT_EQ(COLOR_RED, opts->coach.driver_seat.color);
     EXPECT_EQ(COLOR_BLUE, opts->coach.passenger_seat.color);
     EXPECT_EQ(COLOR_BLACK, opts->coach.rear_seat.color);
-    EXPECT_EQ(UCS_CONFIG_ULUNITS_AUTO, opts->vin);
+    EXPECT_EQ(UCS_ULUNITS_AUTO, opts->vin);
     EXPECT_EQ(200UL, opts->engine.power);
 
     EXPECT_EQ(1024.0, opts->bw_bytes);
@@ -344,9 +389,14 @@ UCS_TEST_F(test_config, parse_default) {
     EXPECT_EQ(UCS_MBYTE * 128.0, opts->bw_mbits);
     EXPECT_EQ(UCS_GBYTE * 128.0, opts->bw_gbits);
     EXPECT_EQ(UCS_TBYTE * 128.0, opts->bw_tbits);
+    EXPECT_TRUE(UCS_CONFIG_BW_IS_AUTO(opts->bw_auto));
 
     EXPECT_EQ(UCS_TBYTE * 128.0, opts->can_pci_bw.bw);
     EXPECT_EQ(std::string("mlx5_0"), opts->can_pci_bw.name);
+
+    EXPECT_EQ(UCS_CONFIG_ON, opts->air_conditioning);
+    EXPECT_EQ(UCS_CONFIG_OFF, opts->abs);
+    EXPECT_EQ(UCS_CONFIG_AUTO, opts->transmission);
 }
 
 UCS_TEST_F(test_config, clone) {
@@ -359,7 +409,7 @@ UCS_TEST_F(test_config, clone) {
         /* coverity[tainted_string_argument] */
         ucs::scoped_setenv env2("UCX_PRICE_ALIAS", "0");
         
-        car_opts opts(NULL, NULL);
+        car_opts opts(UCS_DEFAULT_ENV_PREFIX, NULL);
         EXPECT_EQ(COLOR_WHITE, opts->color);
         EXPECT_EQ(0U, opts->price);
 
@@ -373,7 +423,7 @@ UCS_TEST_F(test_config, clone) {
 }
 
 UCS_TEST_F(test_config, set_get) {
-    car_opts opts(NULL, NULL);
+    car_opts opts(UCS_DEFAULT_ENV_PREFIX, NULL);
     EXPECT_EQ(COLOR_RED, opts->color);
     EXPECT_EQ(std::string(color_names[COLOR_RED]),
               std::string(opts.get("COLOR")));
@@ -398,7 +448,7 @@ UCS_TEST_F(test_config, set_get_with_table_prefix) {
     /* coverity[tainted_string_argument] */
     ucs::scoped_setenv env2("UCX_CARS_COLOR", "white");
 
-    car_opts opts(NULL, "CARS_");
+    car_opts opts(UCS_DEFAULT_ENV_PREFIX, "CARS_");
     EXPECT_EQ(COLOR_WHITE, opts->color);
     EXPECT_EQ(std::string(color_names[COLOR_WHITE]),
               std::string(opts.get("COLOR")));
@@ -408,9 +458,9 @@ UCS_TEST_F(test_config, set_get_with_env_prefix) {
     /* coverity[tainted_string_argument] */
     ucs::scoped_setenv env1("UCX_COLOR", "black");
     /* coverity[tainted_string_argument] */
-    ucs::scoped_setenv env2("UCX_TEST_COLOR", "white");
+    ucs::scoped_setenv env2("TEST_UCX_COLOR", "white");
 
-    car_opts opts("TEST", NULL);
+    car_opts opts("TEST_" UCS_DEFAULT_ENV_PREFIX, NULL);
     EXPECT_EQ(COLOR_WHITE, opts->color);
     EXPECT_EQ(std::string(color_names[COLOR_WHITE]),
               std::string(opts.get("COLOR")));
@@ -428,20 +478,59 @@ UCS_TEST_F(test_config, performance) {
 
     /* Now test the time */
     UCS_TEST_TIME_LIMIT(0.05) {
-        car_opts opts(NULL, NULL);
+        car_opts opts(UCS_DEFAULT_ENV_PREFIX, NULL);
     }
+}
+
+UCS_TEST_F(test_config, unused) {
+    ucs::ucx_env_cleanup env_cleanup;
+
+    /* set to warn about unused env vars */
+    ucs_global_opts.warn_unused_env_vars = 1;
+
+    const std::string warn_str    = "unused env variable";
+    const std::string unused_var1 = "UCX_UNUSED_VAR1";
+    /* coverity[tainted_string_argument] */
+    ucs::scoped_setenv env1(unused_var1.c_str(), "unused");
+
+    {
+        config_err_exp_str.push_back(warn_str + ": " + unused_var1);
+        scoped_log_handler log_handler(config_error_handler);
+        car_opts opts(UCS_DEFAULT_ENV_PREFIX, NULL);
+
+        ucs_config_parser_warn_unused_env_vars_once(UCS_DEFAULT_ENV_PREFIX);
+
+        config_err_exp_str.pop_back();
+    }
+
+    {
+        const std::string unused_var2 = "TEST_UNUSED_VAR2";
+        /* coverity[tainted_string_argument] */
+        ucs::scoped_setenv env2(unused_var2.c_str(), "unused");
+
+        config_err_exp_str.push_back(warn_str + ": " + unused_var2);
+        scoped_log_handler log_handler(config_error_handler);
+        car_opts opts("TEST_", NULL);
+
+        ucs_config_parser_warn_unused_env_vars_once("TEST_");
+
+        config_err_exp_str.pop_back();
+    }
+
+    /* reset to not warn about unused env vars */
+    ucs_global_opts.warn_unused_env_vars = 0;
 }
 
 UCS_TEST_F(test_config, dump) {
     /* aliases must not be counted here */
-    test_config_print_opts(UCS_CONFIG_PRINT_CONFIG, 24u);
+    test_config_print_opts(UCS_CONFIG_PRINT_CONFIG, 28u);
 }
 
 UCS_TEST_F(test_config, dump_hidden) {
     /* aliases must be counted here */
     test_config_print_opts((UCS_CONFIG_PRINT_CONFIG |
                             UCS_CONFIG_PRINT_HIDDEN),
-                           29u);
+                           35u);
 }
 
 UCS_TEST_F(test_config, dump_hidden_check_alias_name) {
@@ -449,10 +538,42 @@ UCS_TEST_F(test_config, dump_hidden_check_alias_name) {
     test_config_print_opts((UCS_CONFIG_PRINT_CONFIG |
                             UCS_CONFIG_PRINT_HIDDEN |
                             UCS_CONFIG_PRINT_DOC),
-                           29u);
+                           35u);
 
     test_config_print_opts((UCS_CONFIG_PRINT_CONFIG |
                             UCS_CONFIG_PRINT_HIDDEN |
                             UCS_CONFIG_PRINT_DOC),
-                           29u, "TEST_");
+                           35u, "TEST_");
+}
+
+UCS_TEST_F(test_config, deprecated) {
+    /* set to warn about unused env vars */
+    ucs_global_opts.warn_unused_env_vars = 1;
+
+    const std::string warn_str        = " is deprecated";
+    const std::string deprecated_var1 = "UCX_DRIVER";
+    /* coverity[tainted_string_argument] */
+    ucs::scoped_setenv env1(deprecated_var1.c_str(), "Taxi driver");
+    config_err_exp_str.push_back(deprecated_var1 + warn_str);
+
+    {
+        scoped_log_handler log_handler(config_error_handler);
+        car_opts opts(UCS_DEFAULT_ENV_PREFIX, NULL);
+    }
+
+    {
+        const std::string deprecated_var2 = "UCX_ENGINE_FUEL_LEVEL";
+        /* coverity[tainted_string_argument] */
+        ucs::scoped_setenv env2(deprecated_var2.c_str(), "58");
+        config_err_exp_str.push_back(deprecated_var2 + warn_str);
+
+        scoped_log_handler log_handler_vars(config_error_handler);
+        car_opts opts(UCS_DEFAULT_ENV_PREFIX, NULL);
+        config_err_exp_str.pop_back();
+    }
+
+    config_err_exp_str.pop_back();
+
+    /* reset to not warn about unused env vars */
+    ucs_global_opts.warn_unused_env_vars = 0;
 }

@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "uct_iface.h"
 #include "uct_md.h"
 
@@ -39,9 +43,11 @@ static inline int uct_mem_get_mmap_flags(unsigned uct_mmap_flags)
 {
     int mm_flags = 0;
 
+#ifdef MAP_NONBLOCK
     if (uct_mmap_flags & UCT_MD_MEM_FLAG_NONBLOCK) {
         mm_flags |= MAP_NONBLOCK;
     }
+#endif
 
     if (uct_mmap_flags & UCT_MD_MEM_FLAG_FIXED) {
         mm_flags |= MAP_FIXED;
@@ -63,10 +69,12 @@ ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
     uct_mem_h memh;
     uct_md_h md;
     void *address;
+    int ret;
+#ifdef SHM_HUGETLB
     int shmid;
+#endif
 #ifdef MADV_HUGEPAGE
     ssize_t huge_page_size;
-    int ret;
 #endif
 
     if (min_length == 0) {
@@ -128,9 +136,9 @@ ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
                 }
 
                 ucs_assert(memh != UCT_MEM_HANDLE_NULL);
-                mem->md   = md;
-                mem->mem_type = md_attr.cap.mem_type;
-                mem->memh = memh;
+                mem->md       = md;
+                mem->mem_type = md_attr.cap.access_mem_type;
+                mem->memh     = memh;
                 goto allocated;
 
             }
@@ -157,8 +165,9 @@ ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
                 break;
             }
 
-            address = ucs_memalign(huge_page_size, alloc_length UCS_MEMTRACK_VAL);
-            if (address == NULL) {
+            ret = ucs_posix_memalign(&address, huge_page_size, alloc_length
+                                     UCS_MEMTRACK_VAL);
+            if (ret != 0) {
                 ucs_trace("failed to allocate %zu bytes using THP: %m", alloc_length);
             } else {
                 ret = madvise(address, alloc_length, MADV_HUGEPAGE);
@@ -182,9 +191,9 @@ ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
             }
 
             alloc_length = min_length;
-            address = ucs_memalign(UCS_SYS_CACHE_LINE_SIZE, alloc_length
-                                   UCS_MEMTRACK_VAL);
-            if (address != NULL) {
+            ret = ucs_posix_memalign(&address, UCS_SYS_CACHE_LINE_SIZE,
+                                     alloc_length UCS_MEMTRACK_VAL);
+            if (ret == 0) {
                 goto allocated_without_md;
             }
 
@@ -208,6 +217,7 @@ ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
             break;
 
         case UCT_ALLOC_METHOD_HUGE:
+#ifdef SHM_HUGETLB
             /* Allocate huge pages */
             alloc_length = min_length;
             address = (flags & UCT_MD_MEM_FLAG_FIXED) ? addr : NULL;
@@ -216,6 +226,9 @@ ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
             if (status == UCS_OK) {
                 goto allocated_without_md;
             }
+#else
+            status = UCS_ERR_NO_MEMORY;
+#endif
 
             ucs_trace("failed to allocate %zu bytes from hugetlb: %s",
                       min_length, ucs_status_string(status));
@@ -232,7 +245,7 @@ ucs_status_t uct_mem_alloc(void *addr, size_t min_length, unsigned flags,
 
 allocated_without_md:
     mem->md       = NULL;
-    mem->mem_type = UCT_MD_MEM_TYPE_HOST;
+    mem->mem_type = UCS_MEMORY_TYPE_HOST;
     mem->memh     = UCT_MEM_HANDLE_NULL;
 allocated:
     ucs_trace("allocated %zu bytes at %p using %s", alloc_length, address,
@@ -354,7 +367,7 @@ UCS_PROFILE_FUNC(ucs_status_t, uct_iface_mp_chunk_alloc, (mp, size_p, chunk_p),
     hdr->method = mem.method;
     hdr->length = mem.length;
     hdr->memh   = mem.memh;
-    *size_p       = mem.length - sizeof(*hdr);
+    *size_p     = mem.length - sizeof(*hdr);
     *chunk_p    = hdr + 1;
     return UCS_OK;
 }
@@ -366,7 +379,7 @@ UCS_PROFILE_FUNC_VOID(uct_iface_mp_chunk_release, (mp, chunk),
     uct_iface_mp_chunk_hdr_t *hdr;
     uct_allocated_memory_t mem;
 
-    hdr = chunk - sizeof(*hdr);
+    hdr = UCS_PTR_BYTE_OFFSET(chunk, -sizeof(*hdr));
 
     mem.address = hdr;
     mem.method  = hdr->method;
@@ -384,7 +397,7 @@ static void uct_iface_mp_obj_init(ucs_mpool_t *mp, void *obj, void *chunk)
     uct_iface_mp_chunk_hdr_t *hdr;
 
     init_obj_cb = uct_iface_mp_priv(mp)->init_obj_cb;
-    hdr = chunk - sizeof(*hdr);
+    hdr = UCS_PTR_BYTE_OFFSET(chunk, -sizeof(*hdr));
     if (init_obj_cb != NULL) {
         init_obj_cb(&iface->super, obj, hdr->memh);
     }

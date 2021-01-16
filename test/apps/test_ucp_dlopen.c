@@ -4,6 +4,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include <sys/mman.h>
 #include <dlfcn.h>
 #include <stdio.h>
@@ -18,17 +22,25 @@
 
 int test_ucp_init(void *handle)
 {
-    ucs_status_t (*ucp_init_version_f)(unsigned, unsigned, const ucp_params_t*,
-                                      const ucp_config_t*, ucp_context_h*);
-    void (*ucp_context_print_info_f)(const ucp_context_h, FILE*);
-    void (*ucp_cleanup_f)(ucp_context_h);
+    typedef ucs_status_t (*ucp_init_version_func_t)(unsigned, unsigned,
+                                                    const ucp_params_t *,
+                                                    const ucp_config_t *,
+                                                    ucp_context_h *);
+    typedef void (*ucp_context_print_info_func_t)(const ucp_context_h, FILE*);
+    typedef void (*ucp_cleanup_func_t)(ucp_context_h);
+
+    ucp_init_version_func_t ucp_init_version_f;
+    ucp_context_print_info_func_t ucp_context_print_info_f;
+    ucp_cleanup_func_t ucp_cleanup_f;
     ucp_params_t ucp_params;
     ucs_status_t status;
     ucp_context_h ucph;
 
-    ucp_init_version_f       = dlsym(handle, "ucp_init_version");
-    ucp_cleanup_f            = dlsym(handle, "ucp_cleanup");
-    ucp_context_print_info_f = dlsym(handle, "ucp_context_print_info");
+    ucp_init_version_f       = (ucp_init_version_func_t)dlsym(handle,
+                                                              "ucp_init_version");
+    ucp_cleanup_f            = (ucp_cleanup_func_t)dlsym(handle, "ucp_cleanup");
+    ucp_context_print_info_f = (ucp_context_print_info_func_t)dlsym(handle,
+                                                                    "ucp_context_print_info");
 
     if (!ucp_init_version_f || !ucp_cleanup_f || !ucp_context_print_info_f) {
         fprintf(stderr, "failed to get UCP function pointers\n");
@@ -77,7 +89,8 @@ int main(int argc, char **argv)
                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ptr2 == MAP_FAILED) {
         fprintf(stderr, "mmmap() failed: %m\n");
-        return -1;
+        ret = -1;
+        goto failed_mmap;
     }
 
     /* load ucp */
@@ -85,23 +98,23 @@ int main(int argc, char **argv)
     handle = dlopen(filename, RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) {
         fprintf(stderr, "failed to open %s: %m\n", filename);
-        return -1;
+        ret = -1;
+        goto failed_dlopen;
     }
 
     /* init ucp */
     ret = test_ucp_init(handle);
-    if (ret) {
-        return -1;
-    }
 
     /* unload ucp */
     dlclose(handle);
 
+failed_dlopen:
     /* relase the memory - could break if UCM is unloaded */
     munmap(ptr2, alloc_size);
+failed_mmap:
     free(ptr1);
 
     printf("done\n");
-    return 0;
+    return ret;
 }
 

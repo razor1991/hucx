@@ -1,7 +1,7 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2015.  ALL RIGHTS RESERVED.
 * Copyright (C) ARM Ltd. 2016.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+* Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -14,7 +14,9 @@
 #endif
 
 #include <ucs/sys/compiler_def.h>
+#include <stddef.h>
 
+BEGIN_C_DECLS
 
 /* CPU models */
 typedef enum ucs_cpu_model {
@@ -27,6 +29,8 @@ typedef enum ucs_cpu_model {
     UCS_CPU_MODEL_INTEL_BROADWELL,
     UCS_CPU_MODEL_INTEL_SKYLAKE,
     UCS_CPU_MODEL_ARM_AARCH64,
+    UCS_CPU_MODEL_AMD_NAPLES,
+    UCS_CPU_MODEL_AMD_ROME,
     UCS_CPU_MODEL_LAST
 } ucs_cpu_model_t;
 
@@ -47,6 +51,35 @@ typedef enum ucs_cpu_flag {
     UCS_CPU_FLAG_AVX2       = UCS_BIT(10),
     UCS_CPU_FLAG_CLWB       = UCS_BIT(11)
 } ucs_cpu_flag_t;
+
+
+/* CPU vendors */
+typedef enum ucs_cpu_vendor {
+    UCS_CPU_VENDOR_UNKNOWN,
+    UCS_CPU_VENDOR_INTEL,
+    UCS_CPU_VENDOR_AMD,
+    UCS_CPU_VENDOR_GENERIC_ARM,
+    UCS_CPU_VENDOR_GENERIC_PPC,
+    UCS_CPU_VENDOR_FUJITSU_ARM,
+    UCS_CPU_VENDOR_LAST
+} ucs_cpu_vendor_t;
+
+
+/* CPU cache types */
+typedef enum ucs_cpu_cache_type {
+    UCS_CPU_CACHE_L1d, /**< L1 data cache */
+    UCS_CPU_CACHE_L1i, /**< L1 instruction cache */
+    UCS_CPU_CACHE_L2,  /**< L2 cache */
+    UCS_CPU_CACHE_L3,  /**< L3 cache */
+    UCS_CPU_CACHE_LAST
+} ucs_cpu_cache_type_t;
+
+
+/* Built-in memcpy settings */
+typedef struct ucs_cpu_builtin_memcpy {
+    size_t min;
+    size_t max;
+} ucs_cpu_builtin_memcpy_t;
 
 
 /* System constants */
@@ -72,6 +105,25 @@ static inline void ucs_clear_cache(void *start, void *end);
 #define UCS_SYS_CACHE_LINE_SIZE    UCS_ARCH_CACHE_LINE_SIZE
 #endif
 
+/* Array of default built-in memcpy settings for different CPU architectures */
+extern const ucs_cpu_builtin_memcpy_t ucs_cpu_builtin_memcpy[UCS_CPU_VENDOR_LAST];
+
+#if HAVE___CLEAR_CACHE
+/* libc routine declaration */
+void __clear_cache(void* beg, void* end);
+#endif
+
+/**
+ * Get size of CPU cache.
+ *
+ * @param type  Cache type.
+ * @param value Filled with the cache size.
+ * 
+ * @return Cache size value or 0 if cache is not supported or can't be read.
+ */
+size_t ucs_cpu_get_cache_size(ucs_cpu_cache_type_t type);
+
+
 /**
  * Clear processor data and instruction caches, intended for
  * self-modifying code.
@@ -82,9 +134,6 @@ static inline void ucs_clear_cache(void *start, void *end);
 static inline void ucs_clear_cache(void *start, void *end)
 {
 #if HAVE___CLEAR_CACHE
-    /* do not allow global declaration of compiler intrinsic */
-    void __clear_cache(void* beg, void* end);
-
     __clear_cache(start, end);
 #else
     ucs_arch_clear_cache(start, end);
@@ -101,5 +150,21 @@ static inline void ucs_writeback_cache(void *start, void *end)
 {
     ucs_arch_writeback_cache(start, end);
 }
+
+/**
+ * Get memory copy bandwidth.
+ * 
+ * @return Memory copy bandwidth estimation based on CPU used.
+ */
+double ucs_cpu_get_memcpy_bw();
+
+
+static inline int ucs_cpu_prefer_relaxed_order()
+{
+    return ucs_arch_get_cpu_vendor() == UCS_CPU_VENDOR_FUJITSU_ARM;
+}
+
+
+END_C_DECLS
 
 #endif

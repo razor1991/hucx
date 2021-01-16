@@ -16,6 +16,6 @@ git fetch --all
 git checkout -t origin/master -f
 git pull
 git submodule update --init --recursive --remote
-cp -f ../doc/doxygen-doc/ucx.pdf ./
+cp -f ../docs/doxygen-doc/ucx.pdf ./
 git commit ucx.pdf -m "update ucx.pdf for $rev"
 git push

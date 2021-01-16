@@ -13,10 +13,7 @@ libuct_ib_la_CFLAGS   = $(BASE_CFLAGS)
 libuct_ib_la_LIBADD   = $(top_builddir)/src/ucs/libucs.la \
                         $(top_builddir)/src/uct/libuct.la
 libuct_ib_la_LDFLAGS  = $(IBVERBS_LDFLAGS) $(NUMA_LIBS) -version-info $(SOVERSION)
-libmlx5_ver           = $(shell (rpm -qf $(IBVERBS_DIR)/include/infiniband/mlx5_hw.h &>/dev/null && rpm -qf /usr/include/infiniband/mlx5_hw.h) | head -1)
-libuct_ib_ladir       = $(includedir)/uct/ib
-
-nobase_dist_libuct_ib_la_HEADERS =
+libmlx5_ver           = $(shell (rpm -qf $(IBVERBS_DIR)/include/infiniband/mlx5_hw.h &>/dev/null && rpm -qf /usr/include/infiniband/mlx5_hw.h) | grep -v 'not owned' | head -1)
 
 noinst_HEADERS = \
 	base/ib_device.h \
@@ -31,15 +28,6 @@ libuct_ib_la_SOURCES = \
 	base/ib_log.c \
 	base/ib_md.c
 
-devel_headers = \
-	base/ib_alloc.h
-
-if INSTALL_DEVEL_HEADERS
-nobase_dist_libuct_ib_la_HEADERS += $(devel_headers)
-else
-noinst_HEADERS += $(devel_headers)
-endif
-
 # TODO separate module for mlx5
 if HAVE_MLX5_HW
 libuct_ib_la_CPPFLAGS += -DUCT_IB_LIBMLX5_VER=\"$(libmlx5_ver)\"
@@ -48,18 +36,29 @@ noinst_HEADERS += \
 	mlx5/ib_mlx5_log.h \
 	mlx5/ib_mlx5.h \
 	mlx5/ib_mlx5.inl \
-	mlx5/ib_mlx5_dv.h \
-	mlx5/ib_mlx5_hw.h \
-	mlx5/ib_mlx5_ifc.h
+	mlx5/dv/ib_mlx5_dv.h \
+	mlx5/dv/ib_mlx5_ifc.h \
+	mlx5/exp/ib_mlx5_hw.h
 
 libuct_ib_la_SOURCES += \
 	mlx5/ib_mlx5_log.c \
-	mlx5/ib_mlx5.c \
-	mlx5/ib_mlx5_dv.c \
-	mlx5/ib_mlx5_hw.c
+	mlx5/ib_mlx5.c
+
+if HAVE_EXP
+noinst_HEADERS += \
+	mlx5/exp/ib_exp.h
+
+libuct_ib_la_SOURCES += \
+	mlx5/exp/ib_mlx5_hw.c \
+	mlx5/exp/ib_exp.c \
+	mlx5/exp/ib_exp_md.c
+endif # HAVE_EXP
 
 if HAVE_MLX5_DV
 libuct_ib_la_LDFLAGS +=  $(LIB_MLX5)
+libuct_ib_la_SOURCES += \
+	mlx5/dv/ib_mlx5_dv.c \
+	mlx5/dv/ib_mlx5dv_md.c
 endif # HAVE_MLX5_DV
 
 endif # HAVE_MLX5_HW
@@ -91,6 +90,11 @@ libuct_ib_la_SOURCES += \
 	rc/accel/rc_mlx5_common.c
 endif # HAVE_MLX5_HW
 
+if HAVE_DEVX
+libuct_ib_la_SOURCES += \
+	rc/accel/rc_mlx5_devx.c
+endif # HAVE_DEVX
+
 endif # HAVE_TL_RC
 
 
@@ -102,6 +106,12 @@ noinst_HEADERS += \
 libuct_ib_la_SOURCES += \
 	dc/dc_mlx5_ep.c \
 	dc/dc_mlx5.c
+
+if HAVE_DEVX
+libuct_ib_la_SOURCES += \
+	dc/dc_mlx5_devx.c
+endif # HAVE_DEVX
+
 endif # HAVE_TL_DC
 
 

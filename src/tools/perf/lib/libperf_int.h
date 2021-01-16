@@ -25,23 +25,31 @@ BEGIN_C_DECLS
 
 #define TIMING_QUEUE_SIZE    2048
 #define UCT_PERF_TEST_AM_ID  5
+#define ADDR_BUF_SIZE        2048
 
 
-typedef struct ucx_perf_context  ucx_perf_context_t;
-typedef struct uct_peer          uct_peer_t;
-typedef struct ucp_peer          ucp_peer_t;
-typedef struct ucp_perf_request  ucp_perf_request_t;
+typedef struct ucx_perf_context        ucx_perf_context_t;
+typedef struct uct_peer                uct_peer_t;
+typedef struct ucp_perf_request        ucp_perf_request_t;
+typedef struct ucx_perf_thread_context ucx_perf_thread_context_t;
 
 
 struct ucx_perf_allocator {
+    ucs_memory_type_t mem_type;
     ucs_status_t (*init)(ucx_perf_context_t *perf);
-    ucs_status_t (*ucp_alloc)(ucx_perf_context_t *perf, size_t length,
+    ucs_status_t (*ucp_alloc)(const ucx_perf_context_t *perf, size_t length,
                               void **address_p, ucp_mem_h *memh, int non_blk_flag);
-    void         (*ucp_free)(ucx_perf_context_t *perf, void *address,
+    void         (*ucp_free)(const ucx_perf_context_t *perf, void *address,
                              ucp_mem_h memh);
-    void*        (*memset)(void *s, int c, size_t len);
+    ucs_status_t (*uct_alloc)(const ucx_perf_context_t *perf, size_t length,
+                              unsigned flags, uct_allocated_memory_t *alloc_mem);
+    void         (*uct_free)(const ucx_perf_context_t *perf,
+                             uct_allocated_memory_t *alloc_mem);
+    void         (*memcpy)(void *dst, ucs_memory_type_t dst_mem_type,
+                           const void *src, ucs_memory_type_t src_mem_type,
+                           size_t count);
+    void*        (*memset)(void *dst, int value, size_t count);
 };
-
 
 struct ucx_perf_context {
     ucx_perf_params_t            params;
@@ -49,7 +57,6 @@ struct ucx_perf_context {
     /* Buffers */
     void                         *send_buffer;
     void                         *recv_buffer;
-    ptrdiff_t                    offset;
 
     /* Measurements */
     double                       start_time_acc;  /* accurate start time */
@@ -73,26 +80,39 @@ struct ucx_perf_context {
 
     union {
         struct {
-            ucs_async_context_t  async;
-            uct_md_h             md;
-            uct_worker_h         worker;
-            uct_iface_h          iface;
-            uct_peer_t           *peers;
+            ucs_async_context_t    async;
+            uct_component_h        cmpt;
+            uct_md_h               md;
+            uct_worker_h           worker;
+            uct_iface_h            iface;
+            uct_peer_t             *peers;
             uct_allocated_memory_t send_mem;
             uct_allocated_memory_t recv_mem;
-            uct_iov_t            *iov;
+            uct_iov_t              *iov;
         } uct;
 
         struct {
-            ucp_context_h        context;
-            ucp_worker_h         worker;
-            ucp_peer_t           *peers;
-            ucp_mem_h            send_memh;
-            ucp_mem_h            recv_memh;
-            ucp_dt_iov_t         *send_iov;
-            ucp_dt_iov_t         *recv_iov;
+            ucp_context_h              context;
+            ucx_perf_thread_context_t* tctx;
+            ucp_worker_h               worker;
+            ucp_ep_h                   ep;
+            ucp_rkey_h                 rkey;
+            unsigned long              remote_addr;
+            ucp_mem_h                  send_memh;
+            ucp_mem_h                  recv_memh;
+            ucp_dt_iov_t               *send_iov;
+            ucp_dt_iov_t               *recv_iov;
         } ucp;
     };
+};
+
+
+struct ucx_perf_thread_context {
+    pthread_t           pt;
+    int                 tid;
+    ucs_status_t        status;
+    ucx_perf_context_t  perf;
+    ucx_perf_result_t   result;
 };
 
 
@@ -100,13 +120,6 @@ struct uct_peer {
     uct_ep_h                     ep;
     unsigned long                remote_addr;
     uct_rkey_bundle_t            rkey;
-};
-
-
-struct ucp_peer {
-    ucp_ep_h                     ep;
-    unsigned long                remote_addr;
-    ucp_rkey_h                   rkey;
 };
 
 
@@ -123,6 +136,9 @@ struct ucp_perf_request {
 
 
 void ucx_perf_test_start_clock(ucx_perf_context_t *perf);
+
+
+void uct_perf_ep_flush_b(ucx_perf_context_t *perf, int peer_index);
 
 
 void uct_perf_iface_flush_b(ucx_perf_context_t *perf);
@@ -155,6 +171,15 @@ static inline void ucx_perf_get_time(ucx_perf_context_t *perf)
     perf->current.time_acc = ucs_get_accurate_time();
 }
 
+static inline void ucx_perf_omp_barrier(ucx_perf_context_t *perf)
+{
+#if _OPENMP
+    if (perf->params.thread_count > 1) {
+#pragma omp barrier
+    }
+#endif
+}
+
 static inline void ucx_perf_update(ucx_perf_context_t *perf,
                                    ucx_perf_counter_t iters, size_t bytes)
 {
@@ -177,18 +202,8 @@ static inline void ucx_perf_update(ucx_perf_context_t *perf,
     if (perf->current.time - perf->prev.time >= perf->report_interval) {
         ucx_perf_get_time(perf);
 
-        /* Disable all other threads' report generation and output.
-         * The master clause cannot be used here as the unit test
-         * uct_test_perf runs on single pthreads with no parallel region,
-         * using that clause will result in undefined behavior.
-         */
-#if _OPENMP
-        if (omp_get_thread_num() == 0)
-#endif /* _OPENMP */
-        {
-            ucx_perf_calc_result(perf, &result);
-            rte_call(perf, report, &result, perf->params.report_arg, 0);
-        }
+        ucx_perf_calc_result(perf, &result);
+        rte_call(perf, report, &result, perf->params.report_arg, 0, 0);
 
         perf->prev = perf->current;
     }
@@ -212,7 +227,6 @@ size_t ucx_perf_get_message_size(const ucx_perf_params_t *params)
 
     return length;
 }
-
 
 END_C_DECLS
 

@@ -2,13 +2,19 @@
 # Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
 # Copyright (C) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
 # Copyright (C) ARM Ltd. 2017.  ALL RIGHTS RESERVED.
-# Copyright (C) Huawei Technologies Co.,Ltd. 2020. ALL RIGHTS RESERVED.
+# Copyright (C) Huawei Technologies Co.,Ltd. 2019-2021. ALL RIGHTS RESERVED.
 #
 # See file LICENSE for terms.
 #
 
+SUBDIRS = profiling
+
+if HAVE_GLIBCXX_NOTHROW
+SUBDIRS += iodemo
+endif
+
 if HAVE_CXX11
-SUBDIRS = sockaddr
+SUBDIRS += sockaddr
 endif
 
 noinst_PROGRAMS = \

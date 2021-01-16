@@ -1,9 +1,12 @@
 /**
 * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
-* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include "libstats.h"
 
@@ -69,8 +72,8 @@ SGLIB_DEFINE_HASHED_CONTAINER_FUNCTIONS(ucs_stats_clsid_t, UCS_STATS_CLS_HASH_SI
 
 #define FREAD(_buf, _size, _stream) \
     { \
-        size_t nread = fread(_buf, 1, _size, _stream); \
-        assert(nread == _size); \
+        size_t _nread = fread(_buf, 1, _size, _stream); \
+        assert(_nread == _size); \
     }
 
 #define FWRITE(_buf, _size, _stream) \
@@ -178,7 +181,7 @@ static void ucs_stats_write_counters(ucs_stats_counter_t *counters,
     const unsigned counters_per_byte = 8 / UCS_STATS_BITS_PER_COUNTER;
     ucs_stats_counter_t value;
     uint8_t *counter_desc, v;
-    void *counter_data, *pos;
+    char *counter_data, *pos;
     size_t counter_desc_size;
     unsigned i;
 
@@ -263,7 +266,7 @@ ucs_stats_serialize_binary(FILE *stream, ucs_stats_node_t *root,
     ucs_stats_class_t *cls;
     ucs_stats_clsid_t *elem;
     ucs_stats_data_header_t hdr;
-    unsigned index, counter;
+    unsigned idx, counter;
 
     sglib_hashed_ucs_stats_clsid_t_init(cls_hash);
 
@@ -276,7 +279,7 @@ ucs_stats_serialize_binary(FILE *stream, ucs_stats_node_t *root,
     FWRITE_ONE(&hdr, stream);
 
     /* Write stats node classes */
-    index = 0;
+    idx = 0;
     for (elem = sglib_hashed_ucs_stats_clsid_t_it_init(&it, cls_hash);
          elem != NULL; elem = sglib_hashed_ucs_stats_clsid_t_it_next(&it))
     {
@@ -286,10 +289,10 @@ ucs_stats_serialize_binary(FILE *stream, ucs_stats_node_t *root,
         for (counter = 0; counter < cls->num_counters; ++counter) {
             ucs_stats_write_str(cls->counter_names[counter], stream);
         }
-        elem->clsid = index++;
+        elem->clsid = idx++;
     }
 
-    assert(index == hdr.num_classes);
+    assert(idx == hdr.num_classes);
 
     /* Write stats nodes */
     ucs_stats_serialize_binary_recurs(stream, root, sel, cls_hash);
@@ -448,7 +451,7 @@ ucs_stats_deserialize_recurs(FILE *stream, ucs_stats_class_t **classes,
         return UCS_ERR_NO_MEMORY;
     }
 
-    node = ptr + headroom;
+    node = UCS_PTR_BYTE_OFFSET(ptr, headroom);
 
     node->cls = cls;
     FREAD(node->name, namelen, stream);
@@ -571,7 +574,6 @@ static void ucs_stats_free_recurs(ucs_stats_node_t *node)
     }
     ucs_list_for_each_safe(child, tmp, &node->children[UCS_STATS_INACTIVE_CHILDREN], list) {
         ucs_stats_free_recurs(child);
-        free(child->cls);
         free(child);
     }
 }
@@ -584,6 +586,5 @@ void ucs_stats_free(ucs_stats_node_t *root)
     ucs_stats_free_recurs(&s->node);
     ucs_stats_free_classes(s->classes, s->num_classes);
     free(s);
-    s = NULL;
 }
 

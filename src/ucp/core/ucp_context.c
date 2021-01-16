@@ -1,30 +1,34 @@
 /**
  * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
  * Copyright (C) ARM Ltd. 2016.  ALL RIGHTS RESERVED.
- * Copyright (C) Huawei Technologies Co., Ltd. 2019-2020.  ALL RIGHTS RESERVED.
+ * Copyright (C) NVIDIA Corporation. 2019.  ALL RIGHTS RESERVED.
+ * Copyright (C) Huawei Technologies Co., Ltd. 2019-2021.  ALL RIGHTS RESERVED.
  *
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ucp_context.h"
 #include "ucp_request.h"
-#include <ucp/proto/proto.h>
 
 #include <ucs/config/parser.h>
 #include <ucs/algorithm/crc.h>
 #include <ucs/datastruct/mpool.inl>
 #include <ucs/datastruct/queue.h>
+#include <ucs/datastruct/string_set.h>
 #include <ucs/debug/log.h>
 #include <ucs/debug/debug.h>
 #include <ucs/sys/compiler.h>
 #include <ucs/sys/string.h>
-#include <ucs/arch/bitops.h>
 #include <string.h>
 
 
 #define UCP_RSC_CONFIG_ALL    "all"
 
-ucp_am_handler_t ucp_am_handlers[UCP_AM_ID_MAX] = {{0}};
+ucp_am_handler_t ucp_am_handlers[UCP_AM_ID_MAX] = {{0, NULL, NULL}};
 
 static const char *ucp_atomic_modes[] = {
     [UCP_ATOMIC_MODE_CPU]    = "cpu",
@@ -45,13 +49,6 @@ static const char * ucp_rndv_modes[] = {
     [UCP_RNDV_MODE_PUT_ZCOPY] = "put_zcopy",
     [UCP_RNDV_MODE_AUTO]      = "auto",
     [UCP_RNDV_MODE_LAST]      = NULL,
-};
-
-uct_memory_type_t ucm_to_uct_mem_type_map[] = {
-    [UCM_MEM_TYPE_CUDA]         = UCT_MD_MEM_TYPE_CUDA,
-    [UCM_MEM_TYPE_CUDA_MANAGED] = UCT_MD_MEM_TYPE_CUDA_MANAGED,
-    [UCM_MEM_TYPE_ROCM]         = UCT_MD_MEM_TYPE_ROCM,
-    [UCM_MEM_TYPE_ROCM_MANAGED] = UCT_MD_MEM_TYPE_ROCM_MANAGED,
 };
 
 static ucs_config_field_t ucp_config_table[] = {
@@ -77,16 +74,21 @@ static ucs_config_field_t ucp_config_table[] = {
 
   {"TLS", UCP_RSC_CONFIG_ALL,
    "Comma-separated list of transports to use. The order is not meaningful.\n"
-   " - all    : use all the available transports.\n"
-   " - sm/shm : all shared memory transports.\n"
-   " - mm     : shared memory transports - only memory mappers.\n"
-   " - ugni   : ugni_rdma and ugni_udt.\n"
-   " - ib     : all infiniband transports.\n"
-   " - rc     : rc verbs (uses ud for bootstrap).\n"
-   " - rc_x   : rc with accelerated verbs (uses ud_x for bootstrap).\n"
-   " - ud     : ud verbs.\n"
-   " - ud_x   : ud with accelerated verbs.\n"
-   " - dc_x   : dc with accelerated verbs.\n"
+   " - all     : use all the available transports.\n"
+   " - sm/shm  : all shared memory transports (mm, cma, knem).\n"
+   " - mm      : shared memory transports - only memory mappers.\n"
+   " - ugni    : ugni_smsg and ugni_rdma (uses ugni_udt for bootstrap).\n"
+   " - ib      : all infiniband transports (rc/rc_mlx5, ud/ud_mlx5, dc_mlx5).\n"
+   " - rc_v    : rc verbs (uses ud for bootstrap).\n"
+   " - rc_x    : rc with accelerated verbs (uses ud_mlx5 for bootstrap).\n"
+   " - rc      : rc_v and rc_x (preferably if available).\n"
+   " - ud_v    : ud verbs.\n"
+   " - ud_x    : ud with accelerated verbs.\n"
+   " - ud      : ud_v and ud_x (preferably if available).\n"
+   " - dc/dc_x : dc with accelerated verbs.\n"
+   " - tcp     : sockets over TCP/IP.\n"
+   " - cuda    : CUDA (NVIDIA GPU) memory support.\n"
+   " - rocm    : ROCm (AMD GPU) memory support.\n"
    " Using a \\ prefix before a transport name treats it as an explicit transport name\n"
    " and disables aliasing.\n",
    ucs_offsetof(ucp_config_t, tls), UCS_CONFIG_TYPE_STRING_ARRAY},
@@ -94,11 +96,16 @@ static ucs_config_field_t ucp_config_table[] = {
   {"ALLOC_PRIO", "md:sysv,md:posix,huge,thp,md:*,mmap,heap",
    "Priority of memory allocation methods. Each item in the list can be either\n"
    "an allocation method (huge, thp, mmap, libc) or md:<NAME> which means to use the\n"
-   "specified memory domain for allocation. NAME can be either a MD component\n"
-   "name, or a wildcard - '*' - which expands to all MD components.",
+   "specified memory domain for allocation. NAME can be either a UCT component\n"
+   "name, or a wildcard - '*' - which is equivalent to all UCT components.",
    ucs_offsetof(ucp_config_t, alloc_prio), UCS_CONFIG_TYPE_STRING_ARRAY},
 
-  {"SOCKADDR_AUX_TLS", "ud,ud_x",
+  {"SOCKADDR_TLS_PRIORITY", "rdmacm,sockcm",
+   "Priority of sockaddr transports for client/server connection establishment.\n"
+   "The '*' wildcard expands to all the available sockaddr transports.",
+   ucs_offsetof(ucp_config_t, sockaddr_cm_tls), UCS_CONFIG_TYPE_STRING_ARRAY},
+
+  {"SOCKADDR_AUX_TLS", "ud",
    "Transports to use for exchanging additional address information while\n"
    "establishing client/server connection. ",
    ucs_offsetof(ucp_config_t, sockaddr_aux_tls), UCS_CONFIG_TYPE_STRING_ARRAY},
@@ -130,6 +137,11 @@ static ucs_config_field_t ucp_config_table[] = {
    "the eager_zcopy protocol",
    ucs_offsetof(ucp_config_t, ctx.rndv_perf_diff), UCS_CONFIG_TYPE_DOUBLE},
 
+  {"MULTI_LANE_MAX_RATIO", "10",
+   "Maximal allowed ratio between slowest and fastest lane in a multi-lane "
+   "protocol. Lanes slower than the specified ratio will not be used.",
+   ucs_offsetof(ucp_config_t, ctx.multi_lane_max_ratio), UCS_CONFIG_TYPE_DOUBLE},
+
   {"MAX_EAGER_LANES", NULL, "",
    ucs_offsetof(ucp_config_t, ctx.max_eager_lanes), UCS_CONFIG_TYPE_UINT},
 
@@ -151,13 +163,17 @@ static ucs_config_field_t ucp_config_table[] = {
    " auto      - runtime automatically chooses optimal scheme to use.\n",
    ucs_offsetof(ucp_config_t, ctx.rndv_mode), UCS_CONFIG_TYPE_ENUM(ucp_rndv_modes)},
 
+  {"RKEY_PTR_SEG_SIZE", "512k",
+   "Segment size that is used to perform data transfer when doing RKEY PTR progress",
+   ucs_offsetof(ucp_config_t, ctx.rkey_ptr_seg_size), UCS_CONFIG_TYPE_MEMUNITS},
+
   {"ZCOPY_THRESH", "auto",
    "Threshold for switching from buffer copy to zero copy protocol",
    ucs_offsetof(ucp_config_t, ctx.zcopy_thresh), UCS_CONFIG_TYPE_MEMUNITS},
 
-  {"BCOPY_BW", "5800mb",
+  {"BCOPY_BW", "auto",
    "Estimation of buffer copy bandwidth",
-   ucs_offsetof(ucp_config_t, ctx.bcopy_bw), UCS_CONFIG_TYPE_MEMUNITS},
+   ucs_offsetof(ucp_config_t, ctx.bcopy_bw), UCS_CONFIG_TYPE_BW},
 
   {"ATOMIC_MODE", "guess",
    "Atomic operations synchronization mode.\n"
@@ -170,14 +186,18 @@ static ucs_config_field_t ucp_config_table[] = {
    "          Otherwise the CPU mode is selected.",
    ucs_offsetof(ucp_config_t, ctx.atomic_mode), UCS_CONFIG_TYPE_ENUM(ucp_atomic_modes)},
 
-  {"MAX_WORKER_NAME", UCS_PP_MAKE_STRING(UCP_WORKER_NAME_MAX),
-   "Maximal length of worker name. "
+  {"ADDRESS_DEBUG_INFO",
 #if ENABLE_DEBUG_DATA
-   "Sent to remote peer as part of worker address."
+   "y",
 #else
-   "Not sent to remote peer per build configuration."
+   "n",
 #endif
-   ,
+   "Add debugging information to worker address.",
+   ucs_offsetof(ucp_config_t, ctx.address_debug_info), UCS_CONFIG_TYPE_BOOL},
+
+  {"MAX_WORKER_NAME", UCS_PP_MAKE_STRING(UCP_WORKER_NAME_MAX),
+   "Maximal length of worker name. Sent to remote peer as part of worker address\n"
+   "if UCX_ADDRESS_DEBUG_INFO is set to 'yes'",
    ucs_offsetof(ucp_config_t, ctx.max_worker_name), UCS_CONFIG_TYPE_UINT},
 
   {"USE_MT_MUTEX", "n", "Use mutex for multithreading support in UCP.\n"
@@ -214,6 +234,11 @@ static ucs_config_field_t ucp_config_table[] = {
    "cases (non-contig buffer, or sender wildcard).",
    ucs_offsetof(ucp_config_t, ctx.tm_force_thresh), UCS_CONFIG_TYPE_MEMUNITS},
 
+  {"TM_SW_RNDV", "n",
+   "Use software rendezvous protocol with tag offload. If enabled, tag offload\n"
+   "mode will be used for messages sent with eager protocol only.",
+   ucs_offsetof(ucp_config_t, ctx.tm_sw_rndv), UCS_CONFIG_TYPE_BOOL},
+
   {"NUM_EPS", "auto",
    "An optimization hint of how many endpoints would be created on this context.\n"
    "Does not affect semantics, but only transport selection criteria and the\n"
@@ -222,12 +247,22 @@ static ucs_config_field_t ucp_config_table[] = {
    "to ucp_init()",
    ucs_offsetof(ucp_config_t, ctx.estimated_num_eps), UCS_CONFIG_TYPE_ULUNITS},
 
-  {"RNDV_FRAG_SIZE", "256k",
+  {"NUM_PPN", "auto",
+   "An optimization hint for the number of processes expected to be launched\n"
+   "on a single node. Does not affect semantics, only transport selection criteria\n"
+   "and the resulting performance.\n",
+   ucs_offsetof(ucp_config_t, ctx.estimated_num_ppn), UCS_CONFIG_TYPE_ULUNITS},
+
+  {"RNDV_FRAG_SIZE", "512k",
    "RNDV fragment size \n",
    ucs_offsetof(ucp_config_t, ctx.rndv_frag_size), UCS_CONFIG_TYPE_MEMUNITS},
 
+  {"RNDV_PIPELINE_SEND_THRESH", "inf",
+   "RNDV size threshold to enable sender side pipeline for mem type\n",
+   ucs_offsetof(ucp_config_t, ctx.rndv_pipeline_send_thresh), UCS_CONFIG_TYPE_MEMUNITS},
+
   {"MEMTYPE_CACHE", "y",
-   "Enable memory type(cuda) cache \n",
+   "Enable memory type (cuda/rocm) cache \n",
    ucs_offsetof(ucp_config_t, ctx.enable_memtype_cache), UCS_CONFIG_TYPE_BOOL},
 
   {"FLUSH_WORKER_EPS", "y",
@@ -242,29 +277,60 @@ static ucs_config_field_t ucp_config_table[] = {
    "of all entities which connect to each other are the same.",
    ucs_offsetof(ucp_config_t, ctx.unified_mode), UCS_CONFIG_TYPE_BOOL},
 
+  {"SOCKADDR_CM_ENABLE", "n" /* TODO: set try by default */,
+   "Enable alternative wireup protocol for sockaddr connected endpoints.\n"
+   "Enabling this mode changes underlying UCT mechanism for connection\n"
+   "establishment and enables synchronized close protocol which does not\n"
+   "require out of band synchronization before destroying UCP resources.",
+   ucs_offsetof(ucp_config_t, ctx.sockaddr_cm_enable), UCS_CONFIG_TYPE_TERNARY},
+
+  {"PROTO_ENABLE", "n",
+   "Experimental: enable new protocol selection logic",
+   ucs_offsetof(ucp_config_t, ctx.proto_enable), UCS_CONFIG_TYPE_BOOL},
+
   {NULL}
 };
 UCS_CONFIG_REGISTER_TABLE(ucp_config_table, "UCP context", NULL, ucp_config_t)
 
 
 static ucp_tl_alias_t ucp_tl_aliases[] = {
-  { "sm",    { "mm", "knem", "cma", "rdmacm", NULL } },
-  { "shm",   { "mm", "knem", "cma", "rdmacm", NULL } },
-  { "ib",    { "rc", "ud", "rc_mlx5", "ud_mlx5", "dc_mlx5", "rdmacm", NULL } },
-  { "ud",    { "ud", "rdmacm", NULL } },
+  { "mm",    { "posix", "sysv", "xpmem" } }, /* for backward compatibility */
+  { "sm",    { "posix", "sysv", "xpmem", "knem", "cma", "rdmacm", "sockcm", NULL } },
+  { "shm",   { "posix", "sysv", "xpmem", "knem", "cma", "rdmacm", "sockcm", NULL } },
+  { "ib",    { "rc_verbs", "ud_verbs", "rc_mlx5", "ud_mlx5", "dc_mlx5", "rdmacm", NULL } },
+  { "ud_v",  { "ud_verbs", "rdmacm", NULL } },
   { "ud_x",  { "ud_mlx5", "rdmacm", NULL } },
-  { "rc",    { "rc", "ud:aux", "rdmacm", NULL } },
+  { "ud",    { "ud_mlx5", "ud_verbs", "rdmacm", NULL } },
+  { "rc_v",  { "rc_verbs", "ud_verbs:aux", "rdmacm", NULL } },
   { "rc_x",  { "rc_mlx5", "ud_mlx5:aux", "rdmacm", NULL } },
+  { "rc",    { "rc_mlx5", "ud_mlx5:aux", "rc_verbs", "ud_verbs:aux", "rdmacm", NULL } },
   { "dc",    { "dc_mlx5", "rdmacm", NULL } },
   { "dc_x",  { "dc_mlx5", "rdmacm", NULL } },
   { "ugni",  { "ugni_smsg", "ugni_udt:aux", "ugni_rdma", NULL } },
+  { "cuda",  { "cuda_copy", "cuda_ipc", "gdr_copy", NULL } },
+  { "rocm",  { "rocm_copy", "rocm_ipc", "rocm_gdr", NULL } },
   { NULL }
+};
+
+
+const char *ucp_feature_str[] = {
+    [ucs_ilog2(UCP_FEATURE_TAG)]    = "UCP_FEATURE_TAG",
+    [ucs_ilog2(UCP_FEATURE_RMA)]    = "UCP_FEATURE_RMA",
+    [ucs_ilog2(UCP_FEATURE_AMO32)]  = "UCP_FEATURE_AMO32",
+    [ucs_ilog2(UCP_FEATURE_AMO64)]  = "UCP_FEATURE_AMO64",
+    [ucs_ilog2(UCP_FEATURE_WAKEUP)] = "UCP_FEATURE_WAKEUP",
+    [ucs_ilog2(UCP_FEATURE_STREAM)] = "UCP_FEATURE_STREAM",
+    [ucs_ilog2(UCP_FEATURE_AM)]     = "UCP_FEATURE_AM",
+    [ucs_ilog2(UCP_FEATURE_GROUPS)] = "UCP_FEATURE_GROUPS",
+    NULL
 };
 
 
 ucs_status_t ucp_config_read(const char *env_prefix, const char *filename,
                              ucp_config_t **config_p)
 {
+    unsigned full_prefix_len = sizeof(UCS_DEFAULT_ENV_PREFIX) + 1;
+    unsigned env_prefix_len  = 0;
     ucp_config_t *config;
     ucs_status_t status;
 
@@ -274,16 +340,37 @@ ucs_status_t ucp_config_read(const char *env_prefix, const char *filename,
         goto err;
     }
 
-    status = ucs_config_parser_fill_opts(config, ucp_config_table, env_prefix,
-                                         NULL, 0);
+    if (env_prefix != NULL) {
+        env_prefix_len   = strlen(env_prefix);
+        full_prefix_len += env_prefix_len;
+    }
+
+    config->env_prefix = ucs_malloc(full_prefix_len, "ucp config");
+    if (config->env_prefix == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_free_config;
+    }
+
+    if (env_prefix_len != 0) {
+        ucs_snprintf_zero(config->env_prefix, full_prefix_len, "%s_%s",
+                          env_prefix, UCS_DEFAULT_ENV_PREFIX);
+    } else {
+        ucs_snprintf_zero(config->env_prefix, full_prefix_len, "%s",
+                          UCS_DEFAULT_ENV_PREFIX);
+    }
+
+    status = ucs_config_parser_fill_opts(config, ucp_config_table,
+                                         config->env_prefix, NULL, 0);
     if (status != UCS_OK) {
-        goto err_free;
+        goto err_free_prefix;
     }
 
     *config_p = config;
     return UCS_OK;
 
-err_free:
+err_free_prefix:
+    ucs_free(config->env_prefix);
+err_free_config:
     ucs_free(config);
 err:
     return status;
@@ -292,6 +379,7 @@ err:
 void ucp_config_release(ucp_config_t *config)
 {
     ucs_config_parser_release_opts(config, ucp_config_table);
+    ucs_free(config->env_prefix);
     ucs_free(config);
 }
 
@@ -304,8 +392,8 @@ ucs_status_t ucp_config_modify(ucp_config_t *config, const char *name,
 void ucp_config_print(const ucp_config_t *config, FILE *stream,
                       const char *title, ucs_config_print_flags_t print_flags)
 {
-    ucs_config_parser_print_opts(stream, title, config, ucp_config_table, NULL,
-                                 print_flags);
+    ucs_config_parser_print_opts(stream, title, config, ucp_config_table,
+                                 NULL, UCS_DEFAULT_ENV_PREFIX, print_flags);
 }
 
 /* Search str in the array. If str_suffix is specified, search for
@@ -440,7 +528,8 @@ static int ucp_is_resource_in_transports_list(const char *tl_name,
              */
             alias_arr_count = ucp_tl_alias_count(alias);
             snprintf(info, sizeof(info), "for alias '%s'", alias->alias);
-            tmp_rsc_flags = 0;
+            dummy_mask      = 0;
+            tmp_rsc_flags   = 0;
             tmp_tl_cfg_mask = 0;
             if (ucp_config_is_tl_enabled(names, count, alias->alias, 1,
                                          &tmp_rsc_flags, &tmp_tl_cfg_mask) &&
@@ -483,7 +572,7 @@ static int ucp_is_resource_enabled(const uct_tl_resource_desc_t *resource,
 }
 
 static void ucp_add_tl_resource_if_enabled(ucp_context_h context, ucp_tl_md_t *md,
-                                           ucp_rsc_index_t md_index,
+                                           ucp_md_index_t md_index,
                                            const ucp_config_t *config,
                                            const uct_tl_resource_desc_t *resource,
                                            uint8_t rsc_flags, unsigned *num_resources_p,
@@ -516,13 +605,16 @@ static void ucp_add_tl_resource_if_enabled(ucp_context_h context, ucp_tl_md_t *m
     }
 }
 
-static ucs_status_t ucp_add_tl_resources(ucp_context_h context, ucp_tl_md_t *md,
-                                         ucp_rsc_index_t md_index,
+static ucs_status_t ucp_add_tl_resources(ucp_context_h context,
+                                         ucp_md_index_t md_index,
                                          const ucp_config_t *config,
                                          unsigned *num_resources_p,
+                                         ucs_string_set_t avail_devices[],
+                                         ucs_string_set_t *avail_tls,
                                          uint64_t dev_cfg_masks[],
                                          uint64_t *tl_cfg_mask)
 {
+    ucp_tl_md_t *md = &context->tl_mds[md_index];
     uct_tl_resource_desc_t *tl_resources;
     uct_tl_resource_desc_t sa_rsc;
     ucp_tl_resource_desc_t *tmp;
@@ -567,6 +659,12 @@ static ucs_status_t ucp_add_tl_resources(ucp_context_h context, ucp_tl_md_t *md,
     /* copy only the resources enabled by user configuration */
     context->tl_rscs = tmp;
     for (i = 0; i < num_tl_resources; ++i) {
+        if (!(md->attr.cap.flags & UCT_MD_FLAG_SOCKADDR)) {
+            ucs_string_set_addf(&avail_devices[tl_resources[i].dev_type],
+                                "'%s'(%s)", tl_resources[i].dev_name,
+                                context->tl_cmpts[md->cmpt_index].attr.name);
+            ucs_string_set_add(avail_tls, tl_resources[i].tl_name);
+        }
         ucp_add_tl_resource_if_enabled(context, md, md_index, config,
                                        &tl_resources[i], 0, num_resources_p,
                                        dev_cfg_masks, tl_cfg_mask);
@@ -592,16 +690,55 @@ err:
     return status;
 }
 
-static void ucp_report_unavailable(const ucs_config_names_array_t* cfg,
-                                   uint64_t mask, const char *title)
+static void ucp_get_aliases_set(ucs_string_set_t *avail_tls)
 {
-    int i;
+    ucp_tl_alias_t *alias;
+    const char **tl_name;
 
-    for (i = 0; i < cfg->count; i++) {
-        if (!(mask & UCS_BIT(i)) && strcmp(cfg->names[i], UCP_RSC_CONFIG_ALL)) {
-            ucs_warn("%s '%s' is not available", title, cfg->names[i]);
+    for (alias = ucp_tl_aliases; alias->alias != NULL; ++alias) {
+        for (tl_name = alias->tls; *tl_name != NULL; ++tl_name) {
+            if (ucs_string_set_contains(avail_tls, *tl_name)) {
+                ucs_string_set_add(avail_tls, alias->alias);
+                break;
+            }
         }
     }
+}
+
+static void ucp_report_unavailable(const ucs_config_names_array_t* cfg,
+                                   uint64_t mask, const char *title1,
+                                   const char *title2,
+                                   const ucs_string_set_t *avail_names)
+{
+    ucs_string_buffer_t avail_strb, unavail_strb;
+    unsigned i;
+    int found;
+
+    ucs_string_buffer_init(&unavail_strb);
+
+    found = 0;
+    for (i = 0; i < cfg->count; i++) {
+        if (!(mask & UCS_BIT(i)) && strcmp(cfg->names[i], UCP_RSC_CONFIG_ALL) &&
+            !ucs_string_set_contains(avail_names, cfg->names[i])) {
+            ucs_string_buffer_appendf(&unavail_strb, "%s'%s'",
+                                      found++ ? "," : "",
+                                      cfg->names[i]);
+        }
+    }
+
+    if (found) {
+        ucs_string_buffer_init(&avail_strb);
+        ucs_string_set_print_sorted(avail_names, &avail_strb, ", ");
+        ucs_warn("%s%s%s %s %s not available, please use one or more of: %s",
+                 title1, title2,
+                 (found > 1) ? "s" : "",
+                 ucs_string_buffer_cstr(&unavail_strb),
+                 (found > 1) ? "are" : "is",
+                 ucs_string_buffer_cstr(&avail_strb));
+        ucs_string_buffer_cleanup(&avail_strb);
+    }
+
+    ucs_string_buffer_cleanup(&unavail_strb);
 }
 
 const char * ucp_find_tl_name_by_csum(ucp_context_t *context, uint16_t tl_name_csum)
@@ -652,52 +789,6 @@ const char* ucp_tl_bitmap_str(ucp_context_h context, uint64_t tl_bitmap,
     return str;
 }
 
-static const char* ucp_feature_flag_str(unsigned feature_flag)
-{
-    switch (feature_flag) {
-    case UCP_FEATURE_TAG:
-        return "UCP_FEATURE_TAG";
-    case UCP_FEATURE_RMA:
-        return "UCP_FEATURE_RMA";
-    case UCP_FEATURE_AMO32:
-        return "UCP_FEATURE_AMO32";
-    case UCP_FEATURE_AMO64:
-        return "UCP_FEATURE_AMO64";
-    case UCP_FEATURE_WAKEUP:
-        return "UCP_FEATURE_WAKEUP";
-    case UCP_FEATURE_STREAM:
-        return "UCP_FEATURE_STREAM";
-    case UCP_FEATURE_GROUPS:
-        return "UCP_FEATURE_GROUPS";
-    default:
-        ucs_fatal("Unknown feature flag value %u", feature_flag);
-    }
-}
-
-const char* ucp_feature_flags_str(unsigned feature_flags, char *str,
-                                  size_t max_str_len)
-{
-    unsigned i, count;
-    char *p, *endp;
-
-    p    = str;
-    endp = str + max_str_len;
-    count = 0;
-
-    ucs_for_each_bit(i, feature_flags) {
-        ucs_snprintf_zero(p, endp - p, "%s%s", (count == 0) ? "" : "|",
-                          ucp_feature_flag_str(UCS_BIT(i)));
-        count++;
-        p += strlen(p);
-    }
-
-    if (count == 0) {
-        ucs_assert(max_str_len > 0);
-        str[0] = '\0'; /* empty string */
-    }
-
-    return str;
-}
 
 static void ucp_free_resources(ucp_context_t *context)
 {
@@ -712,6 +803,7 @@ static void ucp_free_resources(ucp_context_t *context)
         uct_md_close(context->tl_mds[i].md);
     }
     ucs_free(context->tl_mds);
+    ucs_free(context->tl_cmpts);
 }
 
 static ucs_status_t ucp_check_resource_config(const ucp_config_t *config)
@@ -738,23 +830,27 @@ static ucs_status_t ucp_check_resource_config(const ucp_config_t *config)
      return UCS_OK;
 }
 
-static ucs_status_t ucp_fill_tl_md(const uct_md_resource_desc_t *md_rsc,
+static ucs_status_t ucp_fill_tl_md(ucp_context_h context,
+                                   ucp_rsc_index_t cmpt_index,
+                                   const uct_md_resource_desc_t *md_rsc,
                                    ucp_tl_md_t *tl_md)
 {
     uct_md_config_t *md_config;
     ucs_status_t status;
 
-    /* Save MD resource */
-    tl_md->rsc = *md_rsc;
+    /* Initialize tl_md structure */
+    tl_md->cmpt_index = cmpt_index;
+    tl_md->rsc        = *md_rsc;
 
     /* Read MD configuration */
-    status = uct_md_config_read(md_rsc->md_name, NULL, NULL, &md_config);
+    status = uct_md_config_read(context->tl_cmpts[cmpt_index].cmpt, NULL, NULL,
+                                &md_config);
     if (status != UCS_OK) {
         return status;
     }
 
-    /* Open MD */
-    status = uct_md_open(md_rsc->md_name, md_config, &tl_md->md);
+    status = uct_md_open(context->tl_cmpts[cmpt_index].cmpt, md_rsc->md_name,
+                         md_config, &tl_md->md);
     uct_config_release(md_config);
     if (status != UCS_OK) {
         return status;
@@ -832,22 +928,125 @@ static void ucp_fill_sockaddr_aux_tls_config(ucp_context_h context,
                                              const ucp_config_t *config)
 {
     const char **tl_names = (const char**)config->sockaddr_aux_tls.aux_tls;
-    unsigned count = config->sockaddr_aux_tls.count;
+    unsigned count        = config->sockaddr_aux_tls.count;
+    uint8_t dummy_flags   = 0;
+    uint64_t dummy_mask   = 0;
     ucp_rsc_index_t tl_id;
-    uint8_t dummy_flags;
-    uint64_t dummy_mask;
 
     context->config.sockaddr_aux_rscs_bitmap = 0;
 
     /* Check if any of the context's resources are present in the sockaddr
      * auxiliary transports for the client-server flow */
-    for (tl_id = 0; tl_id < context->num_tls; ++tl_id) {
+    ucs_for_each_bit(tl_id, context->tl_bitmap) {
         if (ucp_is_resource_in_transports_list(context->tl_rscs[tl_id].tl_rsc.tl_name,
                                                tl_names, count, &dummy_flags,
                                                &dummy_mask)) {
             context->config.sockaddr_aux_rscs_bitmap |= UCS_BIT(tl_id);
         }
     }
+}
+
+static void ucp_fill_sockaddr_tls_prio_list(ucp_context_h context,
+                                            const char **sockaddr_tl_names,
+                                            ucp_rsc_index_t num_sockaddr_tls)
+{
+    uint64_t sa_tls_bitmap = 0;
+    ucp_rsc_index_t idx    = 0;
+    ucp_tl_resource_desc_t *resource;
+    ucp_rsc_index_t tl_id;
+    ucp_tl_md_t *tl_md;
+    ucp_rsc_index_t j;
+
+    /* Set a bitmap of sockaddr transports */
+    for (j = 0; j < context->num_tls; ++j) {
+        resource = &context->tl_rscs[j];
+        tl_md    = &context->tl_mds[resource->md_index];
+        if (tl_md->attr.cap.flags & UCT_MD_FLAG_SOCKADDR) {
+            sa_tls_bitmap |= UCS_BIT(j);
+        }
+    }
+
+    /* Parse the sockaddr transports priority list */
+    for (j = 0; j < num_sockaddr_tls; j++) {
+        /* go over the priority list and find the transport's tl_id in the
+         * sockaddr tls bitmap. save the tl_id's for the client/server usage
+         * later */
+        ucs_for_each_bit(tl_id, sa_tls_bitmap) {
+            resource = &context->tl_rscs[tl_id];
+
+            if (!strcmp(sockaddr_tl_names[j], "*") ||
+                !strncmp(sockaddr_tl_names[j], resource->tl_rsc.tl_name,
+                         UCT_TL_NAME_MAX)) {
+                context->config.sockaddr_tl_ids[idx] = tl_id;
+                idx++;
+                sa_tls_bitmap &= ~UCS_BIT(tl_id);
+            }
+        }
+    }
+
+    context->config.num_sockaddr_tls = idx;
+}
+
+static void ucp_fill_sockaddr_cms_prio_list(ucp_context_h context,
+                                            const char **sockaddr_cm_names,
+                                            ucp_rsc_index_t num_sockaddr_cms,
+                                            int sockaddr_cm_enable)
+{
+    uint64_t cm_cmpts_bitmap = context->config.cm_cmpts_bitmap;
+    uint64_t cm_cmpts_bitmap_safe;
+    ucp_rsc_index_t cmpt_idx, cm_idx;
+
+    memset(&context->config.cm_cmpt_idxs, UCP_NULL_RESOURCE, UCP_MAX_RESOURCES);
+    context->config.num_cm_cmpts = 0;
+
+    if (!sockaddr_cm_enable) {
+        return;
+    }
+
+    /* Parse the sockaddr CMs priority list */
+    for (cm_idx = 0; cm_idx < num_sockaddr_cms; ++cm_idx) {
+        /* go over the priority list and find the CM's cm_idx in the
+         * sockaddr CMs bitmap. Save the cmpt_idx for the client/server usage
+         * later */
+        cm_cmpts_bitmap_safe = cm_cmpts_bitmap;
+        ucs_for_each_bit(cmpt_idx, cm_cmpts_bitmap_safe) {
+            if (!strcmp(sockaddr_cm_names[cm_idx], "*") ||
+                !strncmp(sockaddr_cm_names[cm_idx],
+                         context->tl_cmpts[cmpt_idx].attr.name,
+                         UCT_COMPONENT_NAME_MAX)) {
+                context->config.cm_cmpt_idxs[context->config.num_cm_cmpts++] = cmpt_idx;
+                cm_cmpts_bitmap &= ~UCS_BIT(cmpt_idx);
+            }
+        }
+    }
+}
+
+static ucs_status_t ucp_fill_sockaddr_prio_list(ucp_context_h context,
+                                                const ucp_config_t *config)
+{
+    const char **sockaddr_tl_names = (const char**)config->sockaddr_cm_tls.cm_tls;
+    unsigned num_sockaddr_tls      = config->sockaddr_cm_tls.count;
+    int sockaddr_cm_enable         = context->config.ext.sockaddr_cm_enable !=
+                                     UCS_NO;
+
+    /* Check if a list of sockaddr transports/CMs has valid length */
+    if (num_sockaddr_tls > UCP_MAX_RESOURCES) {
+        ucs_warn("sockaddr transports or connection managers list is too long, "
+                 "only first %d entries will be used", UCP_MAX_RESOURCES);
+        num_sockaddr_tls = UCP_MAX_RESOURCES;
+    }
+
+    ucp_fill_sockaddr_tls_prio_list(context, sockaddr_tl_names,
+                                    num_sockaddr_tls);
+    ucp_fill_sockaddr_cms_prio_list(context, sockaddr_tl_names,
+                                    num_sockaddr_tls, sockaddr_cm_enable);
+    if ((context->config.ext.sockaddr_cm_enable == UCS_YES) &&
+        (context->config.num_cm_cmpts == 0)) {
+        ucs_error("UCX_SOCKADDR_CM_ENABLE is set to yes but none of the available components supports SOCKADDR_CM");
+        return UCS_ERR_UNSUPPORTED;
+    }
+
+    return UCS_OK;
 }
 
 static ucs_status_t ucp_check_resources(ucp_context_h context,
@@ -871,13 +1070,14 @@ static ucs_status_t ucp_check_resources(ucp_context_h context,
 
     if (num_usable_tls == 0) {
         ucp_resource_config_str(config, info_str, sizeof(info_str));
-        ucs_error("No usable transports/devices, asked %s", info_str);
+        ucs_error("no usable transports/devices (asked %s)", info_str);
         return UCS_ERR_NO_DEVICE;
     }
 
     /* Error check: Make sure there are not too many transports */
     if (context->num_tls >= UCP_MAX_RESOURCES) {
-        ucs_error("Exceeded transports/devices limit (%u requested, up to %d are supported)",
+        ucs_error("exceeded transports/devices limit "
+                  "(%u requested, up to %d are supported)",
                   context->num_tls, UCP_MAX_RESOURCES);
         return UCS_ERR_EXCEEDS_LIMIT;
     }
@@ -885,95 +1085,190 @@ static ucs_status_t ucp_check_resources(ucp_context_h context,
     return ucp_check_tl_names(context);
 }
 
-static ucs_status_t ucp_fill_resources(ucp_context_h context,
-                                       const ucp_config_t *config)
+static ucs_status_t ucp_add_component_resources(ucp_context_h context,
+                                                ucp_rsc_index_t cmpt_index,
+                                                ucs_string_set_t avail_devices[],
+                                                ucs_string_set_t *avail_tls,
+                                                uint64_t dev_cfg_masks[],
+                                                uint64_t *tl_cfg_mask,
+                                                const ucp_config_t *config)
 {
-    uint64_t dev_cfg_masks[UCT_DEVICE_TYPE_LAST] = {0};
-    uint64_t tl_cfg_mask = 0;
+    const ucp_tl_cmpt_t *tl_cmpt = &context->tl_cmpts[cmpt_index];
+    uct_component_attr_t uct_component_attr;
     unsigned num_tl_resources;
-    unsigned num_md_resources;
-    uct_md_resource_desc_t *md_rscs;
     ucs_status_t status;
     ucp_rsc_index_t i;
     unsigned md_index;
     uint64_t mem_type_mask;
-    uct_memory_type_t mem_type;
+    uint64_t mem_type_bitmap;
 
-    context->tl_mds      = NULL;
-    context->num_mds     = 0;
-    context->tl_rscs     = NULL;
-    context->num_tls     = 0;
-    context->num_mem_type_mds = 0;
-    context->memtype_cache = NULL;
-
-    status = ucp_check_resource_config(config);
-    if (status != UCS_OK) {
-        goto err;
-    }
 
     /* List memory domain resources */
-    status = uct_query_md_resources(&md_rscs, &num_md_resources);
+    uct_component_attr.field_mask   = UCT_COMPONENT_ATTR_FIELD_MD_RESOURCES;
+    uct_component_attr.md_resources =
+                    ucs_alloca(tl_cmpt->attr.md_resource_count *
+                               sizeof(*uct_component_attr.md_resources));
+    status = uct_component_query(tl_cmpt->cmpt, &uct_component_attr);
     if (status != UCS_OK) {
-        goto err;
-    }
-
-    /* Error check: Make sure there is at least one MD */
-    if (num_md_resources == 0) {
-        ucs_error("No memory domain resources found");
-        status = UCS_ERR_NO_DEVICE;
-        goto err_release_md_resources;
-    }
-
-    /* Allocate actual array of MDs */
-    context->tl_mds = ucs_malloc(num_md_resources * sizeof(*context->tl_mds),
-                                 "ucp_tl_mds");
-    if (context->tl_mds == NULL) {
-        status = UCS_ERR_NO_MEMORY;
-        goto err_release_md_resources;
+        goto out;
     }
 
     /* Open all memory domains */
-    md_index = 0;
-    mem_type_mask = UCS_BIT(UCT_MD_MEM_TYPE_HOST);
-    for (i = 0; i < num_md_resources; ++i) {
-        status = ucp_fill_tl_md(&md_rscs[i], &context->tl_mds[md_index]);
+    mem_type_mask = UCS_BIT(UCS_MEMORY_TYPE_HOST);
+    for (i = 0; i < tl_cmpt->attr.md_resource_count; ++i) {
+        md_index = context->num_mds;
+        status = ucp_fill_tl_md(context, cmpt_index,
+                                &uct_component_attr.md_resources[i],
+                                &context->tl_mds[md_index]);
         if (status != UCS_OK) {
             continue;
         }
 
         /* Add communication resources of each MD */
-        status = ucp_add_tl_resources(context, &context->tl_mds[md_index],
-                                      md_index, config, &num_tl_resources,
-                                      dev_cfg_masks, &tl_cfg_mask);
+        status = ucp_add_tl_resources(context, md_index, config,
+                                      &num_tl_resources, avail_devices,
+                                      avail_tls, dev_cfg_masks, tl_cfg_mask);
         if (status != UCS_OK) {
             uct_md_close(context->tl_mds[md_index].md);
-            goto err_free_context_resources;
+            goto out;
         }
 
         /* If the MD does not have transport resources (device or sockaddr),
          * don't use it */
         if (num_tl_resources > 0) {
             /* List of memory type MDs */
-            mem_type = context->tl_mds[md_index].attr.cap.mem_type;
-            if (!(mem_type_mask & UCS_BIT(mem_type))) {
-                context->mem_type_tl_mds[context->num_mem_type_mds] = md_index;
-                ++context->num_mem_type_mds;
-                mem_type_mask |= UCS_BIT(mem_type);
+            mem_type_bitmap = context->tl_mds[md_index].attr.cap.detect_mem_types;
+            if (~mem_type_mask & mem_type_bitmap) {
+                context->mem_type_detect_mds[context->num_mem_type_detect_mds] = md_index;
+                ++context->num_mem_type_detect_mds;
+                mem_type_mask |= mem_type_bitmap;
             }
-            ++md_index;
             ++context->num_mds;
         } else {
             ucs_debug("closing md %s because it has no selected transport resources",
-                      md_rscs[i].md_name);
+                      context->tl_mds[md_index].rsc.md_name);
             uct_md_close(context->tl_mds[md_index].md);
         }
     }
 
-    if (context->num_mem_type_mds && context->config.ext.enable_memtype_cache) {
+    status = UCS_OK;
+out:
+    return status;
+}
+
+static ucs_status_t ucp_fill_resources(ucp_context_h context,
+                                       const ucp_config_t *config)
+{
+    uint64_t dev_cfg_masks[UCT_DEVICE_TYPE_LAST] = {};
+    uint64_t tl_cfg_mask                         = 0;
+    ucs_string_set_t avail_devices[UCT_DEVICE_TYPE_LAST];
+    ucs_string_set_t avail_tls;
+    uct_component_h *uct_components;
+    unsigned i, num_uct_components;
+    uct_device_type_t dev_type;
+    ucs_status_t status;
+    unsigned max_mds;
+
+    context->tl_cmpts         = NULL;
+    context->num_cmpts        = 0;
+    context->tl_mds           = NULL;
+    context->num_mds          = 0;
+    context->tl_rscs          = NULL;
+    context->num_tls          = 0;
+    context->memtype_cache    = NULL;
+    context->num_mem_type_detect_mds = 0;
+
+    for (i = 0; i < UCS_MEMORY_TYPE_LAST; ++i) {
+        context->mem_type_access_tls[i] = 0;
+    }
+
+    ucs_string_set_init(&avail_tls);
+    UCS_STATIC_ASSERT(UCT_DEVICE_TYPE_NET == 0);
+    for (dev_type = UCT_DEVICE_TYPE_NET; dev_type < UCT_DEVICE_TYPE_LAST; ++dev_type) {
+        ucs_string_set_init(&avail_devices[dev_type]);
+    }
+
+    status = ucp_check_resource_config(config);
+    if (status != UCS_OK) {
+        goto out_cleanup_avail_devices;
+    }
+
+    status = uct_query_components(&uct_components, &num_uct_components);
+    if (status != UCS_OK) {
+        goto out_cleanup_avail_devices;
+    }
+
+    if (num_uct_components > UCP_MAX_RESOURCES) {
+        ucs_error("too many components: %u, max: %u", num_uct_components,
+                  UCP_MAX_RESOURCES);
+        status = UCS_ERR_EXCEEDS_LIMIT;
+        goto out_release_components;
+    }
+
+    context->num_cmpts = num_uct_components;
+    context->tl_cmpts  = ucs_calloc(context->num_cmpts,
+                                    sizeof(*context->tl_cmpts), "ucp_tl_cmpts");
+    if (context->tl_cmpts == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto out_release_components;
+    }
+
+    context->config.cm_cmpts_bitmap = 0;
+
+    max_mds = 0;
+    for (i = 0; i < context->num_cmpts; ++i) {
+        memset(&context->tl_cmpts[i].attr, 0, sizeof(context->tl_cmpts[i].attr));
+        context->tl_cmpts[i].cmpt = uct_components[i];
+        context->tl_cmpts[i].attr.field_mask =
+                        UCT_COMPONENT_ATTR_FIELD_NAME              |
+                        UCT_COMPONENT_ATTR_FIELD_MD_RESOURCE_COUNT |
+                        UCT_COMPONENT_ATTR_FIELD_FLAGS;
+        status = uct_component_query(context->tl_cmpts[i].cmpt,
+                                     &context->tl_cmpts[i].attr);
+        if (status != UCS_OK) {
+            goto err_free_resources;
+        }
+
+        if (context->tl_cmpts[i].attr.flags & UCT_COMPONENT_FLAG_CM) {
+            context->config.cm_cmpts_bitmap |= UCS_BIT(i);
+        }
+
+        max_mds += context->tl_cmpts[i].attr.md_resource_count;
+    }
+
+    if ((context->config.ext.sockaddr_cm_enable == UCS_YES) &&
+        (context->config.cm_cmpts_bitmap == 0)) {
+        ucs_error("there are no UCT components with CM capability");
+        status = UCS_ERR_UNSUPPORTED;
+        goto err_free_resources;
+    }
+
+    /* Allocate actual array of MDs */
+    context->tl_mds = ucs_malloc(max_mds * sizeof(*context->tl_mds),
+                                 "ucp_tl_mds");
+    if (context->tl_mds == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_free_resources;
+    }
+
+    /* Collect resources of each component */
+    for (i = 0; i < context->num_cmpts; ++i) {
+        status = ucp_add_component_resources(context, i, avail_devices,
+                                             &avail_tls, dev_cfg_masks,
+                                             &tl_cfg_mask, config);
+        if (status != UCS_OK) {
+            goto err_free_resources;
+        }
+    }
+
+    /* Create memtype cache if we have memory type MDs, and it's enabled by
+     * configuration
+     */
+    if (context->num_mem_type_detect_mds && context->config.ext.enable_memtype_cache) {
         status = ucs_memtype_cache_create(&context->memtype_cache);
         if (status != UCS_OK) {
             ucs_debug("could not create memtype cache for mem_type allocations");
-            goto err_free_context_resources;
+            goto err_free_resources;
         }
     }
 
@@ -983,33 +1278,47 @@ static ucs_status_t ucp_fill_resources(ucp_context_h context,
      */
     context->tl_bitmap = config->ctx.unified_mode ? 0 : UCS_MASK(context->num_tls);
 
+    /* Warn about devices and transports which were specified explicitly in the
+     * configuration, but are not available
+     */
+    if (config->warn_invalid_config) {
+        UCS_STATIC_ASSERT(UCT_DEVICE_TYPE_NET == 0);
+        for (dev_type = UCT_DEVICE_TYPE_NET; dev_type < UCT_DEVICE_TYPE_LAST; ++dev_type) {
+            ucp_report_unavailable(&config->devices[dev_type],
+                                   dev_cfg_masks[dev_type],
+                                   ucp_device_type_names[dev_type], " device",
+                                   &avail_devices[dev_type]);
+        }
+
+        ucp_get_aliases_set(&avail_tls);
+        ucp_report_unavailable(&config->tls, tl_cfg_mask, "", "transport",
+                               &avail_tls);
+    }
+
     /* Validate context resources */
     status = ucp_check_resources(context, config);
     if (status != UCS_OK) {
-        goto err_free_context_resources;
-    }
-
-    uct_release_md_resource_list(md_rscs);
-
-    if (config->warn_invalid_config) {
-        /* Notify the user if there are devices or transports from the command line
-         * that are not available
-         */
-        for (i = 0; i < UCT_DEVICE_TYPE_LAST; ++i) {
-            ucp_report_unavailable(&config->devices[i], dev_cfg_masks[i], "device");
-        }
-        ucp_report_unavailable(&config->tls, tl_cfg_mask, "transport");
+        goto err_free_resources;
     }
 
     ucp_fill_sockaddr_aux_tls_config(context, config);
+    status = ucp_fill_sockaddr_prio_list(context, config);
+    if (status != UCS_OK) {
+        goto err_free_resources;
+    }
 
-    return UCS_OK;
+    goto out_release_components;
 
-err_free_context_resources:
+err_free_resources:
     ucp_free_resources(context);
-err_release_md_resources:
-    uct_release_md_resource_list(md_rscs);
-err:
+out_release_components:
+    uct_release_component_list(uct_components);
+out_cleanup_avail_devices:
+    UCS_STATIC_ASSERT(UCT_DEVICE_TYPE_NET == 0);
+    for (dev_type = UCT_DEVICE_TYPE_NET; dev_type < UCT_DEVICE_TYPE_LAST; ++dev_type) {
+        ucs_string_set_cleanup(&avail_devices[dev_type]);
+    }
+    ucs_string_set_cleanup(&avail_tls);
     return status;
 }
 
@@ -1055,6 +1364,12 @@ static void ucp_apply_params(ucp_context_h context, const ucp_params_t *params,
         context->config.est_num_eps = 1;
     }
 
+    if (params->field_mask & UCP_PARAM_FIELD_ESTIMATED_NUM_PPN) {
+        context->config.est_num_ppn = params->estimated_num_ppn;
+    } else {
+        context->config.est_num_ppn = 1;
+    }
+
     if ((params->field_mask & UCP_PARAM_FIELD_MT_WORKERS_SHARED) &&
         params->mt_workers_shared) {
         context->mt_lock.mt_type = mt_type;
@@ -1074,25 +1389,47 @@ static ucs_status_t ucp_fill_config(ucp_context_h context,
     ucp_apply_params(context, params,
                      config->ctx.use_mt_mutex ? UCP_MT_TYPE_MUTEX
                                               : UCP_MT_TYPE_SPINLOCK);
+
     context->config.ext = config->ctx;
 
-    if (context->config.ext.estimated_num_eps != UCS_CONFIG_ULUNITS_AUTO) {
-        /* num_eps were set via the env variable. Override current value */
+    if (context->config.ext.estimated_num_eps != UCS_ULUNITS_AUTO) {
+        /* num_eps was set via the env variable. Override current value */
         context->config.est_num_eps = context->config.ext.estimated_num_eps;
     }
-    ucs_debug("Estimated number of endpoints is %d",
+    ucs_debug("estimated number of endpoints is %d",
               context->config.est_num_eps);
+
+    if (context->config.ext.estimated_num_ppn != UCS_ULUNITS_AUTO) {
+        /* num_ppn was set via the env variable. Override current value */
+        context->config.est_num_ppn = context->config.ext.estimated_num_ppn;
+    }
+    ucs_debug("estimated number of endpoints per node is %d",
+              context->config.est_num_ppn);
+
+    if (UCS_CONFIG_BW_IS_AUTO(context->config.ext.bcopy_bw)) {
+        /* bcopy_bw wasn't set via the env variable. Calculate the value */
+        context->config.ext.bcopy_bw = ucs_cpu_get_memcpy_bw();
+    }
+    ucs_debug("estimated bcopy bandwidth is %f",
+              context->config.ext.bcopy_bw);
 
     /* always init MT lock in context even though it is disabled by user,
      * because we need to use context lock to protect ucp_mm_ and ucp_rkey_
      * routines */
     UCP_THREAD_LOCK_INIT(&context->mt_lock);
 
+    /* save environment prefix to later notify user for unused variables */
+    context->config.env_prefix = ucs_strdup(config->env_prefix, "ucp config");
+    if (context->config.env_prefix == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err;
+    }
+
     /* Get allocation alignment from configuration, make sure it's valid */
     if (config->alloc_prio.count == 0) {
         ucs_error("No allocation methods specified - aborting");
         status = UCS_ERR_INVALID_PARAM;
-        goto err;
+        goto err_free_env_prefix;
     }
 
     num_alloc_methods = config->alloc_prio.count;
@@ -1104,7 +1441,7 @@ static ucs_status_t ucp_fill_config(ucp_context_h context,
                                                "ucp_alloc_methods");
     if (context->config.alloc_methods == NULL) {
         status = UCS_ERR_NO_MEMORY;
-        goto err;
+        goto err_free_env_prefix;
     }
 
     /* Parse the allocation methods specified in the configuration */
@@ -1115,8 +1452,8 @@ static ucs_status_t ucp_fill_config(ucp_context_h context,
              * component name.
              */
             context->config.alloc_methods[i].method = UCT_ALLOC_METHOD_MD;
-            ucs_strncpy_zero(context->config.alloc_methods[i].mdc_name,
-                             method_name + 3, UCT_MD_COMPONENT_NAME_MAX);
+            ucs_strncpy_zero(context->config.alloc_methods[i].cmpt_name,
+                             method_name + 3, UCT_COMPONENT_NAME_MAX);
             ucs_debug("allocation method[%d] is md '%s'", i, method_name + 3);
         } else {
             /* Otherwise, this is specific allocation method name.
@@ -1127,8 +1464,8 @@ static ucs_status_t ucp_fill_config(ucp_context_h context,
                     !strcmp(method_name, uct_alloc_method_names[method]))
                 {
                     /* Found the allocation method in the internal name list */
-                    context->config.alloc_methods[i].method = method;
-                    strcpy(context->config.alloc_methods[i].mdc_name, "");
+                    context->config.alloc_methods[i].method = (uct_alloc_method_t)method;
+                    strcpy(context->config.alloc_methods[i].cmpt_name, "");
                     ucs_debug("allocation method[%d] is '%s'", i, method_name);
                     break;
                 }
@@ -1136,12 +1473,12 @@ static ucs_status_t ucp_fill_config(ucp_context_h context,
             if (context->config.alloc_methods[i].method == UCT_ALLOC_METHOD_LAST) {
                 ucs_error("Invalid allocation method: %s", method_name);
                 status = UCS_ERR_INVALID_PARAM;
-                goto err_free;
+                goto err_free_alloc_methods;
             }
         }
     }
 
-    /* Need to check MAX_BCOPY value if it is enabled only */
+    /* Need to check TM_SEG_SIZE value if it is enabled only */
     if (context->config.ext.tm_max_bb_size > context->config.ext.tm_thresh) {
         if (context->config.ext.tm_max_bb_size < sizeof(ucp_request_hdr_t)) {
             /* In case of expected SW RNDV message, the header (ucp_request_hdr_t) is
@@ -1162,8 +1499,10 @@ static ucs_status_t ucp_fill_config(ucp_context_h context,
 
     return UCS_OK;
 
-err_free:
+err_free_alloc_methods:
     ucs_free(context->config.alloc_methods);
+err_free_env_prefix:
+    ucs_free(context->config.env_prefix);
 err:
     UCP_THREAD_LOCK_FINALIZE(&context->mt_lock);
     return status;
@@ -1172,14 +1511,8 @@ err:
 static void ucp_free_config(ucp_context_h context)
 {
     ucs_free(context->config.alloc_methods);
+    ucs_free(context->config.env_prefix);
 }
-
-static ucs_mpool_ops_t ucp_rkey_mpool_ops = {
-    .chunk_alloc   = ucs_mpool_chunk_malloc,
-    .chunk_release = ucs_mpool_chunk_free,
-    .obj_init      = NULL,
-    .obj_cleanup   = NULL
-};
 
 ucs_status_t ucp_init_version(unsigned api_major_version, unsigned api_minor_version,
                               const ucp_params_t *params, const ucp_config_t *config,
@@ -1228,15 +1561,6 @@ ucs_status_t ucp_init_version(unsigned api_major_version, unsigned api_minor_ver
         goto err_free_config;
     }
 
-    /* create memory pool for small rkeys */
-    status = ucs_mpool_init(&context->rkey_mp, 0,
-                            sizeof(ucp_rkey_t) + sizeof(uct_rkey_bundle_t) * UCP_RKEY_MPOOL_MAX_MD,
-                            0, UCS_SYS_CACHE_LINE_SIZE, 128, -1,
-                            &ucp_rkey_mpool_ops, "ucp_rkeys");
-    if (status != UCS_OK) {
-        goto err_free_resources;
-    }
-
     if (dfl_config != NULL) {
         ucp_config_release(dfl_config);
     }
@@ -1250,8 +1574,6 @@ ucs_status_t ucp_init_version(unsigned api_major_version, unsigned api_minor_ver
     *context_p = context;
     return UCS_OK;
 
-err_free_resources:
-    ucp_free_resources(context);
 err_free_config:
     ucp_free_config(context);
 err_free_ctx:
@@ -1262,6 +1584,17 @@ err_release_config:
     }
 err:
     return status;
+}
+
+void ucp_cleanup(ucp_context_h context)
+{
+    while (!ucs_list_is_empty(&context->extensions)) {
+        ucs_free(ucs_list_extract_head(&context->extensions, ucp_context_extension_t, list));
+    }
+    ucp_free_resources(context);
+    ucp_free_config(context);
+    UCP_THREAD_LOCK_FINALIZE(&context->mt_lock);
+    ucs_free(context);
 }
 
 ucs_status_t ucp_extend(ucp_context_h context, size_t extension_ctx_length,
@@ -1284,18 +1617,6 @@ ucs_status_t ucp_extend(ucp_context_h context, size_t extension_ctx_length,
 
     ucs_list_add_tail(&context->extensions, &ext->list);
     return UCS_OK;
-}
-
-void ucp_cleanup(ucp_context_h context)
-{
-    while (!ucs_list_is_empty(&context->extensions)) {
-        ucs_free(ucs_list_extract_head(&context->extensions, ucp_context_extension_t, list));
-    }
-    ucs_mpool_cleanup(&context->rkey_mp, 1);
-    ucp_free_resources(context);
-    ucp_free_config(context);
-    UCP_THREAD_LOCK_FINALIZE(&context->mt_lock);
-    ucs_free(context);
 }
 
 void ucp_dump_payload(ucp_context_h context, char *buffer, size_t max,
@@ -1361,15 +1682,22 @@ ucs_status_t ucp_context_query(ucp_context_h context, ucp_context_attr_t *attr)
 
 void ucp_context_print_info(ucp_context_h context, FILE *stream)
 {
-    ucp_rsc_index_t md_index, rsc_index;
+    ucp_rsc_index_t cmpt_index, md_index, rsc_index;
 
     fprintf(stream, "#\n");
     fprintf(stream, "# UCP context\n");
     fprintf(stream, "#\n");
 
+    for (cmpt_index = 0; cmpt_index < context->num_cmpts; ++cmpt_index) {
+        fprintf(stream, "#     component %-2d :  %s\n",
+                cmpt_index, context->tl_cmpts[cmpt_index].attr.name);
+    }
+    fprintf(stream, "#\n");
+
     for (md_index = 0; md_index < context->num_mds; ++md_index) {
-        fprintf(stream, "#            md %-2d :  %s\n",
-                md_index, context->tl_mds[md_index].rsc.md_name);
+        fprintf(stream, "#            md %-2d :  component %-2d %s \n",
+                md_index, context->tl_mds[md_index].cmpt_index,
+                context->tl_mds[md_index].rsc.md_name);
     }
 
     fprintf(stream, "#\n");
@@ -1398,4 +1726,63 @@ uct_md_h ucp_context_find_tl_md(ucp_context_h context, const char *md_name)
     }
 
     return NULL;
+}
+
+ucs_memory_type_t
+ucp_memory_type_detect_mds(ucp_context_h context, const void *address, size_t size)
+{
+    ucs_memory_type_t mem_type;
+    unsigned i, md_index;
+    ucs_status_t status;
+
+    for (i = 0; i < context->num_mem_type_detect_mds; ++i) {
+        md_index = context->mem_type_detect_mds[i];
+        status   = uct_md_detect_memory_type(context->tl_mds[md_index].md,
+                                             address, size, &mem_type);
+        if (status == UCS_OK) {
+            if (context->memtype_cache != NULL) {
+                ucs_memtype_cache_update(context->memtype_cache, address, size,
+                                         mem_type);
+            }
+            return mem_type;
+        }
+    }
+
+    /* Memory type not detected by any memtype MD - assume it is host memory */
+    return UCS_MEMORY_TYPE_HOST;
+}
+
+uint64_t ucp_context_dev_tl_bitmap(ucp_context_h context, const char *dev_name)
+{
+    uint64_t        tl_bitmap;
+    ucp_rsc_index_t tl_idx;
+
+    tl_bitmap = 0;
+
+    ucs_for_each_bit(tl_idx, context->tl_bitmap) {
+        if (strcmp(context->tl_rscs[tl_idx].tl_rsc.dev_name, dev_name)) {
+            continue;
+        }
+
+        tl_bitmap |= UCS_BIT(tl_idx);
+    }
+
+    return tl_bitmap;
+}
+
+uint64_t ucp_context_dev_idx_tl_bitmap(ucp_context_h context,
+                                       ucp_rsc_index_t dev_idx)
+{
+    uint64_t        tl_bitmap;
+    ucp_rsc_index_t tl_idx;
+
+    tl_bitmap = 0;
+
+    ucs_for_each_bit(tl_idx, context->tl_bitmap) {
+        if (context->tl_rscs[tl_idx].dev_index == dev_idx) {
+            tl_bitmap |= UCS_BIT(tl_idx);
+        }
+    }
+
+    return tl_bitmap;
 }

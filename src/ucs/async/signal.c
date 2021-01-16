@@ -115,7 +115,13 @@ ucs_async_signal_sys_timer_create(int uid, pid_t tid, timer_t *sys_timer_id)
     ev.sigev_notify          = SIGEV_THREAD_ID;
     ev.sigev_signo           = ucs_global_opts.async_signo;
     ev.sigev_value.sival_int = uid; /* user parameter to timer */
+#if defined(HAVE_SIGEVENT_SIGEV_UN_TID)
     ev._sigev_un._tid        = tid; /* target thread */
+#elif defined(HAVE_SIGEVENT_SIGEV_NOTIFY_THREAD_ID)
+    ev.sigev_notify_thread_id = tid; /* target thread */
+#else
+#error "Port me"
+#endif
     ret = timer_create(CLOCK_REALTIME, &ev, &timer);
     if (ret < 0) {
         ucs_error("failed to create an interval timer: %m");
@@ -175,6 +181,29 @@ static ucs_status_t ucs_async_signal_dispatch_timer(int uid)
     return ucs_async_dispatch_timerq(&timer->timerq, ucs_get_time());
 }
 
+static inline int ucs_signal_map_to_events(int si_code)
+{
+    int events;
+
+    switch (si_code) {
+    case POLL_IN:
+    case POLL_MSG:
+    case POLL_PRI:
+        events = UCS_EVENT_SET_EVREAD;
+        return events;
+    case POLL_OUT:
+        events = UCS_EVENT_SET_EVWRITE;
+        return events;
+    case POLL_HUP:
+    case POLL_ERR:
+        events = UCS_EVENT_SET_EVERR;
+        return events;
+    default:
+        ucs_warn("unexpected si_code %d", si_code);
+        return UCS_ASYNC_EVENT_DUMMY;
+    }
+}
+
 static void ucs_async_signal_handler(int signo, siginfo_t *siginfo, void *arg)
 {
     ucs_assert(signo == ucs_global_opts.async_signo);
@@ -182,8 +211,8 @@ static void ucs_async_signal_handler(int signo, siginfo_t *siginfo, void *arg)
     /* Check event code */
     switch (siginfo->si_code) {
     case SI_TIMER:
-        ucs_trace_async("timer signal uid=%d", siginfo->si_int);
-        ucs_async_signal_dispatch_timer(siginfo->si_int);
+        ucs_trace_async("timer signal uid=%d", siginfo->si_value.sival_int);
+        ucs_async_signal_dispatch_timer(siginfo->si_value.sival_int);
         return;
     case POLL_IN:
     case POLL_OUT:
@@ -192,7 +221,8 @@ static void ucs_async_signal_handler(int signo, siginfo_t *siginfo, void *arg)
     case POLL_MSG:
     case POLL_PRI:
         ucs_trace_async("async signal handler called for fd %d", siginfo->si_fd);
-        ucs_async_dispatch_handlers(&siginfo->si_fd, 1);
+        ucs_async_dispatch_handlers(&siginfo->si_fd, 1,
+                                    ucs_signal_map_to_events(siginfo->si_code));
         return;
     default:
         ucs_warn("signal handler called with unexpected event code %d, ignoring",
@@ -203,13 +233,13 @@ static void ucs_async_signal_handler(int signo, siginfo_t *siginfo, void *arg)
 
 static void ucs_async_signal_allow(int allow)
 {
-    sigset_t sigset;
+    sigset_t sig_set;
 
     ucs_trace_func("enable=%d tid=%d", allow, ucs_get_tid());
 
-    sigemptyset(&sigset);
-    sigaddset(&sigset, ucs_global_opts.async_signo);
-    pthread_sigmask(allow ? SIG_UNBLOCK : SIG_BLOCK, &sigset, NULL);
+    sigemptyset(&sig_set);
+    sigaddset(&sig_set, ucs_global_opts.async_signo);
+    pthread_sigmask(allow ? SIG_UNBLOCK : SIG_BLOCK, &sig_set, NULL);
 }
 
 static void ucs_async_signal_block_all()
@@ -243,7 +273,9 @@ static ucs_status_t ucs_async_signal_install_handler()
         new_action.sa_sigaction = ucs_async_signal_handler;
         sigemptyset(&new_action.sa_mask);
         new_action.sa_flags    = SA_RESTART|SA_SIGINFO;
+#if HAVE_SIGACTION_SA_RESTORER
         new_action.sa_restorer = NULL;
+#endif
         ret = sigaction(ucs_global_opts.async_signo, &new_action,
                         &ucs_async_signal_global_context.prev_sighandler);
         if (ret < 0) {
@@ -310,20 +342,20 @@ static ucs_status_t ucs_async_signal_modify_event_fd(ucs_async_context_t *async,
                                                      int event_fd, int events)
 {
     ucs_status_t status;
-    int add, remove;
+    int add, rm;
 
     UCS_ASYNC_SIGNAL_CHECK_THREAD(async);
 
     if (events) {
-        add    = O_ASYNC; /* Enable notifications */
-        remove = 0;
+        add = O_ASYNC; /* Enable notifications */
+        rm  = 0;
     } else {
-        add    = 0;       /* Disable notifications */
-        remove = O_ASYNC;
+        add = 0;       /* Disable notifications */
+        rm  = O_ASYNC;
     }
 
-    ucs_trace_async("fcntl(fd=%d, add=0x%x, remove=0x%x)", event_fd, add, remove);
-    status = ucs_sys_fcntl_modfl(event_fd, add, remove);
+    ucs_trace_async("fcntl(fd=%d, add=0x%x, remove=0x%x)", event_fd, add, rm);
+    status = ucs_sys_fcntl_modfl(event_fd, add, rm);
     if (status != UCS_OK) {
         ucs_error("fcntl F_SETFL failed: %m");
         return UCS_ERR_IO_ERROR;
@@ -576,7 +608,7 @@ static void ucs_async_signal_global_init()
 static void ucs_async_signal_global_cleanup()
 {
     if (ucs_async_signal_global_context.event_count != 0) {
-        ucs_info("signal handler not removed (%d events remaining)",
+        ucs_warn("signal handler not removed (%d events remaining)",
                  ucs_async_signal_global_context.event_count);
     }
     pthread_mutex_destroy(&ucs_async_signal_global_context.timers_lock);

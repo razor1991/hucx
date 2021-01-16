@@ -4,7 +4,9 @@
  * See file LICENSE for terms.
  */
 
-#define _GNU_SOURCE /* for dladdr */
+#ifndef _GNU_SOURCE
+#  define _GNU_SOURCE /* for dladdr */
+#endif
 
 #include "sys.h"
 
@@ -14,8 +16,10 @@
 
 #include <ucm/api/ucm.h>
 #include <ucm/util/log.h>
+#include <ucm/event/event.h>
 #include <ucm/mmap/mmap.h>
 #include <ucs/sys/math.h>
+#include <ucs/sys/topo.h>
 #include <linux/mman.h>
 #include <sys/mman.h>
 #include <pthread.h>
@@ -36,7 +40,8 @@ ucm_global_config_t ucm_global_opts = {
     .enable_malloc_reloc        = 0,
     .enable_cuda_reloc          = 1,
     .enable_dynamic_mmap_thresh = 1,
-    .alloc_alignment            = 16
+    .alloc_alignment            = 16,
+    .dlopen_process_rpath       = 1
 };
 
 size_t ucm_get_page_size()
@@ -58,7 +63,7 @@ size_t ucm_get_page_size()
 static void *ucm_sys_complete_alloc(void *ptr, size_t size)
 {
     *(size_t*)ptr = size;
-    return ptr + sizeof(size_t);
+    return UCS_PTR_BYTE_OFFSET(ptr, sizeof(size_t));
 }
 
 void *ucm_sys_malloc(size_t size)
@@ -70,6 +75,7 @@ void *ucm_sys_malloc(size_t size)
     ptr = ucm_orig_mmap(NULL, sys_size, PROT_READ|PROT_WRITE,
                         MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ptr == MAP_FAILED) {
+        ucm_error("mmap(size=%zu) failed: %m", sys_size);
         return NULL;
     }
 
@@ -98,7 +104,10 @@ void ucm_sys_free(void *ptr)
         return;
     }
 
-    ptr -= sizeof(size_t);
+    /* Do not use UCS_PTR_BYTE_OFFSET macro here due to coverity
+     * false positive.
+     * TODO: check for false positive on newer coverity. */
+    ptr  = (char*)ptr - sizeof(size_t);
     size = *(size_t*)ptr;
     munmap(ptr, size);
 }
@@ -112,7 +121,7 @@ void *ucm_sys_realloc(void *ptr, size_t size)
         return ucm_sys_malloc(size);
     }
 
-    oldptr   = ptr - sizeof(size_t);
+    oldptr   = UCS_PTR_BYTE_OFFSET(ptr, -sizeof(size_t));
     oldsize  = *(size_t*)oldptr;
     sys_size = ucs_align_up_pow2(size + sizeof(size_t), ucm_get_page_size());
 
@@ -122,6 +131,8 @@ void *ucm_sys_realloc(void *ptr, size_t size)
 
     newptr = ucm_orig_mremap(oldptr, oldsize, sys_size, MREMAP_MAYMOVE);
     if (newptr == MAP_FAILED) {
+        ucm_error("mremap(oldptr=%p oldsize=%zu, newsize=%zu) failed: %m",
+                  oldptr, oldsize, sys_size);
         return NULL;
     }
 
@@ -136,10 +147,12 @@ void ucm_parse_proc_self_maps(ucm_proc_maps_cb_t cb, void *arg)
     ssize_t read_size, offset;
     unsigned long start, end;
     char prot_c[4];
+    int line_num;
     int prot;
     char *ptr, *newline;
     int maps_fd;
     int ret;
+    int n;
 
     maps_fd = open(UCM_PROC_SELF_MAPS, O_RDONLY);
     if (maps_fd < 0) {
@@ -195,31 +208,39 @@ void ucm_parse_proc_self_maps(ucm_proc_maps_cb_t cb, void *arg)
 
     pthread_rwlock_rdlock(&lock);
 
-    ptr    = buffer;
+    ptr      = buffer;
+    line_num = 1;
     while ( (newline = strchr(ptr, '\n')) != NULL ) {
-        /* 00400000-0040b000 r-xp ... \n */
-        ret = sscanf(ptr, "%lx-%lx %4c", &start, &end, prot_c);
-        if (ret != 3) {
-            ucm_fatal("failed to parse %s error at offset %zd",
-                      UCM_PROC_SELF_MAPS, ptr - buffer);
-        }
+        /* address           perms offset   dev   inode   pathname
+         * 00400000-0040b000 r-xp  00001a00 0a:0b 12345   /dev/mydev
+         */
+        *newline = '\0';
+        ret = sscanf(ptr, "%lx-%lx %4c %*x %*x:%*x %*d %n",
+                     &start, &end, prot_c,
+                     /* ignore offset, dev, inode */
+                     &n /* save number of chars before path begins */);
+        if (ret < 3) {
+            ucm_warn("failed to parse %s line %d: '%s'",
+                     UCM_PROC_SELF_MAPS, line_num, ptr);
+        } else {
+            prot = 0;
+            if (prot_c[0] == 'r') {
+                prot |= PROT_READ;
+            }
+            if (prot_c[1] == 'w') {
+                prot |= PROT_WRITE;
+            }
+            if (prot_c[2] == 'x') {
+                prot |= PROT_EXEC;
+            }
 
-        prot = 0;
-        if (prot_c[0] == 'r') {
-            prot |= PROT_READ;
-        }
-        if (prot_c[1] == 'w') {
-            prot |= PROT_WRITE;
-        }
-        if (prot_c[2] == 'x') {
-            prot |= PROT_EXEC;
-        }
-
-        if (cb(arg, (void*)start, end - start, prot)) {
-            goto out;
+            if (cb(arg, (void*)start, end - start, prot, ptr + n)) {
+                goto out;
+            }
         }
 
         ptr = newline + 1;
+        ++line_num;
     }
 
 out:
@@ -231,7 +252,8 @@ typedef struct {
     size_t       seg_size;
 } ucm_get_shm_seg_size_ctx_t;
 
-static int ucm_get_shm_seg_size_cb(void *arg, void *addr, size_t length, int prot)
+static int ucm_get_shm_seg_size_cb(void *arg, void *addr, size_t length,
+                                   int prot, const char *path)
 {
     ucm_get_shm_seg_size_ctx_t *ctx = arg;
     if (addr == ctx->shmaddr) {
@@ -289,4 +311,53 @@ void ucm_prevent_dl_unload()
 
     /* Now we drop our reference to the lib, and it won't be unloaded anymore */
     dlclose(dl);
+}
+
+char *ucm_concat_path(char *buffer, size_t max, const char *dir, const char *file)
+{
+    size_t len;
+
+    len = strlen(dir);
+    while (len && (dir[len - 1] == '/')) {
+        len--; /* trim closing '/' */
+    }
+
+    len = ucs_min(len, max);
+    memcpy(buffer, dir, len);
+    max -= len;
+    if (max < 2) { /* buffer is shorter than dir - copy dir only */
+        buffer[len - 1] = '\0';
+        return buffer;
+    }
+
+    buffer[len] = '/';
+    max--;
+
+    while (file[0] == '/') {
+        file++; /* trim beginning '/' */
+    }
+
+    strncpy(buffer + len + 1, file, max);
+    buffer[max + len] = '\0'; /* force close string */
+
+    return buffer;
+}
+
+ucs_status_t ucm_get_mem_type_current_device_info(ucs_memory_type_t memtype, ucs_sys_bus_id_t *bus_id)
+{
+    ucs_status_t status = UCS_ERR_UNSUPPORTED;
+    ucm_event_installer_t *event_installer;
+
+    ucs_list_for_each(event_installer, &ucm_event_installer_list, list) {
+        if (NULL == event_installer->get_mem_type_current_device_info) {
+            continue;
+        }
+
+        status = event_installer->get_mem_type_current_device_info(bus_id, memtype);
+        if (UCS_OK == status) {
+            break;
+        }
+    }
+
+    return status; 
 }

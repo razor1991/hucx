@@ -1,8 +1,12 @@
 /**
  * Copyright (c) UT-Battelle, LLC. 2014-2017. ALL RIGHTS RESERVED.
- * Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
+ * Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  */
+
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
 
 #include "ugni_device.h"
 #include "ugni_iface.h"
@@ -16,30 +20,31 @@ UCS_CONFIG_DEFINE_ARRAY(ugni_alloc_methods, sizeof(uct_alloc_method_t),
 pthread_mutex_t uct_ugni_global_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* For Cray devices we have only one MD */
-static ucs_status_t uct_ugni_query_md_resources(uct_md_resource_desc_t **resources_p,
-                                                unsigned *num_resources_p)
+static ucs_status_t
+uct_ugni_query_md_resources(uct_component_h component,
+                            uct_md_resource_desc_t **resources_p,
+                            unsigned *num_resources_p)
 {
-    if (getenv("PMI_GNI_PTAG") != NULL) {
-        return uct_single_md_resource(&uct_ugni_md_component, resources_p, num_resources_p);
-    } else {
-        *resources_p     = NULL;
-        *num_resources_p = 0;
-        return UCS_OK;
+    if (getenv("PMI_GNI_PTAG") == NULL) {
+        return uct_md_query_empty_md_resource(resources_p, num_resources_p);
     }
+
+    return uct_md_query_single_md_resource(component, resources_p,
+                                           num_resources_p);
 }
 
 static ucs_status_t uct_ugni_md_query(uct_md_h md, uct_md_attr_t *md_attr)
 {
-    md_attr->rkey_packed_size  = 3 * sizeof(uint64_t);
-    md_attr->cap.flags         = UCT_MD_FLAG_REG       |
-                                 UCT_MD_FLAG_NEED_MEMH |
-                                 UCT_MD_FLAG_NEED_RKEY;
-    md_attr->cap.reg_mem_types = UCS_BIT(UCT_MD_MEM_TYPE_HOST);
-    md_attr->cap.mem_type      = UCT_MD_MEM_TYPE_HOST;
-    md_attr->cap.max_alloc     = 0;
-    md_attr->cap.max_reg       = ULONG_MAX;
-    md_attr->reg_cost.overhead = 1000.0e-9;
-    md_attr->reg_cost.growth   = 0.007e-9;
+    md_attr->rkey_packed_size     = 3 * sizeof(uint64_t);
+    md_attr->cap.flags            = UCT_MD_FLAG_REG       |
+                                    UCT_MD_FLAG_NEED_MEMH |
+                                    UCT_MD_FLAG_NEED_RKEY;
+    md_attr->cap.reg_mem_types    = UCS_MEMORY_TYPES_CPU_ACCESSIBLE;
+    md_attr->cap.access_mem_type  = UCS_MEMORY_TYPE_HOST;
+    md_attr->cap.detect_mem_types = 0;
+    md_attr->cap.max_alloc        = 0;
+    md_attr->cap.max_reg          = ULONG_MAX;
+    md_attr->reg_cost             = ucs_linear_func_make(1000.0e-9, 0.007e-9);
     memset(&md_attr->local_cpus, 0xff, sizeof(md_attr->local_cpus));
     return UCS_OK;
 }
@@ -120,15 +125,16 @@ static ucs_status_t uct_ugni_rkey_pack(uct_md_h md, uct_mem_h memh,
     return UCS_OK;
 }
 
-static ucs_status_t uct_ugni_rkey_release(uct_md_component_t *mdc, uct_rkey_t rkey,
-                                          void *handle)
+static ucs_status_t uct_ugni_rkey_release(uct_component_t *component,
+                                          uct_rkey_t rkey, void *handle)
 {
     ucs_assert(NULL == handle);
     ucs_free((void *)rkey);
     return UCS_OK;
 }
 
-static ucs_status_t uct_ugni_rkey_unpack(uct_md_component_t *mdc, const void *rkey_buffer,
+static ucs_status_t uct_ugni_rkey_unpack(uct_component_t *component,
+                                         const void *rkey_buffer,
                                          uct_rkey_t *rkey_p, void **handle_p)
 {
     const uint64_t *ptr = rkey_buffer;
@@ -169,26 +175,27 @@ static void uct_ugni_md_close(uct_md_h md)
     pthread_mutex_unlock(&uct_ugni_global_lock);
 }
 
-static ucs_status_t uct_ugni_md_open(const char *md_name, const uct_md_config_t *md_config,
-                                     uct_md_h *md_p)
+static ucs_status_t
+uct_ugni_md_open(uct_component_h component,const char *md_name,
+                 const uct_md_config_t *md_config, uct_md_h *md_p)
 {
     ucs_status_t status = UCS_OK;
 
     pthread_mutex_lock(&uct_ugni_global_lock);
     static uct_md_ops_t md_ops = {
-        .close        = uct_ugni_md_close,
-        .query        = uct_ugni_md_query,
-        .mem_alloc    = (void*)ucs_empty_function,
-        .mem_free     = (void*)ucs_empty_function,
-        .mem_reg      = uct_ugni_mem_reg,
-        .mem_dereg    = uct_ugni_mem_dereg,
-        .mkey_pack     = uct_ugni_rkey_pack,
-        .is_mem_type_owned = (void *)ucs_empty_function_return_zero,
+        .close              = uct_ugni_md_close,
+        .query              = uct_ugni_md_query,
+        .mem_alloc          = (void*)ucs_empty_function,
+        .mem_free           = (void*)ucs_empty_function,
+        .mem_reg            = uct_ugni_mem_reg,
+        .mem_dereg          = uct_ugni_mem_dereg,
+        .mkey_pack          = uct_ugni_rkey_pack,
+        .detect_memory_type = ucs_empty_function_return_unsupported,
     };
 
     static uct_ugni_md_t md = {
         .super.ops          = &md_ops,
-        .super.component    = &uct_ugni_md_component,
+        .super.component    = &uct_ugni_component,
         .ref_count          = 0
     };
 
@@ -214,14 +221,22 @@ error:
     return status;
 }
 
-
-UCT_MD_COMPONENT_DEFINE(uct_ugni_md_component,
-                        UCT_UGNI_MD_NAME,
-                        uct_ugni_query_md_resources,
-                        uct_ugni_md_open,
-                        NULL,
-                        uct_ugni_rkey_unpack,
-                        uct_ugni_rkey_release,
-                        "UGNI_",
-                        uct_md_config_table,
-                        uct_md_config_t);
+uct_component_t uct_ugni_component = {
+    .query_md_resources = uct_ugni_query_md_resources,
+    .md_open            = uct_ugni_md_open,
+    .cm_open            = ucs_empty_function_return_unsupported,
+    .rkey_unpack        = uct_ugni_rkey_unpack,
+    .rkey_ptr           = ucs_empty_function_return_unsupported,
+    .rkey_release       = uct_ugni_rkey_release,
+    .name               = UCT_UGNI_MD_NAME,
+    .md_config          = {
+        .name           = "UGNI memory domain",
+        .prefix         = "UGNI_",
+        .table          = uct_md_config_table,
+        .size           = sizeof(uct_md_config_t),
+    },
+    .cm_config          = UCS_CONFIG_EMPTY_GLOBAL_LIST_ENTRY,
+    .tl_list            = UCT_COMPONENT_TL_LIST_INITIALIZER(&uct_ugni_component),
+    .flags              = 0
+};
+UCT_COMPONENT_REGISTER(&uct_ugni_component);

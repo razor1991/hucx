@@ -4,6 +4,10 @@
 * See file LICENSE for terms.
 */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "global_opts.h"
 
 #include <ucs/config/parser.h>
@@ -11,13 +15,16 @@
 #include <ucs/debug/assert.h>
 #include <ucs/debug/log.h>
 #include <ucs/sys/compiler.h>
+#include <ucs/sys/string.h>
 #include <sys/signal.h>
 
 
 ucs_global_opts_t ucs_global_opts = {
-    .log_level             = UCS_LOG_LEVEL_WARN,
+    .log_component         = {UCS_LOG_LEVEL_WARN, "UCX"},
     .log_print_enable      = 0,
     .log_file              = "",
+    .log_file_size         = SIZE_MAX,
+    .log_file_rotate       = 0,
     .log_buffer_size       = 1024,
     .log_data_size         = 0,
     .mpool_fifo            = 0,
@@ -41,7 +48,8 @@ ucs_global_opts_t ucs_global_opts = {
     .stats_format          = UCS_STATS_FULL,
     .rcache_check_pfn      = 0,
     .module_dir            = UCX_MODULE_DIR, /* defined in Makefile.am */
-    .module_log_level      = UCS_LOG_LEVEL_TRACE
+    .module_log_level      = UCS_LOG_LEVEL_TRACE,
+    .arch                  = UCS_ARCH_GLOBAL_OPTS_INITALIZER
 };
 
 static const char *ucs_handle_error_modes[] = {
@@ -61,7 +69,8 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   "UCS logging level. Messages with a level higher or equal to the selected "
   "will be printed.\n"
   "Possible values are: fatal, error, warn, info, debug, trace, data, func, poll.",
-  ucs_offsetof(ucs_global_opts_t, log_level), UCS_CONFIG_TYPE_ENUM(ucs_log_level_names)},
+  ucs_offsetof(ucs_global_opts_t, log_component),
+  UCS_CONFIG_TYPE_LOG_COMP},
 
  {"LOG_FILE", "",
   "If not empty, UCS will print log messages to the specified file instead of stdout.\n"
@@ -70,6 +79,16 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   "  %h - Replaced with host name\n",
   ucs_offsetof(ucs_global_opts_t, log_file),
   UCS_CONFIG_TYPE_STRING},
+
+ {"LOG_FILE_SIZE", "inf",
+  "The maximal size of log file. The maximal log file size has to be >= LOG_BUFFER.",
+  ucs_offsetof(ucs_global_opts_t, log_file_size), UCS_CONFIG_TYPE_MEMUNITS},
+
+ {"LOG_FILE_ROTATE", "0",
+  "The maximal number of backup log files that could be created to save logs\n"
+  "after the previous ones (if any) are completely filled. The value has to be\n"
+  "less than the maximal signed integer value.",
+  ucs_offsetof(ucs_global_opts_t, log_file_rotate), UCS_CONFIG_TYPE_UINT},
 
  {"LOG_BUFFER", "1024",
   "Buffer size for a single log message.",
@@ -138,7 +157,7 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   "Signal number used for async signaling.",
   ucs_offsetof(ucs_global_opts_t, async_signo), UCS_CONFIG_TYPE_SIGNO},
 
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
  {"STATS_DEST", "",
   "Destination to send statistics to. If the value is empty, statistics are\n"
   "not reported. Possible values are:\n"
@@ -176,7 +195,7 @@ static ucs_config_field_t ucs_global_opts_table[] = {
 
 #endif
 
-#if ENABLE_MEMTRACK
+#ifdef ENABLE_MEMTRACK
  {"MEMTRACK_DEST", "",
   "Destination to output memory tracking report to. If the value is empty,\n"
   "results are not reported. Possible values are:\n"
@@ -193,7 +212,7 @@ static ucs_config_field_t ucs_global_opts_table[] = {
    ucs_offsetof(ucs_global_opts_t, profile_mode),
    UCS_CONFIG_TYPE_BITMAP(ucs_profile_mode_names)},
 
-  {"PROFILE_FILE", "",
+  {"PROFILE_FILE", "ucx_%h_%p.prof",
    "File name to dump profiling data to.\n"
    "Substitutions: %h: host, %p: pid, %c: cpu, %t: time, %u: user, %e: exe.\n",
    ucs_offsetof(ucs_global_opts_t, profile_file), UCS_CONFIG_TYPE_STRING},
@@ -202,10 +221,11 @@ static ucs_config_field_t ucs_global_opts_table[] = {
    "Maximal size of profiling log. New records will replace old records.",
    ucs_offsetof(ucs_global_opts_t, profile_log_size), UCS_CONFIG_TYPE_MEMUNITS},
 
-  {"RCACHE_CHECK_PFN", "n",
-   "Registration cache to check that the physical page frame number of a found\n"
-   "memory region was not changed since the time the region was registered.\n",
-   ucs_offsetof(ucs_global_opts_t, rcache_check_pfn), UCS_CONFIG_TYPE_BOOL},
+  {"RCACHE_CHECK_PFN", "0",
+   "Registration cache to check that the physical pages frame number of a found\n"
+   "memory region were not changed since the time the region was registered.\n"
+   "Number of pages to check, 0 - disable checking.",
+   ucs_offsetof(ucs_global_opts_t, rcache_check_pfn), UCS_CONFIG_TYPE_UINT},
 
   {"MODULE_DIR", UCX_MODULE_DIR,
    "Directory to search for loadable modules",
@@ -214,6 +234,10 @@ static ucs_config_field_t ucs_global_opts_table[] = {
   {"MODULE_LOG_LEVEL", "trace",
    "Logging level for module loader\n",
    ucs_offsetof(ucs_global_opts_t, module_log_level), UCS_CONFIG_TYPE_ENUM(ucs_log_level_names)},
+
+  {"", "", NULL,
+   ucs_offsetof(ucs_global_opts_t, arch),
+   UCS_CONFIG_TYPE_TABLE(ucs_arch_global_opts_table)},
 
   {NULL}
 };
@@ -226,7 +250,7 @@ void ucs_global_opts_init()
     ucs_status_t status;
 
     status = ucs_config_parser_fill_opts(&ucs_global_opts, ucs_global_opts_table,
-                                         NULL, NULL, 1);
+                                         UCS_DEFAULT_ENV_PREFIX, NULL, 1);
     if (status != UCS_OK) {
         ucs_fatal("failed to parse global configuration - aborting");
     }
@@ -257,5 +281,6 @@ void ucs_global_opts_release()
 void ucs_global_opts_print(FILE *stream, ucs_config_print_flags_t print_flags)
 {
     ucs_config_parser_print_opts(stream, "Global configuration", &ucs_global_opts,
-                                 ucs_global_opts_table, NULL, print_flags);
+                                 ucs_global_opts_table, NULL,
+                                 UCS_DEFAULT_ENV_PREFIX, print_flags);
 }

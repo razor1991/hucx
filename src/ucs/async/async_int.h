@@ -19,6 +19,7 @@ struct ucs_async_handler {
     int                        id;      /* Event/Timer ID */
     ucs_async_mode_t           mode;    /* Event delivery mode */
     int                        events;  /* Bitmap of events */
+    pthread_t                  caller;  /* Thread which invokes the callback */
     ucs_async_event_cb_t       cb;      /* Callback function */
     void                       *arg;    /* Callback argument */
     ucs_async_context_t        *async;  /* Async context for the handler. Can be NULL */
@@ -30,10 +31,11 @@ struct ucs_async_handler {
 /**
  * Dispatch event coming from async context.
  *
- * @param id         Array of event IDs to dispatch.
- * @param count      Number of events
+ * @param handler_ids   Array of handler IDs to dispatch.
+ * @param count         Number of events
+ * @param events        Events to pass to the handler
  */
-ucs_status_t ucs_async_dispatch_handlers(int *events, size_t count);
+ucs_status_t ucs_async_dispatch_handlers(int *handler_ids, size_t count, int events);
 
 
 /**

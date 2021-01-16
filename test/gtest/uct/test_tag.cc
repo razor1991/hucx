@@ -11,7 +11,6 @@ extern "C" {
 #include "uct_test.h"
 
 #define UCT_TAG_INSTANTIATE_TEST_CASE(_test_case) \
-    _UCT_INSTANTIATE_TEST_CASE(_test_case, rc) \
     _UCT_INSTANTIATE_TEST_CASE(_test_case, rc_mlx5) \
     _UCT_INSTANTIATE_TEST_CASE(_test_case, dc_mlx5)
 
@@ -59,35 +58,26 @@ public:
                                                 "RC_TM_ENABLE", "y");
         ASSERT_TRUE((status == UCS_OK) || (status == UCS_ERR_NO_ELEM));
 
+        status = uct_config_modify(m_iface_config, "RC_TM_MP_SRQ_ENABLE", "no");
+        ASSERT_TRUE((status == UCS_OK) || (status == UCS_ERR_NO_ELEM));
+
         uct_test::init();
 
-        uct_iface_params params;
-        params.field_mask  = UCT_IFACE_PARAM_FIELD_RX_HEADROOM     |
-                             UCT_IFACE_PARAM_FIELD_OPEN_MODE       |
-                             UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_CB  |
-                             UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_ARG |
-                             UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_CB   |
-                             UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_ARG;
+        entity *sender = uct_test::create_entity(0ul, NULL, unexp_eager,
+                                                 unexp_rndv,
+                                                 reinterpret_cast<void*>(this),
+                                                 reinterpret_cast<void*>(this));
+        m_entities.push_back(sender);
 
-        // tl and dev names are taken from resources via GetParam, no need
-        // to fill it here
-        params.rx_headroom = 0;
-        params.open_mode   = UCT_IFACE_OPEN_MODE_DEVICE;
-        params.eager_cb    = unexp_eager;
-        params.eager_arg   = reinterpret_cast<void*>(this);
-        params.rndv_cb     = unexp_rndv;
-        params.rndv_arg    = reinterpret_cast<void*>(this);
+        check_skip_test();
 
         if (UCT_DEVICE_TYPE_SELF == GetParam()->dev_type) {
-            entity *e = uct_test::create_entity(params);
-            m_entities.push_back(e);
-
-            e->connect(0, *e, 0);
+            sender->connect(0, *sender, 0);
         } else {
-            entity *sender = uct_test::create_entity(params);
-            m_entities.push_back(sender);
-
-            entity *receiver = uct_test::create_entity(params);
+            entity *receiver = uct_test::create_entity(0ul, NULL, unexp_eager,
+                                                       unexp_rndv,
+                                                       reinterpret_cast<void*>(this),
+                                                       reinterpret_cast<void*>(this));
             m_entities.push_back(receiver);
 
             sender->connect(0, *receiver, 0);
@@ -147,7 +137,7 @@ public:
     {
         UCS_TEST_GET_BUFFER_IOV(iov, iovcnt, ctx.mbuf->ptr(),
                                 ctx.mbuf->length(), ctx.mbuf->memh(),
-                                sender().iface_attr().cap.tag.eager.max_iov);
+                                e.iface_attr().cap.tag.eager.max_iov);
 
         ucs_status_t status = uct_ep_tag_eager_zcopy(e.ep(0), ctx.tag,
                                                      ctx.imm_data, iov, iovcnt,
@@ -332,6 +322,7 @@ public:
         // Message should be reported as unexpected and filled with
         // recv seed (unchanged), as the incoming tag does not match the expected
         check_rx_completion(r_ctx, false, RECV_SEED);
+        ASSERT_UCS_OK(tag_cancel(receiver(), r_ctx, 1));
         flush();
     }
 
@@ -401,7 +392,8 @@ public:
     }
 
     static ucs_status_t unexp_eager(void *arg, void *data, size_t length,
-                                    unsigned flags, uct_tag_t stag, uint64_t imm)
+                                    unsigned flags, uct_tag_t stag,
+                                    uint64_t imm, void **context)
     {
         recv_ctx *user_ctx = reinterpret_cast<recv_ctx*>(imm);
         user_ctx->unexp    = true;
@@ -447,7 +439,9 @@ public:
 
     static ucs_log_func_rc_t
     log_ep_destroy(const char *file, unsigned line, const char *function,
-                   ucs_log_level_t level, const char *message, va_list ap)
+                   ucs_log_level_t level,
+                   const ucs_log_component_config_t *comp_conf,
+                   const char *message, va_list ap)
     {
         if (level == UCS_LOG_LEVEL_WARN) {
             // Ignore warnings about uncompleted operations during ep destroy
@@ -480,94 +474,94 @@ protected:
 
 bool test_tag::is_am_received = false;
 
-UCS_TEST_P(test_tag, tag_eager_short_expected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_short_expected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_SHORT))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_SHORT);
     test_tag_expected(static_cast<send_func>(&test_tag::tag_eager_short),
                       sender().iface_attr().cap.tag.eager.max_short);
 }
 
-UCS_TEST_P(test_tag, tag_eager_bcopy_expected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_bcopy_expected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
     test_tag_expected(static_cast<send_func>(&test_tag::tag_eager_bcopy),
                       sender().iface_attr().cap.tag.eager.max_bcopy);
 }
 
-UCS_TEST_P(test_tag, tag_eager_zcopy_expected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_zcopy_expected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY);
     test_tag_expected(static_cast<send_func>(&test_tag::tag_eager_zcopy),
                       sender().iface_attr().cap.tag.eager.max_zcopy);
 }
 
-UCS_TEST_P(test_tag, tag_rndv_zcopy_expected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_rndv_zcopy_expected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
     test_tag_expected(static_cast<send_func>(&test_tag::tag_rndv_zcopy),
                       sender().iface_attr().cap.tag.rndv.max_zcopy);
 }
 
-UCS_TEST_P(test_tag, tag_eager_bcopy_unexpected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_bcopy_unexpected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
     test_tag_unexpected(static_cast<send_func>(&test_tag::tag_eager_bcopy),
                         sender().iface_attr().cap.tag.eager.max_bcopy);
 }
 
-UCS_TEST_P(test_tag, tag_eager_zcopy_unexpected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_zcopy_unexpected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY);
     test_tag_unexpected(static_cast<send_func>(&test_tag::tag_eager_zcopy),
                         sender().iface_attr().cap.tag.eager.max_bcopy);
 }
 
-UCS_TEST_P(test_tag, tag_rndv_zcopy_unexpected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_rndv_zcopy_unexpected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
     test_tag_unexpected(static_cast<send_func>(&test_tag::tag_rndv_zcopy));
 }
 
-UCS_TEST_P(test_tag, tag_eager_bcopy_wrong_tag)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_bcopy_wrong_tag,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
     test_tag_wrong_tag(static_cast<send_func>(&test_tag::tag_eager_bcopy));
 }
 
-UCS_TEST_P(test_tag, tag_eager_zcopy_wrong_tag)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_zcopy_wrong_tag,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY);
     test_tag_wrong_tag(static_cast<send_func>(&test_tag::tag_eager_zcopy));
 }
 
-UCS_TEST_P(test_tag, tag_eager_short_tag_mask)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_short_tag_mask,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_SHORT))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_SHORT);
     test_tag_mask(static_cast<send_func>(&test_tag::tag_eager_short));
 }
 
-UCS_TEST_P(test_tag, tag_eager_bcopy_tag_mask)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_bcopy_tag_mask,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
     test_tag_mask(static_cast<send_func>(&test_tag::tag_eager_bcopy));
 }
 
-UCS_TEST_P(test_tag, tag_eager_zcopy_tag_mask)
+UCS_TEST_SKIP_COND_P(test_tag, tag_eager_zcopy_tag_mask,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_ZCOPY);
     test_tag_mask(static_cast<send_func>(&test_tag::tag_eager_zcopy));
 }
 
-UCS_TEST_P(test_tag, tag_rndv_zcopy_tag_mask)
+UCS_TEST_SKIP_COND_P(test_tag, tag_rndv_zcopy_tag_mask,
+                     !check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
     test_tag_mask(static_cast<send_func>(&test_tag::tag_rndv_zcopy));
 }
 
-UCS_TEST_P(test_tag, tag_hold_uct_desc)
+UCS_TEST_SKIP_COND_P(test_tag, tag_hold_uct_desc,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+                                 UCT_IFACE_FLAG_TAG_RNDV_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY | UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
-
     int n = 10;
     int msg_size = ucs_min(sender().iface_attr().cap.tag.eager.max_bcopy,
                            sender().iface_attr().cap.tag.rndv.max_zcopy);
@@ -587,23 +581,21 @@ UCS_TEST_P(test_tag, tag_hold_uct_desc)
 }
 
 
-UCS_TEST_P(test_tag, tag_send_no_tag)
+UCS_TEST_SKIP_COND_P(test_tag, tag_send_no_tag,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-  check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
-
-  uct_iface_set_am_handler(receiver().iface(), 0, am_handler, NULL, 0);
-  mapped_buffer lbuf(200, SEND_SEED, sender());
-  ssize_t len = uct_ep_am_bcopy(sender().ep(0), 0, mapped_buffer::pack,
-                                reinterpret_cast<void*>(&lbuf), 0);
-  EXPECT_EQ(lbuf.length(), static_cast<size_t>(len));
-  wait_for_flag(&is_am_received);
-  EXPECT_TRUE(is_am_received);
+    uct_iface_set_am_handler(receiver().iface(), 0, am_handler, NULL, 0);
+    mapped_buffer lbuf(200, SEND_SEED, sender());
+    ssize_t len = uct_ep_am_bcopy(sender().ep(0), 0, mapped_buffer::pack,
+                                  reinterpret_cast<void*>(&lbuf), 0);
+    EXPECT_EQ(lbuf.length(), static_cast<size_t>(len));
+    wait_for_flag(&is_am_received);
+    EXPECT_TRUE(is_am_received);
 }
 
-UCS_TEST_P(test_tag, tag_cancel_force)
+UCS_TEST_SKIP_COND_P(test_tag, tag_cancel_force,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
-
     const size_t length = 128;
     mapped_buffer recvbuf(length, RECV_SEED, receiver());
     recv_ctx r_ctx;
@@ -626,10 +618,9 @@ UCS_TEST_P(test_tag, tag_cancel_force)
     check_rx_completion(r_ctx, false, SEND_SEED);
 }
 
-UCS_TEST_P(test_tag, tag_cancel_noforce)
+UCS_TEST_SKIP_COND_P(test_tag, tag_cancel_noforce,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
-
     const size_t length = 128;
     mapped_buffer recvbuf(length, RECV_SEED, receiver());
     recv_ctx r_ctx;
@@ -647,21 +638,20 @@ UCS_TEST_P(test_tag, tag_cancel_noforce)
     EXPECT_EQ(r_ctx.status, UCS_ERR_CANCELED);
 }
 
-UCS_TEST_P(test_tag, tag_limit, "TM_SYNC_RATIO?=0.0")
+UCS_TEST_SKIP_COND_P(test_tag, tag_limit,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
-
     const size_t length = 32;
-    mapped_buffer recvbuf(length, RECV_SEED, receiver());
     ucs::ptr_vector<recv_ctx> rctxs;
-    recv_ctx *rctx_p;
+    ucs::ptr_vector<mapped_buffer> rbufs;
     ucs_status_t status;
 
     do {
-        // Can use the same recv buffer, as no sends will be issued.
-        rctx_p = (new recv_ctx());
-        init_recv_ctx(*rctx_p, &recvbuf, 1);
+        recv_ctx *rctx_p     = new recv_ctx();
+        mapped_buffer *buf_p = new mapped_buffer(length, RECV_SEED, receiver());
+        init_recv_ctx(*rctx_p, buf_p, 1);
         rctxs.push_back(rctx_p);
+        rbufs.push_back(buf_p);
         status = tag_post(receiver(), *rctx_p);
         // Make sure send resources are acknowledged, as we
         // awaiting for tag space exhaustion.
@@ -680,20 +670,64 @@ UCS_TEST_P(test_tag, tag_limit, "TM_SYNC_RATIO?=0.0")
         status = tag_post(receiver(), rctxs.at(0));
     } while ((ucs_get_time() < deadline) && (status == UCS_ERR_EXCEEDS_LIMIT));
     ASSERT_UCS_OK(status);
+
+    // remove posted tags from HW
+    for (ucs::ptr_vector<recv_ctx>::const_iterator iter = rctxs.begin();
+         iter != rctxs.end() - 1; ++iter) {
+        ASSERT_UCS_OK(tag_cancel(receiver(), **iter, 1));
+    }
 }
 
-UCS_TEST_P(test_tag, sw_rndv_expected)
+UCS_TEST_SKIP_COND_P(test_tag, tag_post_same,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY | UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
+    const size_t length = 128;
+    mapped_buffer recvbuf(length, RECV_SEED, receiver());
+    recv_ctx r_ctx;
+    init_recv_ctx(r_ctx, &recvbuf, 1);
 
+    ASSERT_UCS_OK(tag_post(receiver(), r_ctx));
+
+    // Can't post the same buffer until it is completed/cancelled
+    ucs_status_t status = tag_post(receiver(), r_ctx);
+    EXPECT_EQ(status, UCS_ERR_ALREADY_EXISTS);
+
+    // Cancel with force, should be able to re-post immediately
+    ASSERT_UCS_OK(tag_cancel(receiver(), r_ctx, 1));
+    ASSERT_UCS_OK(tag_post(receiver(), r_ctx));
+
+    // Cancel without force, should be able to re-post when receive completion
+    ASSERT_UCS_OK(tag_cancel(receiver(), r_ctx, 0));
+    status = tag_post(receiver(), r_ctx);
+    EXPECT_EQ(status, UCS_ERR_ALREADY_EXISTS); // no completion yet
+
+    wait_for_flag(&r_ctx.comp); // cancel completed, should be able to post
+    ASSERT_UCS_OK(tag_post(receiver(), r_ctx));
+
+    // Now send something to trigger rx completion
+    init_recv_ctx(r_ctx, &recvbuf, 1); // reinit rx to clear completed states
+    mapped_buffer sendbuf(length, SEND_SEED, sender());
+    send_ctx s_ctx;
+    init_send_ctx(s_ctx, &sendbuf, 1, reinterpret_cast<uint64_t>(&r_ctx));
+    ASSERT_UCS_OK(tag_eager_bcopy(sender(), s_ctx));
+
+    wait_for_flag(&r_ctx.comp); // message consumed, should be able to post
+    ASSERT_UCS_OK(tag_post(receiver(), r_ctx));
+
+    ASSERT_UCS_OK(tag_cancel(receiver(), r_ctx, 1));
+}
+
+UCS_TEST_SKIP_COND_P(test_tag, sw_rndv_expected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+                                 UCT_IFACE_FLAG_TAG_RNDV_ZCOPY))
+{
     test_tag_expected(static_cast<send_func>(&test_tag::tag_rndv_request),
                       sender().iface_attr().cap.tag.rndv.max_hdr, true);
 }
 
-UCS_TEST_P(test_tag, rndv_limit)
+UCS_TEST_SKIP_COND_P(test_tag, rndv_limit,
+                     !check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
-
     mapped_buffer sendbuf(8, SEND_SEED, sender());
     ucs::ptr_vector<send_ctx> sctxs;
     ucs_status_t status;
@@ -723,16 +757,17 @@ UCS_TEST_P(test_tag, rndv_limit)
     ucs_log_pop_handler();
 }
 
-UCS_TEST_P(test_tag, sw_rndv_unexpected)
+UCS_TEST_SKIP_COND_P(test_tag, sw_rndv_unexpected,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+                                 UCT_IFACE_FLAG_TAG_RNDV_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY | UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
     test_tag_unexpected(static_cast<send_func>(&test_tag::tag_rndv_request));
 }
 
 UCT_TAG_INSTANTIATE_TEST_CASE(test_tag)
 
 
-#if ENABLE_STATS && IBV_HW_TM
+#if defined (ENABLE_STATS) && IBV_HW_TM
 extern "C" {
 #include <uct/api/uct.h>
 #include <uct/ib/rc/accel/rc_mlx5_common.h>
@@ -793,12 +828,11 @@ public:
     }
 };
 
-UCS_TEST_P(test_tag_stats, tag_expected_eager)
+UCS_TEST_SKIP_COND_P(test_tag_stats, tag_expected_eager,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_SHORT |
+                                 UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+                                 UCT_IFACE_FLAG_TAG_EAGER_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_SHORT |
-               UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
-               UCT_IFACE_FLAG_TAG_EAGER_ZCOPY);
-
     std::pair<send_func, std::pair<size_t, int> > sfuncs[3] = {
                 std::make_pair(static_cast<send_func>(&test_tag::tag_eager_short),
                 std::make_pair(sender().iface_attr().cap.tag.eager.max_short,
@@ -822,10 +856,10 @@ UCS_TEST_P(test_tag_stats, tag_expected_eager)
     }
 }
 
-UCS_TEST_P(test_tag_stats, tag_unexpected_eager)
+UCS_TEST_SKIP_COND_P(test_tag_stats, tag_unexpected_eager,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+                                 UCT_IFACE_FLAG_TAG_EAGER_ZCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY | UCT_IFACE_FLAG_TAG_EAGER_ZCOPY);
-
     std::pair<send_func, std::pair<size_t, int> > sfuncs[2] = {
                 std::make_pair(static_cast<send_func>(&test_tag::tag_eager_bcopy),
                 std::make_pair(sender().iface_attr().cap.tag.eager.max_bcopy,
@@ -845,9 +879,9 @@ UCS_TEST_P(test_tag_stats, tag_unexpected_eager)
     }
 }
 
-UCS_TEST_P(test_tag_stats, tag_list_ops)
+UCS_TEST_SKIP_COND_P(test_tag_stats, tag_list_ops,
+                     !check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
     mapped_buffer recvbuf(32, RECV_SEED, receiver());
     recv_ctx rctx;
 
@@ -871,10 +905,10 @@ UCS_TEST_P(test_tag_stats, tag_list_ops)
 }
 
 
-UCS_TEST_P(test_tag_stats, tag_rndv)
+UCS_TEST_SKIP_COND_P(test_tag_stats, tag_rndv,
+                     !check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY |
+                                 UCT_IFACE_FLAG_TAG_EAGER_BCOPY))
 {
-    check_caps(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY | UCT_IFACE_FLAG_TAG_EAGER_BCOPY);
-
     size_t len = sender().iface_attr().cap.tag.rndv.max_zcopy / 8;
 
     // Check UNEXP_RNDV on the receiver
@@ -897,5 +931,361 @@ UCS_TEST_P(test_tag_stats, tag_rndv)
 }
 
 UCT_TAG_INSTANTIATE_TEST_CASE(test_tag_stats)
+
+#endif
+
+
+#if IBV_HW_TM
+
+extern "C" {
+#include <uct/ib/rc/accel/rc_mlx5_common.h>
+}
+
+// TODO: Unite with test_tag + add GRH testing for DC
+class test_tag_mp_xrq : public uct_test {
+public:
+    static const uint64_t SEND_SEED = 0xa1a1a1a1a1a1a1a1ul;
+    static const uint64_t AM_ID     = 1;
+    typedef void (test_tag_mp_xrq::*send_func)(mapped_buffer*);
+
+    virtual void init();
+    test_tag_mp_xrq();
+    uct_rc_mlx5_iface_common_t* rc_mlx5_iface(entity &e);
+    void send_eager_bcopy(mapped_buffer *buf);
+    void send_eager_zcopy(mapped_buffer *buf);
+    void send_rndv_zcopy(mapped_buffer *buf);
+    void send_rndv_request(mapped_buffer *buf);
+    void send_am_bcopy(mapped_buffer *buf);
+    void test_common(send_func sfunc, size_t num_segs, size_t exp_segs = 1,
+                     bool is_eager = true);
+
+    static ucs_status_t am_handler(void *arg, void *data, size_t length,
+                                   unsigned flags);
+
+    static ucs_status_t unexp_eager(void *arg, void *data, size_t length,
+                                    unsigned flags, uct_tag_t stag,
+                                    uint64_t imm, void **context);
+
+    static ucs_status_t unexp_rndv(void *arg, unsigned flags, uint64_t stag,
+                                   const void *header, unsigned header_length,
+                                   uint64_t remote_addr, size_t length,
+                                   const void *rkey_buf);
+
+protected:
+    static size_t      m_rx_counter;
+    std::vector<void*> m_uct_descs;
+    bool               m_hold_uct_desc;
+
+    uct_test::entity& sender() {
+        return **m_entities.begin();
+    }
+
+    uct_test::entity& receiver() {
+        return **(m_entities.end() - 1);
+    }
+
+private:
+    ucs_status_t unexp_handler(void *data, unsigned flags, uint64_t imm,
+                               void **context);
+    ucs_status_t handle_uct_desc(void *data, unsigned flags);
+    void set_env_var_or_skip(void *config, const char *var, const char *val);
+    size_t           m_max_hdr;
+    bool             m_first_received;
+    bool             m_last_received;
+    uct_completion_t m_uct_comp;
+};
+
+size_t test_tag_mp_xrq::m_rx_counter = 0;
+
+test_tag_mp_xrq::test_tag_mp_xrq() : m_hold_uct_desc(false),
+                                     m_first_received(false),
+                                     m_last_received(false)
+{
+    m_max_hdr        = sizeof(ibv_tmh) + sizeof(ibv_rvh);
+    m_uct_comp.count = 512; // We do not need completion func to be invoked
+    m_uct_comp.func  = NULL;
+}
+
+uct_rc_mlx5_iface_common_t* test_tag_mp_xrq::rc_mlx5_iface(entity &e)
+{
+    return ucs_derived_of(e.iface(), uct_rc_mlx5_iface_common_t);
+}
+
+void test_tag_mp_xrq::set_env_var_or_skip(void *config, const char *var,
+                                          const char *val)
+{
+    ucs_status_t status = uct_config_modify(config, var, val);
+    if (status != UCS_OK) {
+        ucs_warn("%s", ucs_status_string(status));
+        UCS_TEST_SKIP_R(std::string("Can't set ") + var);
+    }
+}
+
+void test_tag_mp_xrq::init()
+{
+    set_env_var_or_skip(m_iface_config, "RC_TM_ENABLE", "y");
+    set_env_var_or_skip(m_iface_config, "RC_TM_MP_SRQ_ENABLE", "try");
+    set_env_var_or_skip(m_iface_config, "RC_TM_MP_NUM_STRIDES", "8");
+    set_env_var_or_skip(m_md_config, "MLX5_DEVX_OBJECTS", "dct,dcsrq,rcsrq,rcqp");
+
+    uct_test::init();
+
+    entity *sender = uct_test::create_entity(0ul, NULL, unexp_eager, unexp_rndv,
+                                             reinterpret_cast<void*>(this),
+                                             reinterpret_cast<void*>(this));
+    m_entities.push_back(sender);
+
+    entity *receiver = uct_test::create_entity(0ul, NULL, unexp_eager, unexp_rndv,
+                                               reinterpret_cast<void*>(this),
+                                               reinterpret_cast<void*>(this));
+    m_entities.push_back(receiver);
+
+    if (!UCT_RC_MLX5_MP_ENABLED(rc_mlx5_iface(test_tag_mp_xrq::sender()))) {
+        UCS_TEST_SKIP_R("No MP XRQ support");
+    }
+
+    sender->connect(0, *receiver, 0);
+
+    uct_iface_set_am_handler(receiver->iface(), AM_ID, am_handler, this, 0);
+}
+
+void test_tag_mp_xrq::send_eager_bcopy(mapped_buffer *buf)
+{
+    ssize_t len = uct_ep_tag_eager_bcopy(sender().ep(0), 0x11,
+                                         reinterpret_cast<uint64_t>(this),
+                                         mapped_buffer::pack,
+                                         reinterpret_cast<void*>(buf), 0);
+
+    EXPECT_EQ(buf->length(), static_cast<size_t>(len));
+}
+
+void test_tag_mp_xrq::send_eager_zcopy(mapped_buffer *buf)
+{
+    UCS_TEST_GET_BUFFER_IOV(iov, iovcnt, buf->ptr(), buf->length(), buf->memh(),
+                            sender().iface_attr().cap.tag.eager.max_iov);
+
+    ucs_status_t status = uct_ep_tag_eager_zcopy(sender().ep(0), 0x11,
+                                                 reinterpret_cast<uint64_t>(this),
+                                                 iov, iovcnt, 0, &m_uct_comp);
+    ASSERT_UCS_OK_OR_INPROGRESS(status);
+}
+
+void test_tag_mp_xrq::send_rndv_zcopy(mapped_buffer *buf)
+{
+    UCS_TEST_GET_BUFFER_IOV(iov, iovcnt, buf->ptr(), buf->length(), buf->memh(),
+                            sender().iface_attr().cap.tag.rndv.max_iov);
+
+    uint64_t dummy_hdr       = 0xFAFA;
+    ucs_status_ptr_t rndv_op = uct_ep_tag_rndv_zcopy(sender().ep(0), 0x11, &dummy_hdr,
+                                                     sizeof(dummy_hdr), iov,
+                                                     iovcnt, 0, &m_uct_comp);
+    ASSERT_FALSE(UCS_PTR_IS_ERR(rndv_op));
+
+    // There will be no real RNDV performed, cancel the op to avoid mpool
+    // warning on exit
+    ASSERT_UCS_OK(uct_ep_tag_rndv_cancel(sender().ep(0),rndv_op));
+}
+
+void test_tag_mp_xrq::send_rndv_request(mapped_buffer *buf)
+{
+    size_t size = sender().iface_attr().cap.tag.rndv.max_hdr;
+    void *hdr   = alloca(size);
+
+    ASSERT_UCS_OK(uct_ep_tag_rndv_request(sender().ep(0), 0x11, hdr, size, 0));
+}
+
+void test_tag_mp_xrq::send_am_bcopy(mapped_buffer *buf)
+{
+    ssize_t len = uct_ep_am_bcopy(sender().ep(0), AM_ID, mapped_buffer::pack,
+                                  reinterpret_cast<void*>(buf), 0);
+
+    EXPECT_EQ(buf->length(), static_cast<size_t>(len));
+}
+
+void test_tag_mp_xrq::test_common(send_func sfunc, size_t num_segs,
+                                  size_t exp_segs, bool is_eager)
+{
+    size_t seg_size  = rc_mlx5_iface(sender())->super.super.config.seg_size;
+    size_t seg_num   = is_eager ? num_segs : 1;
+    size_t exp_val   = is_eager ? exp_segs : 1;
+    size_t size      = (seg_size * seg_num) - m_max_hdr;
+    m_rx_counter     = 0;
+    m_first_received = m_last_received = false;
+
+    EXPECT_TRUE(size <= sender().iface_attr().cap.tag.eager.max_bcopy);
+    mapped_buffer buf(size, SEND_SEED, sender());
+
+    (this->*sfunc)(&buf);
+
+    wait_for_value(&m_rx_counter, exp_val, true);
+    EXPECT_EQ(exp_val, m_rx_counter);
+    EXPECT_EQ(is_eager, m_first_received); // relevant for eager only
+    EXPECT_EQ(is_eager, m_last_received);  // relevant for eager only
+}
+
+ucs_status_t test_tag_mp_xrq::handle_uct_desc(void *data, unsigned flags)
+{
+    if ((flags & UCT_CB_PARAM_FLAG_DESC) && m_hold_uct_desc) {
+        m_uct_descs.push_back(data);
+        return UCS_INPROGRESS;
+    }
+
+    return UCS_OK;
+}
+
+ucs_status_t test_tag_mp_xrq::am_handler(void *arg, void *data, size_t length,
+                                         unsigned flags)
+{
+   EXPECT_TRUE(flags & UCT_CB_PARAM_FLAG_FIRST);
+   EXPECT_FALSE(flags & UCT_CB_PARAM_FLAG_MORE);
+
+   m_rx_counter++;
+
+   test_tag_mp_xrq *self = reinterpret_cast<test_tag_mp_xrq*>(arg);
+   return self->handle_uct_desc(data, flags);
+}
+
+ucs_status_t test_tag_mp_xrq::unexp_handler(void *data, unsigned flags,
+                                            uint64_t imm, void **context)
+{
+    void *self = reinterpret_cast<void*>(this);
+
+    if (flags & UCT_CB_PARAM_FLAG_FIRST) {
+        // Set the message context which will be passed back with the rest of
+        // message fragments
+        *context         = self;
+        m_first_received = true;
+
+    } else {
+        // Check that the correct message context is passed with all fragments
+        EXPECT_EQ(self, *context);
+    }
+
+    if (!(flags & UCT_CB_PARAM_FLAG_MORE)) {
+        // Last message should contain valid immediate value
+        EXPECT_EQ(reinterpret_cast<uint64_t>(this), imm);
+        m_last_received = true;
+    } else {
+        // Immediate value is passed with the last message only
+        EXPECT_EQ(0ul, imm);
+    }
+
+
+    return handle_uct_desc(data, flags);
+}
+
+ucs_status_t test_tag_mp_xrq::unexp_eager(void *arg, void *data, size_t length,
+                                          unsigned flags, uct_tag_t stag,
+                                          uint64_t imm, void **context)
+{
+    test_tag_mp_xrq *self = reinterpret_cast<test_tag_mp_xrq*>(arg);
+
+    m_rx_counter++;
+
+    return self->unexp_handler(data, flags, imm, context);
+}
+
+ucs_status_t test_tag_mp_xrq::unexp_rndv(void *arg, unsigned flags,
+                                         uint64_t stag, const void *header,
+                                         unsigned header_length,
+                                         uint64_t remote_addr, size_t length,
+                                         const void *rkey_buf)
+{
+    EXPECT_FALSE(flags & UCT_CB_PARAM_FLAG_FIRST);
+    EXPECT_FALSE(flags & UCT_CB_PARAM_FLAG_MORE);
+
+    m_rx_counter++;
+
+    return UCS_OK;
+}
+
+UCS_TEST_P(test_tag_mp_xrq, config)
+{
+    uct_rc_mlx5_iface_common_t *iface = rc_mlx5_iface(sender());
+
+    // MP XRQ is supported with tag offload only
+    EXPECT_TRUE(UCT_RC_MLX5_TM_ENABLED(iface));
+
+    // With MP XRQ segment size should be equal to MTU, because HW generates
+    // CQE per each received MTU
+    size_t mtu = uct_ib_mtu_value(uct_ib_iface_port_attr(&(iface)->super.super)->active_mtu);
+    EXPECT_EQ(mtu, iface->super.super.config.seg_size);
+
+    const uct_iface_attr *attrs = &sender().iface_attr();
+
+    // Max tag bcopy is limited by tag tx memory pool
+    EXPECT_EQ(iface->tm.max_bcopy - sizeof(ibv_tmh),
+              attrs->cap.tag.eager.max_bcopy);
+    EXPECT_GT(attrs->cap.tag.eager.max_bcopy,
+              iface->super.super.config.seg_size);
+
+    // Max tag zcopy is limited by maximal IB message size
+    EXPECT_EQ(uct_ib_iface_port_attr(&iface->super.super)->max_msg_sz - sizeof(ibv_tmh),
+              attrs->cap.tag.eager.max_zcopy);
+
+    // Maximal AM size should not exceed segment size, so it would always
+    // arrive in one-fragment packet (with header it should be strictly less)
+    EXPECT_LT(attrs->cap.am.max_bcopy, iface->super.super.config.seg_size);
+    EXPECT_LT(attrs->cap.am.max_zcopy, iface->super.super.config.seg_size);
+}
+
+UCS_TEST_P(test_tag_mp_xrq, desc_release)
+{
+    m_hold_uct_desc = true; // We want to "hold" UCT memory descriptors
+    std::pair<send_func, bool> sfuncs[5] = {
+              std::make_pair(&test_tag_mp_xrq::send_eager_bcopy,  true),
+              std::make_pair(&test_tag_mp_xrq::send_eager_zcopy,  true),
+              std::make_pair(&test_tag_mp_xrq::send_rndv_zcopy,   false),
+              std::make_pair(&test_tag_mp_xrq::send_rndv_request, false),
+              std::make_pair(&test_tag_mp_xrq::send_am_bcopy,     false)
+    };
+
+    for (int i = 0; i < 5; ++i) {
+        test_common(sfuncs[i].first, 3, 3, sfuncs[i].second);
+    }
+
+    for (ucs::ptr_vector<void>::const_iterator iter = m_uct_descs.begin();
+         iter != m_uct_descs.end(); ++iter)
+    {
+        uct_iface_release_desc(*iter);
+    }
+}
+
+UCS_TEST_P(test_tag_mp_xrq, am)
+{
+    test_common(&test_tag_mp_xrq::send_am_bcopy, 1, 1, false);
+}
+
+UCS_TEST_P(test_tag_mp_xrq, bcopy_eager_only)
+{
+    test_common(&test_tag_mp_xrq::send_eager_bcopy, 1);
+}
+
+UCS_TEST_P(test_tag_mp_xrq, zcopy_eager_only)
+{
+    test_common(&test_tag_mp_xrq::send_eager_zcopy, 1);
+}
+
+UCS_TEST_P(test_tag_mp_xrq, bcopy_eager)
+{
+    test_common(&test_tag_mp_xrq::send_eager_bcopy, 5, 5);
+}
+
+UCS_TEST_P(test_tag_mp_xrq, zcopy_eager)
+{
+    test_common(&test_tag_mp_xrq::send_eager_zcopy, 5, 5);
+}
+
+UCS_TEST_P(test_tag_mp_xrq, rndv_zcopy)
+{
+    test_common(&test_tag_mp_xrq::send_rndv_zcopy, 1, 1, false);
+}
+
+UCS_TEST_P(test_tag_mp_xrq, rndv_request)
+{
+    test_common(&test_tag_mp_xrq::send_rndv_request, 1, 1, false);
+}
+
+UCT_TAG_INSTANTIATE_TEST_CASE(test_tag_mp_xrq)
 
 #endif

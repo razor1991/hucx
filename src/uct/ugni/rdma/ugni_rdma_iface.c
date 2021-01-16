@@ -4,6 +4,10 @@
  * See file LICENSE for terms.
  */
 
+#ifdef HAVE_CONFIG_H
+#  include "config.h"
+#endif
+
 #include "ugni_rdma_ep.h"
 #include "ugni_rdma_iface.h"
 #include <uct/ugni/base/ugni_def.h>
@@ -12,7 +16,7 @@
 
 static ucs_config_field_t uct_ugni_rdma_iface_config_table[] = {
     /* This tuning controls the allocation priorities for bouncing buffers */
-    { "", "MAX_SHORT=2048;MAX_BCOPY=2048;ALLOC=huge,mmap,heap", NULL,
+    { "", "ALLOC=huge,mmap,heap", NULL,
     ucs_offsetof(uct_ugni_rdma_iface_config_t, super), UCS_CONFIG_TYPE_TABLE(uct_iface_config_table)},
 
     UCT_IFACE_MPOOL_CONFIG_FIELDS("RDMA", -1, 0, "rdma",
@@ -23,19 +27,12 @@ static ucs_config_field_t uct_ugni_rdma_iface_config_table[] = {
     {NULL}
 };
 
-static ucs_status_t uct_ugni_rdma_query_tl_resources(uct_md_h md,
-                                                     uct_tl_resource_desc_t **resource_p,
-                                                     unsigned *num_resources_p)
-{
-    return uct_ugni_query_tl_resources(md, UCT_UGNI_RDMA_TL_NAME,
-                                       resource_p, num_resources_p);
-}
-
 static ucs_status_t uct_ugni_rdma_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 {
     uct_ugni_rdma_iface_t *iface = ucs_derived_of(tl_iface, uct_ugni_rdma_iface_t);
 
-    memset(iface_attr, 0, sizeof(uct_iface_attr_t));
+    uct_base_iface_query(&iface->super.super, iface_attr);
+
     iface_attr->cap.put.max_short       = iface->config.fma_seg_size;
     iface_attr->cap.put.max_bcopy       = iface->config.fma_seg_size;
     iface_attr->cap.put.min_zcopy       = 0;
@@ -96,11 +93,12 @@ static ucs_status_t uct_ugni_rdma_iface_query(uct_iface_h tl_iface, uct_iface_at
                                               UCS_BIT(UCT_ATOMIC_OP_SWAP)  |
                                               UCS_BIT(UCT_ATOMIC_OP_CSWAP);
     }
-    iface_attr->overhead               = 80e-9; /* 80 ns */
-    iface_attr->latency.overhead       = 900e-9; /* 900 ns */
-    iface_attr->latency.growth         = 0;
-    iface_attr->bandwidth              = 6911 * pow(1024,2); /* bytes */
-    iface_attr->priority               = 0;
+    iface_attr->overhead            = 80e-9; /* 80 ns */
+    iface_attr->latency             = ucs_linear_func_make(900e-9, 0); /* 900 ns */
+    iface_attr->bandwidth.dedicated = 6911.0 * UCS_MBYTE; /* bytes */
+    iface_attr->bandwidth.shared    = 0;
+    iface_attr->priority            = 0;
+
     return UCS_OK;
 }
 
@@ -176,6 +174,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_ugni_rdma_iface_t)
     ucs_mpool_cleanup(&self->free_desc_buffer, 1);
     ucs_mpool_cleanup(&self->free_desc, 1);
 }
+
+extern ucs_class_t UCS_CLASS_DECL_NAME(uct_ugni_rdma_iface_t);
 
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_ugni_rdma_iface_t, uct_iface_t);
 
@@ -373,11 +373,6 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_ugni_rdma_iface_t, uct_iface_t, uct_md_h,
                           uct_worker_h, const uct_iface_params_t*,
                           const uct_iface_config_t*);
 
-UCT_TL_COMPONENT_DEFINE(uct_ugni_rdma_tl_component,
-                        uct_ugni_rdma_query_tl_resources,
-                        uct_ugni_rdma_iface_t,
-                        UCT_UGNI_RDMA_TL_NAME,
-                        "UGNI_RDMA",
-                        uct_ugni_rdma_iface_config_table,
-                        uct_ugni_rdma_iface_config_t);
-UCT_MD_REGISTER_TL(&uct_ugni_md_component, &uct_ugni_rdma_tl_component);
+UCT_TL_DEFINE(&uct_ugni_component, ugni_rdma, uct_ugni_query_devices,
+              uct_ugni_rdma_iface_t, "UGNI_RDMA_",
+              uct_ugni_rdma_iface_config_table, uct_ugni_rdma_iface_config_t);

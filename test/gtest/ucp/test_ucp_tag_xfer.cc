@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
 * Copyright (C) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
@@ -10,6 +10,7 @@
 #include "ucp_datatype.h"
 
 extern "C" {
+#include <ucp/core/ucp_resource.h>
 #include <ucp/core/ucp_ep.inl>
 #include <ucs/datastruct/queue.h>
 }
@@ -23,23 +24,46 @@ public:
         VARIANT_DEFAULT,
         VARIANT_ERR_HANDLING,
         VARIANT_RNDV_PUT_ZCOPY,
+        VARIANT_RNDV_GET_ZCOPY,
         VARIANT_RNDV_AUTO,
         VARIANT_SEND_NBR,
     };
 
+    test_ucp_tag_xfer() {
+        // TODO: test offload and offload MP as different variants
+        enable_tag_mp_offload();
+
+        if (RUNNING_ON_VALGRIND) {
+            // Alow using TM MP offload for messages with a size of at least
+            // 10000 bytes by setting HW TM segment size to 10 kB, since each
+            // packet in TM MP offload is MTU-size buffer (i.e., in most cases
+            // it is 4 kB segments)
+            m_env.push_back(new ucs::scoped_setenv("UCX_RC_TM_SEG_SIZE", "10k"));
+            m_env.push_back(new ucs::scoped_setenv("UCX_TCP_RX_SEG_SIZE", "8k"));
+        }
+    }
+
     virtual void init() {
         if (GetParam().variant == VARIANT_RNDV_PUT_ZCOPY) {
             modify_config("RNDV_SCHEME", "put_zcopy");
+        } else if (GetParam().variant == VARIANT_RNDV_GET_ZCOPY) {
+            modify_config("RNDV_SCHEME", "get_zcopy");
         } else if (GetParam().variant == VARIANT_RNDV_AUTO) {
             modify_config("RNDV_SCHEME", "auto");
         }
         modify_config("MAX_EAGER_LANES", "2");
         modify_config("MAX_RNDV_LANES", "2");
-        m_env.push_back(new ucs::scoped_setenv("UCX_RC_TM_ENABLE", "y"));
-        if (RUNNING_ON_VALGRIND) {
-            m_env.push_back(new ucs::scoped_setenv("UCX_RC_TM_MAX_BCOPY", "8k"));
-        }
+
         test_ucp_tag::init();
+    }
+
+    bool skip_on_ib_dc() {
+#if HAVE_DC_DV
+        // skip due to DCI stuck bug
+        return has_transport("dc_x");
+#else
+        return false;
+#endif
     }
 
     std::vector<ucp_test_param>
@@ -57,6 +81,9 @@ public:
         generate_test_params_variant(ctx_params, name,
                                      test_case_name + "/rndv_put_zcopy", tls,
                                      VARIANT_RNDV_PUT_ZCOPY, result);
+        generate_test_params_variant(ctx_params, name,
+                                     test_case_name + "/rndv_get_zcopy", tls,
+                                     VARIANT_RNDV_GET_ZCOPY, result);
         generate_test_params_variant(ctx_params, name,
                                      test_case_name + "/rndv_auto", tls,
                                      VARIANT_RNDV_AUTO, result);
@@ -116,7 +143,6 @@ private:
     static const uint64_t SENDER_TAG = 0x111337;
     static const uint64_t RECV_MASK  = 0xffff;
     static const uint64_t RECV_TAG   = 0x1337;
-    ucs::ptr_vector<ucs::scoped_setenv> m_env;
 
 };
 
@@ -233,6 +259,7 @@ void test_ucp_tag_xfer::test_run_xfer(bool send_contig, bool recv_contig,
                            &send_dt, &recv_dt);
 
     /* coverity[var_deref_model] */
+    /* coverity[var_deref_op] */
     recvd = do_xfer(&sendbuf[0], &recvbuf[0], count, send_dt, recv_dt, expected,
                     sync, truncated);
     if (!truncated) {
@@ -263,10 +290,8 @@ void test_ucp_tag_xfer::test_xfer_probe(bool send_contig, bool recv_contig,
     ucp_tag_recv_info_t info;
     request             *rreq, *sreq;
 
-    if (&sender() == &receiver()) {
-        /* the self transport doesn't do rndv and completes the send immediately */
-        UCS_TEST_SKIP_R("loop-back unsupported");
-    }
+    /* the self transport doesn't do rndv and completes the send immediately */
+    skip_loopback();
 
     ucp::dt_gen_start_count  = 0;
     ucp::dt_gen_finish_count = 0;
@@ -495,8 +520,8 @@ size_t test_ucp_tag_xfer::do_xfer(const void *sendbuf, void *recvbuf,
 void test_ucp_tag_xfer::test_xfer_len_offset()
 {
     const size_t max_offset  = 128;
-    const size_t max_length  = 64 * 1024;
-    const size_t min_length  = 1024;
+    const size_t max_length  = 64 * UCS_KBYTE;
+    const size_t min_length  = UCS_KBYTE;
     const size_t offset_step = 16;
     const size_t length_step = 16;
     const size_t buf_size    = max_length + max_offset + 2;
@@ -508,9 +533,6 @@ void test_ucp_tag_xfer::test_xfer_len_offset()
     ucs::detail::message_stream *ms;
 
     skip_err_handling();
-    if (RUNNING_ON_VALGRIND) {
-        UCS_TEST_SKIP_R("valgrind");
-    }
 
     EXPECT_EQ(posix_memalign(&send_buf, 8192, buf_size), 0);
     EXPECT_EQ(posix_memalign(&recv_buf, 8192, buf_size), 0);
@@ -571,6 +593,10 @@ UCS_TEST_P(test_ucp_tag_xfer, generic_unexp) {
     test_xfer(&test_ucp_tag_xfer::test_xfer_generic, false, false, false);
 }
 
+UCS_TEST_P(test_ucp_tag_xfer, generic_unexp_truncated) {
+    test_xfer(&test_ucp_tag_xfer::test_xfer_generic, false, false, true);
+}
+
 UCS_TEST_P(test_ucp_tag_xfer, iov_exp) {
     test_xfer(&test_ucp_tag_xfer::test_xfer_iov, true, false, false);
 }
@@ -587,12 +613,8 @@ UCS_TEST_P(test_ucp_tag_xfer, generic_err_exp) {
     test_xfer(&test_ucp_tag_xfer::test_xfer_generic_err, true, false, false);
 }
 
-UCS_TEST_P(test_ucp_tag_xfer, generic_err_unexp) {
-#if HAVE_DC_DV
-    if (GetParam().transports.front().compare("dc_x") == 0) {
-        UCS_TEST_SKIP_R("DCI stuck bug");
-    }
-#endif
+UCS_TEST_SKIP_COND_P(test_ucp_tag_xfer, generic_err_unexp,
+                     skip_on_ib_dc()) {
     test_xfer(&test_ucp_tag_xfer::test_xfer_generic_err, false, false, false);
 }
 
@@ -727,7 +749,7 @@ UCS_TEST_P(test_ucp_tag_xfer, send_contig_recv_contig_exp_sync_rndv_truncated,
     /* because ucp_tag_send_req return status (instead request) if send operation
      * completed immediately */
     skip_loopback();
-    test_run_xfer(true, true, true, false, false);
+    test_run_xfer(true, true, true, true, true);
 }
 
 UCS_TEST_P(test_ucp_tag_xfer, send_contig_recv_contig_unexp_rndv, "RNDV_THRESH=1000",
@@ -747,7 +769,7 @@ UCS_TEST_P(test_ucp_tag_xfer, send_contig_recv_contig_unexp_sync_rndv, "RNDV_THR
 
 UCS_TEST_P(test_ucp_tag_xfer, send_contig_recv_contig_unexp_sync_rndv_truncated,
            "RNDV_THRESH=1000", "ZCOPY_THRESH=1248576") {
-    test_run_xfer(true, true, false, false, true);
+    test_run_xfer(true, true, false, true, true);
 }
 
 UCS_TEST_P(test_ucp_tag_xfer, send_contig_recv_contig_exp_rndv_probe, "RNDV_THRESH=1000",
@@ -777,7 +799,7 @@ UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_generic_exp_sync_rndv_truncated,
     /* because ucp_tag_send_req return status (instead request) if send operation
      * completed immediately */
     skip_loopback();
-    test_run_xfer(false, false, true, false, false);
+    test_run_xfer(false, false, true, true, true);
 }
 
 UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_generic_unexp_rndv, "RNDV_THRESH=1000") {
@@ -794,7 +816,7 @@ UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_generic_unexp_sync_rndv, "RNDV_T
 
 UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_generic_unexp_sync_rndv_truncated,
            "RNDV_THRESH=1000") {
-    test_run_xfer(false, false, false, false, true);
+    test_run_xfer(false, false, false, true, true);
 }
 
 UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_generic_exp_rndv_probe, "RNDV_THRESH=1000") {
@@ -823,7 +845,7 @@ UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_contig_exp_sync_rndv_truncated,
     /* because ucp_tag_send_req return status (instead request) if send operation
      * completed immediately */
     skip_loopback();
-    test_run_xfer(false, true, true, false, false);
+    test_run_xfer(false, true, true, true, true);
 }
 
 UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_contig_unexp_rndv, "RNDV_THRESH=1000") {
@@ -840,7 +862,7 @@ UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_contig_unexp_sync_rndv, "RNDV_TH
 
 UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_contig_unexp_sync_rndv_truncated,
            "RNDV_THRESH=1000") {
-    test_run_xfer(false, true, false, false, true);
+    test_run_xfer(false, true, false, true, true);
 }
 
 UCS_TEST_P(test_ucp_tag_xfer, send_generic_recv_contig_exp_rndv_probe, "RNDV_THRESH=1000") {
@@ -953,13 +975,14 @@ UCS_TEST_P(test_ucp_tag_xfer, send_contig_recv_generic_exp_rndv_probe_zcopy, "RN
     test_xfer_probe(true, false, true, false);
 }
 
-UCS_TEST_P(test_ucp_tag_xfer, test_xfer_len_offset, "RNDV_THRESH=1000") {
+UCS_TEST_SKIP_COND_P(test_ucp_tag_xfer, test_xfer_len_offset,
+                     RUNNING_ON_VALGRIND, "RNDV_THRESH=1000") {
     test_xfer_len_offset();
 }
 
 UCS_TEST_P(test_ucp_tag_xfer, iov_with_empty_buffers, "ZCOPY_THRESH=512") {
     const size_t iovcnt    = ucp::data_type_desc_t::MAX_IOV;
-    const size_t size      = 1024;
+    const size_t size      = UCS_KBYTE;
     const int    expected  = 1;
     const int    sync      = 0;
     const int    truncated = 0;
@@ -996,7 +1019,7 @@ UCS_TEST_P(test_ucp_tag_xfer, iov_with_empty_buffers, "ZCOPY_THRESH=512") {
 UCP_INSTANTIATE_TEST_CASE(test_ucp_tag_xfer)
 
 
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
 
 class test_ucp_tag_stats : public test_ucp_tag_xfer {
 public:
@@ -1028,12 +1051,52 @@ public:
         return e.worker()->stats;
     }
 
-    void validate_counters(uint64_t tx_cntr, uint64_t rx_cntr) {
+    unsigned get_rx_stat(unsigned counter) {
+        return UCS_STATS_GET_COUNTER(worker_stats(receiver()), counter);
+    }
+
+    void validate_counters(unsigned tx_counter, unsigned rx_counter) {
         uint64_t cnt;
-        cnt = UCS_STATS_GET_COUNTER(ep_stats(sender()), tx_cntr);
+        cnt = UCS_STATS_GET_COUNTER(ep_stats(sender()), tx_counter);
         EXPECT_EQ(1ul, cnt);
-        cnt = UCS_STATS_GET_COUNTER(worker_stats(receiver()), rx_cntr);
+        cnt = get_rx_stat(rx_counter);
         EXPECT_EQ(1ul, cnt);
+    }
+
+    bool has_xpmem() {
+        return ucp_context_find_tl_md(receiver().ucph(), "xpmem") != NULL;
+    }
+
+    bool has_get_zcopy() {
+        return has_transport("rc_v") || has_transport("rc_x") ||
+               has_transport("dc_x") ||
+               (ucp_context_find_tl_md(receiver().ucph(), "cma")  != NULL) ||
+               (ucp_context_find_tl_md(receiver().ucph(), "knem") != NULL);
+    }
+
+    void validate_rndv_counters() {
+        unsigned get_zcopy = get_rx_stat(UCP_WORKER_STAT_TAG_RX_RNDV_GET_ZCOPY);
+        unsigned send_rtr  = get_rx_stat(UCP_WORKER_STAT_TAG_RX_RNDV_SEND_RTR);
+        unsigned rkey_ptr  = get_rx_stat(UCP_WORKER_STAT_TAG_RX_RNDV_RKEY_PTR);
+
+        UCS_TEST_MESSAGE << "get_zcopy: " << get_zcopy
+                         << " send_rtr: " << send_rtr
+                         << " rkey_ptr: " << rkey_ptr;
+        EXPECT_EQ(1, get_zcopy + send_rtr + rkey_ptr);
+
+        if (has_xpmem()) {
+            /* rkey_ptr expected to be selected if xpmem is available */
+            EXPECT_EQ(1u, rkey_ptr);
+        } else if (has_get_zcopy()) {
+            /* if any transports supports get_zcopy, expect it to be used */
+            EXPECT_EQ(1u, get_zcopy);
+        } else {
+            /* Could be a transport which supports get_zcopy that wasn't
+             * accounted for, or fallback to RTR. In any case, rkey_ptr is not
+             * expected to be used.
+             */
+            EXPECT_EQ(1u, send_rtr + get_zcopy);
+        }
     }
 
 };
@@ -1092,6 +1155,7 @@ UCS_TEST_P(test_ucp_tag_stats, rndv_expected, "RNDV_THRESH=1000") {
     test_run_xfer(true, true, true, false, false);
     validate_counters(UCP_EP_STAT_TAG_TX_RNDV,
                       UCP_WORKER_STAT_TAG_RX_RNDV_EXP);
+    validate_rndv_counters();
 }
 
 UCS_TEST_P(test_ucp_tag_stats, rndv_unexpected, "RNDV_THRESH=1000") {
@@ -1099,6 +1163,7 @@ UCS_TEST_P(test_ucp_tag_stats, rndv_unexpected, "RNDV_THRESH=1000") {
     test_run_xfer(true, true, false, false, false);
     validate_counters(UCP_EP_STAT_TAG_TX_RNDV,
                       UCP_WORKER_STAT_TAG_RX_RNDV_UNEXP);
+    validate_rndv_counters();
 }
 
 UCP_INSTANTIATE_TEST_CASE(test_ucp_tag_stats)

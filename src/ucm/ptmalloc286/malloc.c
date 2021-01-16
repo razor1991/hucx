@@ -2222,7 +2222,7 @@ typedef unsigned int flag_t;           /* The type of various bit flag sets */
   ((MCHUNK_SIZE + CHUNK_ALIGN_MASK) & ~CHUNK_ALIGN_MASK)
 
 /* conversion from malloc headers to user pointers, and back */
-#define chunk2mem(p)        ((void*)((char*)(p)       + TWO_SIZE_T_SIZES))
+#define chunk2mem(p)        ((void*)((long)(p)        + TWO_SIZE_T_SIZES))
 #define mem2chunk(mem)      ((mchunkptr)((char*)(mem) - TWO_SIZE_T_SIZES))
 /* chunk associated with aligned address A */
 #define align_as_chunk(A)   (mchunkptr)((A) + align_offset(chunk2mem(A)))
@@ -5364,7 +5364,7 @@ size_t dlmalloc_set_footprint_limit(size_t bytes) {
   size_t result;  /* invert sense of 0 */
   if (bytes == 0)
     result = granularity_align(1); /* Use minimal size */
-  if (bytes == MAX_SIZE_T)
+  else if (bytes == MAX_SIZE_T)
     result = 0;                    /* disable */
   else
     result = granularity_align(bytes);

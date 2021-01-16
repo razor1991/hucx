@@ -1,5 +1,6 @@
 /**
  * Copyright (C) Mellanox Technologies Ltd. 2017.  ALL RIGHTS RESERVED.
+ * Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
  * See file LICENSE for terms.
  */
 
@@ -11,10 +12,8 @@
 #include <ucs/memory/rcache.h>
 #include "gdrapi.h"
 
-#define UCT_GDR_COPY_MD_NAME "gdr_copy"
 
-
-extern uct_md_component_t uct_gdr_copy_md_component;
+extern uct_component_t uct_gdr_copy_component;
 
 
 /**
@@ -24,7 +23,7 @@ typedef struct uct_gdr_copy_md {
     uct_md_t            super;      /**< Domain info */
     gdr_t               gdrcpy_ctx; /**< gdr copy context */
     ucs_rcache_t        *rcache;    /**< Registration cache (can be NULL) */
-    uct_linear_growth_t reg_cost;   /**< Memory registration cost */
+    ucs_linear_func_t   reg_cost;   /**< Memory registration cost */
 } uct_gdr_copy_md_t;
 
 
@@ -35,7 +34,7 @@ typedef struct uct_gdr_copy_md_config {
     uct_md_config_t         super;
     int                     enable_rcache;/**< Enable registration cache */
     uct_md_rcache_config_t  rcache;       /**< Registration cache config */
-    uct_linear_growth_t     uc_reg_cost;  /**< Memory registration cost estimation
+    ucs_linear_func_t       uc_reg_cost;  /**< Memory registration cost estimation
                                              without using the cache */
 } uct_gdr_copy_md_config_t;
 
@@ -57,6 +56,7 @@ typedef struct uct_gdr_copy_mem {
 typedef struct uct_gdr_copy_key {
     uint64_t    vaddr;      /**< Mapped GPU address */
     void        *bar_ptr;   /**< BAR address of GPU mapping */
+    gdr_mh_t    mh;         /**< Memory handle of GPU memory */
 } uct_gdr_copy_key_t;
 
 

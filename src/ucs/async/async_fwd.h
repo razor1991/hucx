@@ -10,6 +10,7 @@
 #include <ucs/config/types.h>
 #include <ucs/time/time_def.h>
 #include <ucs/type/status.h>
+#include <ucs/sys/event_set.h>
 
 BEGIN_C_DECLS
 
@@ -24,9 +25,10 @@ typedef struct ucs_async_context ucs_async_context_t;
  * Async event callback.
  *
  * @param id           Event id (timer or file descriptor).
+ * @param events       The events that triggered the callback.
  * @param arg          User-defined argument.
  */
-typedef void (*ucs_async_event_cb_t)(int id, void *arg);
+typedef void (*ucs_async_event_cb_t)(int id, int events, void *arg);
 
 
 /**
@@ -37,7 +39,7 @@ typedef void (*ucs_async_event_cb_t)(int id, void *arg);
  *
  * @param mode            Thread or signal.
  * @param event_fd        File descriptor to set handler for.
- * @param events          Events to wait on (POLLxx/EPOLLxx bits).
+ * @param events          Events to wait on (UCS_EVENT_SET_EVxxx bits).
  * @param cb              Callback function to execute.
  * @param arg             Argument to callback.
  * @param async           Async context to which events are delivered.
@@ -77,8 +79,9 @@ ucs_status_t ucs_async_add_timer(ucs_async_mode_t mode, ucs_time_t interval,
  *
  * @param id        Timer/FD to remove.
  * @param sync      If nonzero, wait until the handler for this event is not
- *                  running anymore. Cannot be used in the context of the event
- *                  handler itself because it would deadlock.
+ *                  running anymore. If called from the context of the callback,
+ *                  the handler will be removed immediately after the current
+ *                  callback returns.
  *
  * @return Error code as defined by @ref ucs_status_t.
  */
@@ -91,7 +94,7 @@ ucs_status_t ucs_async_remove_handler(int id, int sync);
  * Modify events mask for an existing event handler (event file).
  *
  * @param fd        File descriptor modify events for.
- * @param events    New set of events to wait on (POLLxx/EPOLLxx bits).
+ * @param events    New set of events to wait on (UCS_EVENT_SET_EVxxx bits).
  *
  * @return Error code as defined by @ref ucs_status_t.
  */
@@ -105,7 +108,8 @@ ucs_status_t ucs_async_modify_handler(int fd, int events);
  * Allocate and initialize an asynchronous execution context.
  * This can be used to ensure safe event delivery.
  *
- * @param mode            Either to use signals or epoll threads to wait.
+ * @param mode            Indicates whether to use signals or polling threads 
+ *                        for waiting.
  * @param async_p         Event context pointer to initialize.
  *
  * @return Error code as defined by @ref ucs_status_t.

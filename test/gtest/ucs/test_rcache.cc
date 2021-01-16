@@ -14,6 +14,35 @@ extern "C" {
 #include <ucs/sys/sys.h>
 #include <ucm/api/ucm.h>
 }
+#include <set>
+
+
+class test_rcache_basic : public ucs::test {
+};
+
+UCS_TEST_F(test_rcache_basic, create_fail) {
+    static const ucs_rcache_ops_t ops = {
+        NULL, NULL, NULL
+    };
+    ucs_rcache_params_t params = {
+        sizeof(ucs_rcache_region_t),
+        UCS_PGT_ADDR_ALIGN,
+        ucs_get_page_size(),
+        UCS_BIT(30), /* non-existing event */
+        1000,
+        &ops,
+        NULL,
+        0
+    };
+
+    ucs_rcache_t *rcache;
+    ucs_status_t status = ucs_rcache_create(&params, "test",
+                                            ucs_stats_get_root(), &rcache);
+    EXPECT_NE(UCS_OK, status); /* should fail */
+    if (status == UCS_OK) {
+        ucs_rcache_destroy(rcache);
+    }
+}
 
 
 class test_rcache : public ucs::test {
@@ -42,10 +71,11 @@ protected:
             UCM_EVENT_VM_UNMAPPED,
             1000,
             &ops,
-            reinterpret_cast<void*>(this)
+            reinterpret_cast<void*>(this),
+            0
         };
-        UCS_TEST_CREATE_HANDLE(ucs_rcache_t*, m_rcache, ucs_rcache_destroy,
-                               ucs_rcache_create, &params, "test", ucs_stats_get_root());
+        UCS_TEST_CREATE_HANDLE_IF_SUPPORTED(ucs_rcache_t*, m_rcache, ucs_rcache_destroy,
+                                            ucs_rcache_create, &params, "test", ucs_stats_get_root());
     }
 
     virtual void cleanup() {
@@ -96,7 +126,7 @@ protected:
                 region->super.super.end - region->super.super.start);
         EXPECT_EQ(uint32_t(MAGIC), region->magic);
         region->magic = 0;
-        uint32_t prev = ucs_atomic_fadd32(&m_reg_count, -1);
+        uint32_t prev = ucs_atomic_fsub32(&m_reg_count, 1);
         EXPECT_GT(prev, 0u);
     }
 
@@ -175,7 +205,7 @@ static uintptr_t virt_to_phys(uintptr_t address)
     fd = open(pagemap_file, O_RDONLY);
     if (fd < 0) {
         ucs_error("failed to open %s: %m", pagemap_file);
-        pa = -1;
+        pa = std::numeric_limits<uintptr_t>::max();
         goto out;
     }
 
@@ -183,7 +213,7 @@ static uintptr_t virt_to_phys(uintptr_t address)
     ret = lseek(fd, offset, SEEK_SET);
     if (ret != offset) {
         ucs_error("failed to seek in %s to offset %zu: %m", pagemap_file, offset);
-        pa = -1;
+        pa = std::numeric_limits<uintptr_t>::max();
         goto out_close;
     }
 
@@ -191,7 +221,7 @@ static uintptr_t virt_to_phys(uintptr_t address)
     if (ret != sizeof(entry)) {
         ucs_error("read from %s at offset %zu returned %ld: %m", pagemap_file,
                   offset, ret);
-        pa = -1;
+        pa = std::numeric_limits<uintptr_t>::max();
         goto out_close;
     }
 
@@ -199,7 +229,7 @@ static uintptr_t virt_to_phys(uintptr_t address)
         pfn = entry & ((1ULL << 54) - 1);
         pa = (pfn * page_size) | (address & (page_size - 1));
     } else {
-        pa = -1; /* Page not present */
+        pa = std::numeric_limits<uintptr_t>::max(); /* Page not present */
     }
 
 out_close:
@@ -535,7 +565,9 @@ protected:
 
     static ucs_log_func_rc_t
     log_handler(const char *file, unsigned line, const char *function,
-                ucs_log_level_t level, const char *message, va_list ap)
+                ucs_log_level_t level,
+                const ucs_log_component_config_t *comp_conf,
+                const char *message, va_list ap)
     {
         /* Ignore warnings about empty memory pool */
         if ((level == UCS_LOG_LEVEL_WARN) && strstr(message, "failed to register")) {
@@ -608,7 +640,7 @@ UCS_MT_TEST_F(test_rcache_no_register, merge_invalid_prot_slow, 5)
     munmap(mem, size1+size2);
 }
 
-#if ENABLE_STATS
+#ifdef ENABLE_STATS
 class test_rcache_stats : public test_rcache {
 protected:
 
@@ -630,7 +662,7 @@ protected:
     }
 
     int get_counter(int stat) {
-        return (int)UCS_STATS_GET_COUNTER(m_rcache.get()->stats, stat);
+        return (int)UCS_STATS_GET_COUNTER(m_rcache->stats, stat);
     }
 
     /* a helper function for stats tests debugging */
@@ -688,11 +720,37 @@ UCS_TEST_F(test_rcache_stats, unmap_dereg) {
     r1 = get(mem, size1);
     put(r1);
 
+    /* Should generate umap event and invalidate the memory */
+    munmap(mem, size1);
+    EXPECT_EQ(1, get_counter(UCS_RCACHE_UNMAP_INVALIDATES));
+
+    /* when doing another rcache operation, the region is actually destroyed */
+    mem = alloc_pages(size1, PROT_READ|PROT_WRITE);
+    r1 = get(mem, size1);
+    put(r1);
+    EXPECT_GE(get_counter(UCS_RCACHE_UNMAPS), 1);
+    EXPECT_EQ(1, get_counter(UCS_RCACHE_DEREGS));
+
+    /* cleanup */
+    munmap(mem, size1);
+}
+
+UCS_TEST_F(test_rcache_stats, unmap_dereg_with_lock) {
+    static const size_t size1 = 1024 * 1024;
+    void *mem = alloc_pages(size1, PROT_READ|PROT_WRITE);
+    region *r1;
+
+    r1 = get(mem, size1);
+    put(r1);
+
     /* Should generate umap event but no dereg or unmap invalidation.
      * We can have more unmap events if releasing the region structure triggers
      * releasing memory back to the OS.
      */
+    pthread_rwlock_wrlock(&m_rcache->pgt_lock);
     munmap(mem, size1);
+    pthread_rwlock_unlock(&m_rcache->pgt_lock);
+
     EXPECT_GE(get_counter(UCS_RCACHE_UNMAPS), 1);
     EXPECT_EQ(0, get_counter(UCS_RCACHE_UNMAP_INVALIDATES));
     EXPECT_EQ(0, get_counter(UCS_RCACHE_DEREGS));
@@ -742,8 +800,11 @@ UCS_TEST_F(test_rcache_stats, hits_slow) {
     mem2 = alloc_pages(size1, PROT_READ|PROT_WRITE);
     r1 = get(mem2, size1);
 
-    /* generate unmap event */
+    /* generate unmap event under lock, to roce using invalidation queue */
+    pthread_rwlock_rdlock(&m_rcache->pgt_lock);
     munmap(mem1, size1);
+    pthread_rwlock_unlock(&m_rcache->pgt_lock);
+
     EXPECT_EQ(1, get_counter(UCS_RCACHE_UNMAPS));
 
     EXPECT_EQ(2, get_counter(UCS_RCACHE_GETS));
@@ -770,3 +831,81 @@ UCS_TEST_F(test_rcache_stats, hits_slow) {
     munmap(mem2, size1);
 }
 #endif
+
+
+class test_rcache_pfn : public ucs::test {
+public:
+    void test_pfn(void *address, unsigned page_num)
+    {
+        pfn_enum_t ctx;
+        ucs_status_t status;
+
+        ctx.page_num = page_num;
+        status       = ucs_sys_enum_pfn((uintptr_t)address,
+                                        page_num, enum_pfn_cb, &ctx);
+        ASSERT_UCS_OK(status);
+        /* we expect that we got exact page_num PFN calls */
+        ASSERT_EQ(page_num, ctx.page.size());
+        ASSERT_EQ(page_num, ctx.pfn.size());
+    }
+
+protected:
+    typedef std::set<unsigned> page_set_t;
+    typedef std::set<unsigned long> pfn_set_t;
+    typedef struct {
+        unsigned   page_num;
+        page_set_t page;
+        pfn_set_t  pfn;
+    } pfn_enum_t;
+
+    static void enum_pfn_cb(unsigned page_num, unsigned long pfn, void *ctx)
+    {
+        pfn_enum_t *data = (pfn_enum_t*)ctx;
+
+        EXPECT_LT(page_num, data->page_num);
+        /* we expect that every page will have a unique page_num and a
+         * unique PFN */
+        EXPECT_EQ(data->pfn.end(), data->pfn.find(pfn));
+        EXPECT_EQ(data->page.end(), data->page.find(page_num));
+        data->pfn.insert(pfn);
+        data->page.insert(page_num);
+    }
+};
+
+UCS_TEST_F(test_rcache_pfn, enum_pfn) {
+    const int MAX_PAGE_NUM = 1024 * 100; /* 400Mb max buffer */
+    size_t page_size       = ucs_get_page_size();
+    void *region;
+    unsigned i;
+    size_t len;
+    unsigned long pfn;
+    ucs_status_t status;
+
+    /* stack page could not be mapped into zero region, if we get 0 here it
+     * means the kernel does not provide PFNs */
+    status = ucs_sys_get_pfn((uintptr_t)&pfn, 1, &pfn);
+    ASSERT_UCS_OK(status);
+    if (pfn == 0) {
+        /* stack page could not be mapped into zero region */
+        UCS_TEST_SKIP_R("PFN is not supported");
+    }
+
+    /* initialize stream here to avoid incorrect debug output */
+    ucs::detail::message_stream ms("PAGES");
+
+    for (i = 1; i < MAX_PAGE_NUM; i *= 2) {
+        len = page_size * i;
+        ms << i << " ";
+        region = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ASSERT_TRUE(region != MAP_FAILED);
+        memset(region, 0, len); /* ensure that pages are mapped */
+        /* test region aligned by page size */
+        test_pfn(region, i);
+        if (i > 1) { /* test pfn on mid-of-page address */
+            test_pfn(UCS_PTR_BYTE_OFFSET(region, page_size / 2), i - 1);
+        }
+
+        munmap(region, len);
+    }
+}

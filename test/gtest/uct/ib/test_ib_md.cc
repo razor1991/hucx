@@ -7,9 +7,10 @@
 
 #include <uct/api/uct.h>
 #include <ucs/time/time.h>
-#include <uct/ib/base/ib_alloc.h>
 #include <uct/ib/base/ib_md.h>
+#ifdef HAVE_MLX5_HW
 #include <uct/ib/mlx5/ib_mlx5.h>
+#endif
 
 #include <common/test.h>
 #include <uct/test_md.h>
@@ -60,31 +61,34 @@ void test_ib_md::ib_md_umr_check(void *rkey_buffer,
     ASSERT_TRUE(memh != UCT_MEM_HANDLE_NULL);
 
     uct_ib_mem_t *ib_memh = (uct_ib_mem_t *)memh;
-    uct_ib_md_t  *ib_md = (uct_ib_md_t *)md();
 
     if (amo_access) {
         EXPECT_TRUE(ib_memh->flags & UCT_IB_MEM_ACCESS_REMOTE_ATOMIC);
-        EXPECT_FALSE(ib_memh->flags & UCT_IB_MEM_FLAG_ATOMIC_MR);
     } else {
         EXPECT_FALSE(ib_memh->flags & UCT_IB_MEM_ACCESS_REMOTE_ATOMIC);
-        EXPECT_FALSE(ib_memh->flags & UCT_IB_MEM_FLAG_ATOMIC_MR);
     }
+
+#ifdef HAVE_MLX5_HW
+    EXPECT_FALSE(ib_memh->flags & UCT_IB_MEM_FLAG_ATOMIC_MR);
+#endif
 
     status = uct_md_mkey_pack(md(), memh, rkey_buffer);
     EXPECT_UCS_OK(status);
 
-    if (amo_access) {
-        if (check_umr(ib_md)) {
-            EXPECT_TRUE(ib_memh->flags & UCT_IB_MEM_FLAG_ATOMIC_MR);
-            EXPECT_TRUE(ib_memh->atomic_rkey != 0);
-        } else {
-            EXPECT_FALSE(ib_memh->flags & UCT_IB_MEM_FLAG_ATOMIC_MR);
-            EXPECT_TRUE(ib_memh->atomic_rkey == 0);
-        }
+    status = uct_md_mkey_pack(md(), memh, rkey_buffer);
+    EXPECT_UCS_OK(status);
+
+#ifdef HAVE_MLX5_HW
+    uct_ib_md_t *ib_md = (uct_ib_md_t *)md();
+
+    if ((amo_access && check_umr(ib_md)) || ib_md->relaxed_order) {
+        EXPECT_TRUE(ib_memh->flags & UCT_IB_MEM_FLAG_ATOMIC_MR);
+        EXPECT_TRUE(ib_memh->atomic_rkey != 0);
     } else {
         EXPECT_FALSE(ib_memh->flags & UCT_IB_MEM_FLAG_ATOMIC_MR);
         EXPECT_TRUE(ib_memh->atomic_rkey == 0);
     }
+#endif
 
     status = uct_md_mem_dereg(md(), memh);
     EXPECT_UCS_OK(status);
@@ -93,7 +97,7 @@ void test_ib_md::ib_md_umr_check(void *rkey_buffer,
 }
 
 bool test_ib_md::has_ksm() const {
-#if HAVE_DECL_MLX5DV_CONTEXT_FLAGS_DEVX
+#if HAVE_DEVX
     return (ucs_derived_of(md(), uct_ib_md_t)->dev.flags & UCT_IB_DEVICE_FLAG_MLX5_PRM) &&
            (ucs_derived_of(md(), uct_ib_mlx5_md_t)->flags & UCT_IB_MLX5_MD_FLAG_KSM);
 #elif defined(HAVE_EXP_UMR_KSM)
@@ -105,10 +109,16 @@ bool test_ib_md::has_ksm() const {
 }
 
 bool test_ib_md::check_umr(uct_ib_md_t *ib_md) const {
-#if HAVE_DECL_MLX5DV_CONTEXT_FLAGS_DEVX
+#if HAVE_DEVX
     return has_ksm();
+#elif HAVE_EXP_UMR
+    if (ib_md->dev.flags & UCT_IB_DEVICE_FLAG_MLX5_PRM) {
+        uct_ib_mlx5_md_t *mlx5_md = ucs_derived_of(ib_md, uct_ib_mlx5_md_t);
+        return mlx5_md->umr_qp != NULL;
+    }
+    return false;
 #else
-    return ib_md->umr_qp != NULL;
+    return false;
 #endif
 }
 
@@ -138,6 +148,13 @@ UCS_TEST_P(test_ib_md, ib_md_umr_ksm) {
     ib_md_umr_check(&rkey_buffer[0], has_ksm(), UCT_IB_MD_MAX_MR_SIZE + 0x1000);
 }
 
+UCS_TEST_P(test_ib_md, relaxed_order, "PCI_RELAXED_ORDERING=on") {
+    std::string rkey_buffer(md_attr().rkey_packed_size, '\0');
+
+    ib_md_umr_check(&rkey_buffer[0], false);
+    ib_md_umr_check(&rkey_buffer[0], true);
+}
+
 #if HAVE_UMR_KSM
 UCS_TEST_P(test_ib_md, umr_noninline_klm, "MAX_INLINE_KLM_LIST=1") {
 
@@ -148,44 +165,5 @@ UCS_TEST_P(test_ib_md, umr_noninline_klm, "MAX_INLINE_KLM_LIST=1") {
     ib_md_umr_check(&rkey_buffer[0], has_ksm(), UCT_IB_MD_MAX_MR_SIZE + 0x1000);
 }
 #endif
-
-UCS_TEST_P(test_ib_md, alloc_dm) {
-    void *address;
-    size_t size;
-    ucs_status_t status;
-    uct_ib_device_mem_h dev_mem;
-    uct_mem_h dm_memh;
-
-    for (unsigned i = 1; i < 300; ++i) {
-        const size_t orig_size = i * 100;
-        size = orig_size;
-
-        address = NULL;
-
-        status = uct_ib_md_alloc_device_mem(md(), &size, &address, UCT_MD_MEM_ACCESS_ALL,
-                                    "test DM", &dev_mem);
-        if ((status == UCS_ERR_NO_RESOURCE) || (status == UCS_ERR_UNSUPPORTED)) {
-            continue;
-        }
-
-        ASSERT_UCS_OK(status);
-        EXPECT_GT(size, 0ul);
-
-        EXPECT_GE(size, orig_size);
-        EXPECT_TRUE(address != NULL);
-        EXPECT_TRUE(dev_mem != NULL);
-
-        memset(address, 0xBB, size);
-
-        status = uct_md_mem_reg(md(), address, size, UCT_MD_MEM_ACCESS_ALL,
-                                &dm_memh);
-        ASSERT_UCS_OK(status);
-
-        status = uct_md_mem_dereg(md(), dm_memh);
-        ASSERT_UCS_OK(status);
-
-        uct_ib_md_release_device_mem(dev_mem);
-    }
-}
 
 _UCT_MD_INSTANTIATE_TEST_CASE(test_ib_md, ib)

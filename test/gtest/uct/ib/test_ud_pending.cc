@@ -31,6 +31,8 @@ public:
         req_count = 0;
         me = this;
         m_e1->connect_to_iface(0, *m_e2);
+        disable_async(m_e1);
+        disable_async(m_e2);
         set_tx_win(m_e1, UCT_UD_CA_MAX_WINDOW);
         /* ep is not connected yet */
         EXPECT_EQ(UCS_ERR_NO_RESOURCE, tx(m_e1));
@@ -91,11 +93,10 @@ int test_ud_pending::req_count = 0;
 test_ud_pending *test_ud_pending::me = 0;
 
 /* add/purge requests */
-UCS_TEST_P(test_ud_pending, async_progress) {
+UCS_TEST_SKIP_COND_P(test_ud_pending, async_progress,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT)) {
     uct_pending_req_t r[N];
     int i;
-
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
 
     req_count = 0;
     connect();
@@ -113,11 +114,10 @@ UCS_TEST_P(test_ud_pending, async_progress) {
     EXPECT_EQ(N, req_count);
 }
 
-UCS_TEST_P(test_ud_pending, sync_progress) {
+UCS_TEST_SKIP_COND_P(test_ud_pending, sync_progress,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT)) {
     uct_pending_req_t r[N];
     int i;
-
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
 
     req_count = 0;
     connect();
@@ -136,11 +136,10 @@ UCS_TEST_P(test_ud_pending, sync_progress) {
     EXPECT_EQ(N, req_count);
 }
 
-UCS_TEST_P(test_ud_pending, err_busy) {
+UCS_TEST_SKIP_COND_P(test_ud_pending, err_busy,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT)) {
     uct_pending_req_t r[N];
     int i;
-
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
 
     req_count = 0;
     connect();
@@ -159,33 +158,26 @@ UCS_TEST_P(test_ud_pending, err_busy) {
     EXPECT_EQ(N, req_count);
 }
 
-UCS_TEST_P(test_ud_pending, connect)
+UCS_TEST_SKIP_COND_P(test_ud_pending, connect,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT))
 {
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
-
-    disable_async(m_e1);
-    disable_async(m_e2);
     post_pending_reqs();
     check_pending_reqs(true);
 }
 
-UCS_TEST_P(test_ud_pending, flush)
+UCS_TEST_SKIP_COND_P(test_ud_pending, flush,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT))
 {
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
-
-    disable_async(m_e1);
-    disable_async(m_e2);
     post_pending_reqs();
     flush();
     check_pending_reqs(false);
 }
 
-UCS_TEST_P(test_ud_pending, window)
+UCS_TEST_SKIP_COND_P(test_ud_pending, window,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT))
 {
     int i;
     uct_pending_req_t r;
-
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
 
     req_count = 0;
     me = this;
@@ -202,13 +194,12 @@ UCS_TEST_P(test_ud_pending, window)
     uct_ep_pending_purge(m_e1->ep(0), purge_cb, NULL);
 }
 
-UCS_TEST_P(test_ud_pending, tx_wqe)
+UCS_TEST_SKIP_COND_P(test_ud_pending, tx_wqe,
+                     !check_caps(UCT_IFACE_FLAG_PUT_SHORT))
 {
     int i;
     uct_pending_req_t r;
     ucs_status_t status;
-
-    check_caps(UCT_IFACE_FLAG_PUT_SHORT);
 
     req_count = 0;
     me = this;
@@ -231,6 +222,4 @@ UCS_TEST_P(test_ud_pending, tx_wqe)
     uct_ep_pending_purge(m_e1->ep(0), purge_cb, NULL);
 }
 
-_UCT_INSTANTIATE_TEST_CASE(test_ud_pending, ud)
-_UCT_INSTANTIATE_TEST_CASE(test_ud_pending, ud_mlx5)
-
+UCT_INSTANTIATE_UD_TEST_CASE(test_ud_pending)

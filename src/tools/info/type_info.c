@@ -4,11 +4,11 @@
 * See file LICENSE for terms.
 */
 
-#include "ucx_info.h"
-
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
 #endif
+
+#include "ucx_info.h"
 
 #include <ucs/async/async_int.h>
 #include <ucs/async/pipe.h>
@@ -42,7 +42,7 @@
 #  include <uct/ib/rc/base/rc_iface.h>
 #  include <uct/ib/rc/base/rc_ep.h>
 #  include <uct/ib/rc/verbs/rc_verbs.h>
-#  if HAVE_MLX5_HW
+#  ifdef HAVE_MLX5_HW
 #    include <uct/ib/rc/accel/rc_mlx5.h>
 #  endif
 #endif
@@ -55,13 +55,13 @@
 #if HAVE_TL_UD
 #  include <uct/ib/ud/base/ud_def.h>
 #  include <uct/ib/ud/verbs/ud_verbs.h>
-#  if HAVE_MLX5_HW_UD
+#  ifdef HAVE_MLX5_HW_UD
 #    include <uct/ib/ud/accel/ud_mlx5.h>
 #  endif
 #endif
 
 
-#if HAVE_TL_UGNI
+#ifdef HAVE_TL_UGNI
 #  include <uct/ugni/base/ugni_ep.h>
 #  include <uct/ugni/base/ugni_iface.h>
 #  include <uct/ugni/base/ugni_device.h>
@@ -110,7 +110,7 @@ void print_type_info(const char * tl_name)
         PRINT_SIZE(ucs_ptr_array_t);
         PRINT_SIZE(ucs_queue_elem_t);
         PRINT_SIZE(ucs_queue_head_t);
-        PRINT_SIZE(ucs_spinlock_t);
+        PRINT_SIZE(ucs_recursive_spinlock_t);
         PRINT_SIZE(ucs_timer_t);
         PRINT_SIZE(ucs_timer_queue_t);
         PRINT_SIZE(ucs_twheel_t);
@@ -146,7 +146,7 @@ void print_type_info(const char * tl_name)
         PRINT_SIZE(uct_tcp_ep_t);
         PRINT_SIZE(uct_self_ep_t);
 
-#if HAVE_TL_UGNI
+#ifdef HAVE_TL_UGNI
         PRINT_SIZE(uct_sockaddr_ugni_t);
         PRINT_SIZE(uct_sockaddr_smsg_ugni_t);
         PRINT_SIZE(uct_devaddr_ugni_t);
@@ -168,7 +168,7 @@ void print_type_info(const char * tl_name)
     }
 
 #if HAVE_TL_RC
-    if (tl_name == NULL || !strcasecmp(tl_name, "rc") ||
+    if (tl_name == NULL || !strcasecmp(tl_name, "rc_verbs") ||
         !strcasecmp(tl_name, "rc_mlx5"))
     {
         printf("RC:\n");
@@ -181,13 +181,13 @@ void print_type_info(const char * tl_name)
         PRINT_SIZE(uct_rc_iface_send_desc_t);
 
         PRINT_SIZE(uct_rc_iface_send_desc_t);
-        if (tl_name == NULL || !strcasecmp(tl_name, "rc")) {
+        if (tl_name == NULL || !strcasecmp(tl_name, "rc_verbs")) {
             PRINT_SIZE(uct_rc_verbs_ep_t);
             PRINT_SIZE(uct_rc_verbs_iface_config_t);
             PRINT_SIZE(uct_rc_verbs_iface_t);
         }
 
-#if HAVE_MLX5_HW
+#ifdef HAVE_MLX5_HW
         if (tl_name == NULL || !strcasecmp(tl_name, "rc_mlx5")) {
             PRINT_SIZE(uct_rc_mlx5_am_short_hdr_t);
             PRINT_SIZE(uct_rc_mlx5_ep_t);
@@ -212,7 +212,7 @@ void print_type_info(const char * tl_name)
 #endif
 
 #if HAVE_TL_UD
-    if (tl_name == NULL || !strcasecmp(tl_name, "ud") ||
+    if (tl_name == NULL || !strcasecmp(tl_name, "ud_verbs") ||
         !strcasecmp(tl_name, "ud_mlx5"))
     {
         printf("UD:\n");
@@ -222,16 +222,15 @@ void print_type_info(const char * tl_name)
         PRINT_SIZE(uct_ud_iface_config_t);
         PRINT_SIZE(uct_ud_ep_pending_op_t);
         PRINT_SIZE(uct_ud_send_skb_t);
-        PRINT_SIZE(uct_ud_send_skb_inl_t);
         PRINT_SIZE(uct_ud_recv_skb_t);
 
         PRINT_SIZE(uct_rc_iface_send_desc_t);
-        if (tl_name == NULL || !strcasecmp(tl_name, "ud")) {
+        if (tl_name == NULL || !strcasecmp(tl_name, "ud_verbs")) {
             PRINT_SIZE(uct_ud_verbs_ep_t);
             PRINT_SIZE(uct_ud_verbs_iface_t);
         }
 
-#if HAVE_MLX5_HW_UD
+#ifdef HAVE_MLX5_HW_UD
         if (tl_name == NULL || !strcasecmp(tl_name, "ud_mlx5")) {
             PRINT_SIZE(uct_ud_mlx5_ep_t);
             PRINT_SIZE(uct_ud_mlx5_iface_t);
@@ -241,7 +240,7 @@ void print_type_info(const char * tl_name)
     }
 #endif
 
-#if HAVE_TL_UGNI
+#ifdef HAVE_TL_UGNI
     if (tl_name == NULL || !strcasecmp(tl_name, "ugni")) {
         printf("UGNI:\n");
         PRINT_SIZE(uct_ugni_device_t);

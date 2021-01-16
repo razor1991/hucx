@@ -1,12 +1,11 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2014.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2019. ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
 
 #ifndef UCS_CONFIG_TYPES_H
 #define UCS_CONFIG_TYPES_H
-
 
 #include <ucs/sys/compiler_def.h>
 #include <sys/socket.h>
@@ -18,6 +17,7 @@ typedef enum {
     UCS_LOG_LEVEL_FATAL,        /* Immediate termination */
     UCS_LOG_LEVEL_ERROR,        /* Error is returned to the user */
     UCS_LOG_LEVEL_WARN,         /* Something's wrong, but we continue */
+    UCS_LOG_LEVEL_DIAG,         /* Diagnostics, silent adjustments or internal error handling */
     UCS_LOG_LEVEL_INFO,         /* Information */
     UCS_LOG_LEVEL_DEBUG,        /* Low-volume debugging */
     UCS_LOG_LEVEL_TRACE,        /* High-volume debugging */
@@ -59,6 +59,17 @@ typedef enum ucs_ternary_value {
 
 
 /**
+ * On/Off/Auto logic value.
+ */
+typedef enum ucs_on_off_auto_value {
+    UCS_CONFIG_OFF  = 0,
+    UCS_CONFIG_ON   = 1,
+    UCS_CONFIG_AUTO = 2,
+    UCS_CONFIG_ON_OFF_LAST
+} ucs_on_off_auto_value_t;
+
+
+/**
  * Error handling modes
  */
 typedef enum {
@@ -78,12 +89,6 @@ typedef enum {
     UCS_CONFIG_PRINT_DOC           = UCS_BIT(2),
     UCS_CONFIG_PRINT_HIDDEN        = UCS_BIT(3)
 } ucs_config_print_flags_t;
-
-
-#define UCS_CONFIG_MEMUNITS_INF    SIZE_MAX
-#define UCS_CONFIG_MEMUNITS_AUTO   (SIZE_MAX - 1)
-
-#define UCS_CONFIG_ULUNITS_AUTO    (SIZE_MAX - 1)
 
 
 /**
@@ -113,5 +118,13 @@ typedef struct ucs_sock_addr {
     const struct sockaddr   *addr;      /**< Pointer to socket address */
     socklen_t                addrlen;   /**< Address length */
 } ucs_sock_addr_t;
+
+/**
+ * Logging component.
+ */
+typedef struct ucs_log_component_config {
+    ucs_log_level_t log_level;
+    char            name[16];
+} ucs_log_component_config_t;
 
 #endif /* TYPES_H_ */

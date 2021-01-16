@@ -16,16 +16,23 @@
 #include <ucs/type/class.h>
 
 
+#define UCT_RC_MLX5_CHECK_RES_PTR(_iface, _ep) \
+    UCT_RC_CHECK_CQE_RET(&(_iface)->super, &(_ep)->super, \
+                         UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE)) \
+    UCT_RC_CHECK_TXQP_RET(&(_iface)->super, &(_ep)->super, \
+                          UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE))
+
+
 /**
  * RC remote endpoint
  */
 typedef struct uct_rc_mlx5_ep {
-    uct_rc_ep_t      super;
-    unsigned         qp_num;
+    uct_rc_ep_t              super;
     struct {
-        uct_ib_mlx5_txwq_t  wq;
+        uct_ib_mlx5_txwq_t   wq;
     } tx;
-    struct ibv_qp    *tm_qp;
+    uct_ib_mlx5_qp_t         tm_qp;
+    uct_rc_mlx5_mp_context_t mp;
 } uct_rc_mlx5_ep_t;
 
 typedef struct uct_rc_mlx5_ep_address {
@@ -107,6 +114,11 @@ ucs_status_t uct_rc_mlx5_ep_flush(uct_ep_h tl_ep, unsigned flags, uct_completion
 ucs_status_t uct_rc_mlx5_ep_fc_ctrl(uct_ep_t *tl_ep, unsigned op,
                                     uct_rc_fc_request_t *req);
 
+ucs_status_t uct_rc_mlx5_iface_create_qp(uct_rc_mlx5_iface_common_t *iface,
+                                         uct_ib_mlx5_qp_t *qp,
+                                         uct_ib_mlx5_txwq_t *txwq,
+                                         uct_ib_mlx5_qp_attr_t *attr);
+
 ucs_status_t uct_rc_mlx5_ep_connect_to_ep(uct_ep_h tl_ep,
                                           const uct_device_addr_t *dev_addr,
                                           const uct_ep_addr_t *ep_addr);
@@ -139,5 +151,11 @@ ucs_status_t uct_rc_mlx5_ep_tag_rndv_request(uct_ep_h tl_ep, uct_tag_t tag,
                                              unsigned flags);
 
 ucs_status_t uct_rc_mlx5_ep_get_address(uct_ep_h tl_ep, uct_ep_addr_t *addr);
+
+ucs_status_t uct_rc_mlx5_ep_handle_failure(uct_rc_mlx5_ep_t *ep,
+                                           ucs_status_t status);
+
+ucs_status_t uct_rc_mlx5_ep_set_failed(uct_ib_iface_t *iface, uct_ep_h ep,
+                                       ucs_status_t status);
 
 #endif

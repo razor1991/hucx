@@ -1,5 +1,5 @@
 /**
-* Copyright (C) Mellanox Technologies Ltd. 2001-2012.  ALL RIGHTS RESERVED.
+* Copyright (C) Mellanox Technologies Ltd. 2001-2019.  ALL RIGHTS RESERVED.
 * Copyright (c) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
@@ -10,11 +10,15 @@
 
 #include "gtest.h"
 
+#include <common/mem_buffer.h>
+
+#include <ucs/config/types.h>
 #include <ucs/sys/preprocessor.h>
 #include <ucs/sys/checker.h>
 #include <ucs/sys/string.h>
 #include <ucs/sys/sock.h>
 #include <ucs/time/time.h>
+
 #include <errno.h>
 #include <iostream>
 #include <stdexcept>
@@ -86,6 +90,15 @@
     } while (0)
 
 
+#define ASSERT_UCS_OK_OR_BUSY(_expr) \
+    do { \
+        ucs_status_t _status = (_expr); \
+        if (((_status) != UCS_OK) && ((_status) != UCS_ERR_BUSY)) { \
+            UCS_TEST_ABORT("Error: " << ucs_status_string(_status)); \
+        } \
+    } while (0)
+
+
 #define ASSERT_UCS_PTR_OK(_expr) \
     do { \
         ucs_status_ptr_t _status = (_expr); \
@@ -97,7 +110,7 @@
 
 #define EXPECT_UD_CHECK(_val1, _val2, _exp_ud, _exp_non_ud) \
     do { \
-        if ((GetParam()->tl_name == "ud") || (GetParam()->tl_name == "ud_mlx5")) { \
+        if (has_ud()) { \
             EXPECT_##_exp_ud(_val1, _val2); \
         } else { \
             EXPECT_##_exp_non_ud(_val1, _val2); \
@@ -159,10 +172,13 @@
         }
 
 
+
 namespace ucs {
 
 extern const double test_timeout_in_sec;
 extern const double watchdog_timeout_default;
+
+extern std::set< const ::testing::TestInfo*> skipped_tests;
 
 typedef enum {
     WATCHDOG_STOP,
@@ -193,6 +209,8 @@ double watchdog_get_timeout();
 int watchdog_get_kill_signal();
 int watchdog_start();
 void watchdog_stop();
+
+void analyze_test_results();
 
 class test_abort_exception : public std::exception {
 };
@@ -248,6 +266,7 @@ ucs_time_t get_deadline(double timeout_in_sec = test_timeout_in_sec);
  */
 int max_tcp_connections();
 
+ 
 /**
  * Signal-safe sleep.
  */
@@ -279,6 +298,12 @@ uint16_t get_port();
 void *mmap_fixed_address();
 
 
+/*
+ * Returns a compacted string with just head and tail, e.g "xxx...yyy"
+ */
+std::string compact_string(const std::string &str, size_t length);
+
+
 /**
  * Return the IP address of the given interface address.
  */
@@ -288,6 +313,42 @@ std::string sockaddr_to_str(const S *saddr) {
     return ::ucs_sockaddr_str(reinterpret_cast<const struct sockaddr*>(saddr),
                               buffer, UCS_SOCKADDR_STRING_LEN);
 }
+
+/**
+ * Wrapper for struct sockaddr_storage to unify work flow for IPv4 and IPv6
+ */
+class sock_addr_storage {
+public:
+    sock_addr_storage();
+
+    sock_addr_storage(const ucs_sock_addr_t &ucs_sock_addr);
+
+    void set_sock_addr(const struct sockaddr &addr, const size_t size);
+
+    void reset_to_any();
+
+    bool operator==(const struct sockaddr_storage &sockaddr) const;
+
+    void set_port(uint16_t port);
+
+    uint16_t get_port() const;
+
+    size_t get_addr_size() const;
+
+    ucs_sock_addr_t to_ucs_sock_addr() const;
+
+    std::string to_str() const;
+
+    const struct sockaddr* get_sock_addr_ptr() const;
+
+private:
+    struct sockaddr_storage m_storage;
+    size_t                  m_size;
+    bool                    m_is_valid;
+};
+
+
+std::ostream& operator<<(std::ostream& os, const sock_addr_storage& sa_storage);
 
 
 /*
@@ -316,6 +377,11 @@ static inline int rand() {
     return ::rand();
 }
 
+static inline void srand(unsigned seed) {
+    /* coverity[dont_call] */
+    return ::srand(seed);
+}
+
 void fill_random(void *data, size_t size);
 
 /* C can be vector or string */
@@ -333,7 +399,7 @@ static void fill_random(C& c, size_t size) {
 template <typename T>
 static inline T random_upper() {
   return static_cast<T>((rand() / static_cast<double>(RAND_MAX)) *
-                        std::numeric_limits<T>::max());
+                        static_cast<double>(std::numeric_limits<T>::max()));
 }
 
 template <typename T>
@@ -371,10 +437,25 @@ private:
     std::string       m_old_value;
 };
 
+class ucx_env_cleanup {
+public:
+    ucx_env_cleanup();
+    ~ucx_env_cleanup();
+private:
+    std::vector<std::string> ucx_env_storage;
+};
+
 template <typename T>
 std::string to_string(const T& value) {
     std::stringstream ss;
     ss << value;
+    return ss.str();
+}
+
+template <typename T>
+std::string to_hex_string(const T& value) {
+    std::stringstream ss;
+    ss << std::hex << value;
     return ss.str();
 }
 
@@ -569,6 +650,10 @@ public:
         return m_initialized ? m_value : NULL;
     }
 
+    T operator->() const {
+        return get();
+    }
+
 private:
 
     void release() {
@@ -588,6 +673,55 @@ private:
     ArgT           m_dtor_arg;
 };
 
+/* simplified version of std::auto_ptr which was deprecated in newer stdc++
+ * versions in favor of unique_ptr */
+template <typename T>
+class auto_ptr {
+public:
+    auto_ptr() : m_ptr(NULL) {
+    }
+
+    auto_ptr(T* ptr) : m_ptr(NULL) {
+        reset(ptr);
+    }
+
+    ~auto_ptr() {
+        reset();
+    }
+
+    void reset(T* ptr = NULL) {
+        if (m_ptr) {
+            delete m_ptr;
+        }
+        m_ptr = ptr;
+    }
+
+    operator T*() const {
+        return m_ptr;
+    }
+
+    T* operator->() const {
+        return m_ptr;
+    }
+
+private:
+    auto_ptr(const auto_ptr&); /* disable copy */
+    auto_ptr operator=(const auto_ptr&); /* disable assign */
+
+    T* m_ptr;
+};
+
+#define UCS_TEST_TRY_CREATE_HANDLE(_t, _handle, _dtor, _ctor, ...) \
+    ({ \
+        _t h; \
+        ucs_status_t status = _ctor(__VA_ARGS__, &h); \
+        ASSERT_UCS_OK_OR_BUSY(status); \
+        if (status == UCS_OK) { \
+            _handle.reset(h, _dtor); \
+        } \
+        status; \
+    })
+
 #define UCS_TEST_CREATE_HANDLE(_t, _handle, _dtor, _ctor, ...) \
     { \
         _t h; \
@@ -596,6 +730,17 @@ private:
         _handle.reset(h, _dtor); \
     }
 
+#define UCS_TEST_CREATE_HANDLE_IF_SUPPORTED(_t, _handle, _dtor, _ctor, ...) \
+    { \
+        _t h; \
+        ucs_status_t status = _ctor(__VA_ARGS__, &h); \
+        if (status == UCS_ERR_UNSUPPORTED) { \
+            UCS_TEST_SKIP_R(std::string("Unsupported operation: ") + \
+                            UCS_PP_MAKE_STRING(_ctor)); \
+        } \
+        ASSERT_UCS_OK(status); \
+        _handle.reset(h, _dtor); \
+    }
 
 class size_value {
 public:
@@ -631,6 +776,23 @@ static inline O& operator<<(O& os, const size_value& sz)
     os.flags(f);
     return os;
 }
+
+
+class auto_buffer {
+public:
+    auto_buffer(size_t size);
+    ~auto_buffer();
+    void* operator*() const;
+private:
+    void *m_ptr;
+};
+
+
+template <typename T>
+static void deleter(T *ptr) {
+    delete ptr;
+}
+
 
 extern int    perf_retry_count;
 extern double perf_retry_interval;
@@ -679,6 +841,65 @@ private:
 };
 
 } // detail
+
+/**
+ * N-ary Cartesian product over the N vectors provided in the input vector
+ * The cardinality of the result vector:
+ * output.size = input[0].size * input[1].size * ... * input[input.size].size
+ */
+template<typename T>
+void cartesian_product(std::vector<std::vector<T> > &final_output,
+                       std::vector<T> &cur_output,
+                       typename std::vector<std::vector<T> >
+                       ::const_iterator cur_input,
+                       typename std::vector<std::vector<T> >
+                       ::const_iterator end_input) {
+    if (cur_input == end_input) {
+        final_output.push_back(cur_output);
+        return;
+    }
+
+    const std::vector<T> &cur_vector = *cur_input;
+
+    cur_input++;
+
+    for (typename std::vector<T>::const_iterator iter =
+            cur_vector.begin(); iter != cur_vector.end(); ++iter) {
+        cur_output.push_back(*iter);
+        ucs::cartesian_product(final_output, cur_output,
+                               cur_input, end_input);
+        cur_output.pop_back();
+    }
+}
+
+template<typename T>
+void cartesian_product(std::vector<std::vector<T> > &output,
+                       const std::vector<std::vector<T> > &input)
+{
+    std::vector<T> cur_output;
+    cartesian_product(output, cur_output, input.begin(), input.end());
+}
+
+template<typename T>
+std::vector<std::vector<T> > make_pairs(const std::vector<T> &input_vec) {
+    std::vector<std::vector<T> > result;
+    std::vector<std::vector<T> > input;
+
+    input.push_back(input_vec);
+    input.push_back(input_vec);
+
+    ucs::cartesian_product(result, input);
+
+    return result;
+}
+
+std::vector<std::vector<ucs_memory_type_t> > supported_mem_type_pairs();
+
+
+/**
+ * Skip test if address sanitizer is enabled
+ */
+void skip_on_address_sanitizer();
 
 } // ucs
 

@@ -33,12 +33,13 @@ protected:
 
 size_t test_ucp_stream_base::wait_stream_recv(void *request)
 {
+    ucs_time_t deadline = ucs::get_deadline();
     ucs_status_t status;
     size_t       length;
     do {
         progress();
         status = ucp_stream_recv_request_test(request, &length);
-    } while (status == UCS_INPROGRESS);
+    } while ((status == UCS_INPROGRESS) && (ucs_get_time() < deadline));
     ASSERT_UCS_OK(status);
     ucp_request_free(request);
 
@@ -61,6 +62,53 @@ public:
         return params;
     }
 };
+
+UCS_TEST_P(test_ucp_stream_onesided, recv_not_connected_ep_cleanup) {
+    receiver().connect(&sender(), get_ep_params());
+
+    uint64_t recv_data = 0;
+    size_t length;
+    void *rreq = ucp_stream_recv_nb(receiver().ep(), &recv_data, 1,
+                                    ucp_dt_make_contig(sizeof(uint64_t)),
+                                    ucp_recv_cb, &length,
+                                    UCP_STREAM_RECV_FLAG_WAITALL);
+    EXPECT_TRUE(UCS_PTR_IS_PTR(rreq));
+    EXPECT_EQ(UCS_INPROGRESS, ucp_request_check_status(rreq));
+    disconnect(receiver());
+    EXPECT_EQ(UCS_ERR_CANCELED, ucp_request_check_status(rreq));
+    ucp_request_free(rreq);
+}
+
+UCS_TEST_P(test_ucp_stream_onesided, recv_connected_ep_cleanup) {
+    skip_loopback();
+    sender().connect(&receiver(), get_ep_params());
+    receiver().connect(&sender(), get_ep_params());
+
+    uint64_t send_data = ucs::rand();
+    uint64_t recv_data = 0;
+    ucp_datatype_t dt  = ucp_dt_make_contig(sizeof(uint64_t));
+
+    ucp::data_type_desc_t send_dt_desc(dt, &send_data, sizeof(send_data));
+    void *sreq = stream_send_nb(send_dt_desc);
+
+    size_t recvd_length;
+    void *rreq = ucp_stream_recv_nb(receiver().ep(), &recv_data, 1, dt,
+                                    ucp_recv_cb, &recvd_length,
+                                    UCP_STREAM_RECV_FLAG_WAITALL);
+
+    EXPECT_EQ(sizeof(send_data), wait_stream_recv(rreq));
+    EXPECT_EQ(send_data, recv_data);
+    wait(sreq);
+
+    rreq = ucp_stream_recv_nb(receiver().ep(), &recv_data, 1, dt, ucp_recv_cb,
+                              &recvd_length, UCP_STREAM_RECV_FLAG_WAITALL);
+    EXPECT_TRUE(UCS_PTR_IS_PTR(rreq));
+    EXPECT_EQ(UCS_INPROGRESS, ucp_request_check_status(rreq));
+    disconnect(sender());
+    disconnect(receiver());
+    EXPECT_EQ(UCS_ERR_CANCELED, ucp_request_check_status(rreq));
+    ucp_request_free(rreq);
+}
 
 UCS_TEST_P(test_ucp_stream_onesided, send_recv_no_ep) {
 
@@ -141,13 +189,14 @@ protected:
 
 void test_ucp_stream::do_send_recv_data_test(ucp_datatype_t datatype)
 {
-    std::vector<char> sbuf(16 * 1024 * 1024, 's');
     size_t            ssize = 0; /* total send size in bytes */
+    std::vector<char> sbuf(16 * UCS_MBYTE, 's');
     std::vector<char> check_pattern;
     ucs_status_ptr_t  sstatus;
 
     /* send all msg sizes*/
-    for (size_t i = 3; i < sbuf.size(); i *= 2) {
+    for (size_t i = 3; i < sbuf.size();
+         i *= (2 * ucs::test_time_multiplier())) {
         if (UCP_DT_IS_GENERIC(datatype)) {
             for (size_t j = 0; j < i; ++j) {
                 check_pattern.push_back(char(j));
@@ -171,7 +220,7 @@ void test_ucp_stream::do_send_recv_data_test(ucp_datatype_t datatype)
     do {
         progress();
         rdata = ucp_stream_recv_data_nb(receiver().ep(), &length);
-        if (UCS_PTR_STATUS(rdata) == UCS_OK) {
+        if (rdata == NULL) {
             continue;
         }
 
@@ -189,8 +238,8 @@ void test_ucp_stream::do_send_recv_test(ucp_datatype_t datatype)
 {
     const size_t      dt_elem_size = UCP_DT_IS_CONTIG(datatype) ?
                                      ucp_contig_dt_elem_size(datatype) : 1;
-    std::vector<char> sbuf(16 * 1024 * 1024, 's');
-    size_t            ssize = 0; /* total send size */
+    size_t            ssize        = 0; /* total send size */
+    std::vector<char> sbuf(16 * UCS_MBYTE, 's');
     ucs_status_ptr_t  sstatus;
     std::vector<char> check_pattern;
 
@@ -268,7 +317,7 @@ void test_ucp_stream::do_send_exp_recv_test(ucp_datatype_t datatype)
 {
     const size_t dt_elem_size = UCP_DT_IS_CONTIG(datatype) ?
                                 ucp_contig_dt_elem_size(datatype) : 1;
-    const size_t msg_size = dt_elem_size * 1024 * 1024;
+    const size_t msg_size = dt_elem_size * UCS_MBYTE;
     const size_t n_msgs   = 10;
 
     std::vector<std::vector<T> > rbufs(n_msgs,
@@ -348,17 +397,17 @@ void test_ucp_stream::do_send_recv_data_recv_test(ucp_datatype_t datatype)
 {
     const size_t dt_elem_size = UCP_DT_IS_CONTIG(datatype) ?
                                 ucp_contig_dt_elem_size(datatype) : 1;
-    std::vector<char> sbuf(16 * 1024 * 1024, 's');
-    size_t            ssize = 0; /* total send size */
+    size_t            ssize   = 0; /* total send size */
+    size_t            roffset = 0;
+    size_t            send_i  = dt_elem_size;
+    size_t            recv_i  = 0;
+    std::vector<char> sbuf(16 * UCS_MBYTE, 's');
     ucs_status_ptr_t  sstatus;
     std::vector<char> check_pattern;
     std::vector<char> rbuf;
-    size_t            roffset = 0;
     ucs_status_ptr_t  rdata;
     size_t            length;
 
-    size_t            send_i = dt_elem_size;
-    size_t            recv_i = 0;
     do {
         if (send_i < sbuf.size()) {
             rbuf.resize(rbuf.size() + send_i, 'r');
@@ -377,7 +426,7 @@ void test_ucp_stream::do_send_recv_data_recv_test(ucp_datatype_t datatype)
 
         if ((++recv_i % 2) || ((ssize - roffset) < dt_elem_size)) {
             rdata = ucp_stream_recv_data_nb(receiver().ep(), &length);
-            if (UCS_PTR_STATUS(rdata) == UCS_OK) {
+            if (rdata == NULL) {
                 continue;
             }
 
@@ -459,7 +508,6 @@ UCS_TEST_P(test_ucp_stream, send_recv_generic) {
     ASSERT_UCS_OK(status);
     do_send_recv_test<uint8_t, UCP_STREAM_RECV_FLAG_WAITALL>(dt);
     ucp_dt_destroy(dt);
-
 }
 
 UCS_TEST_P(test_ucp_stream, send_exp_recv_8) {
@@ -516,7 +564,7 @@ UCS_TEST_P(test_ucp_stream, send_recv_data_recv_iov) {
 }
 
 UCS_TEST_P(test_ucp_stream, send_zero_ending_iov_recv_data) {
-    const size_t min_size         = 1024;
+    const size_t min_size         = UCS_KBYTE;
     const size_t max_size         = min_size * 64;
     const size_t iov_num          = 8; /* must be divisible by 4 without a
                                         * remainder, caught on mlx5 based TLs
@@ -608,12 +656,12 @@ protected:
 
 void test_ucp_stream_many2one::init()
 {
-    /* Skip entities creation */
-    test_base::init();
-
     if (is_self()) {
         UCS_TEST_SKIP_R("self");
     }
+
+    /* Skip entities creation */
+    test_base::init();
 
     for (size_t i = 0; i < m_nsenders + 1; ++i) {
         create_entity();
