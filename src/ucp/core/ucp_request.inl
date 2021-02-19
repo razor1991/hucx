@@ -624,6 +624,8 @@ ucp_recv_desc_init(ucp_worker_h worker, void *data, size_t length,
             return UCS_ERR_NO_MEMORY;
         }
 
+        ucs_assert(worker->am_mp.data->elem_size >= (data_offset + length));
+
         /* No need to initialize rdesc->priv_length here, because it is only
          * needed for releasing UCT descriptor. */
 
