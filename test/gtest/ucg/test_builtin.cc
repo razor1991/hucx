@@ -115,37 +115,29 @@ TEST(ucg_plan_test, ucg_plan_4_test) {
 }
 */
 TEST(ucg_plan_test, algorithm_selection) {
-    ucs_status_t ret;
     unsigned idx;
     for (idx = 0; idx < UCG_ALGORITHM_ALLREDUCE_LAST; idx++) {
-        ret = ucg_builtin_allreduce_algo_switch((enum ucg_builtin_allreduce_algorithm) idx, &ucg_builtin_algo_config);
-        ASSERT_EQ(UCS_OK, ret);
+        ucg_builtin_allreduce_algo_switch((enum ucg_builtin_allreduce_algorithm) idx, &ucg_builtin_algo_config);
     }
 
     for (idx = 0; idx < UCG_ALGORITHM_BARRIER_LAST; idx++) {
-        ret = ucg_builtin_barrier_algo_switch((enum ucg_builtin_barrier_algorithm) idx, &ucg_builtin_algo_config);
-        ASSERT_EQ(UCS_OK, ret);
+        ucg_builtin_barrier_algo_switch((enum ucg_builtin_barrier_algorithm) idx, &ucg_builtin_algo_config);
     }
 
     for (idx = 0; idx < UCG_ALGORITHM_BCAST_LAST; idx++) {
-        ret = ucg_builtin_bcast_algo_switch((enum ucg_builtin_bcast_algorithm) idx, &ucg_builtin_algo_config);
-        ASSERT_EQ(UCS_OK, ret);
+        ucg_builtin_bcast_algo_switch((enum ucg_builtin_bcast_algorithm) idx, &ucg_builtin_algo_config);
     }
 
 }
 
 TEST(ucg_plan_test, topo_level) {
-    ucs_status_t ret;
     ucg_builtin_algo_config.topo_level = UCG_GROUP_HIERARCHY_LEVEL_NODE;
     enum ucg_group_member_distance domain_distance = UCG_GROUP_MEMBER_DISTANCE_SELF;
-    ret = choose_distance_from_topo_aware_level(&domain_distance);
-    ASSERT_EQ(UCS_OK, ret);
+    choose_distance_from_topo_aware_level(&domain_distance);
     ucg_builtin_algo_config.topo_level = UCG_GROUP_HIERARCHY_LEVEL_SOCKET;
-    ret = choose_distance_from_topo_aware_level(&domain_distance);
-    ASSERT_EQ(UCS_OK, ret);
+    choose_distance_from_topo_aware_level(&domain_distance);
     ucg_builtin_algo_config.topo_level = UCG_GROUP_HIERARCHY_LEVEL_L3CACHE;
-    ret = choose_distance_from_topo_aware_level(&domain_distance);
-    ASSERT_EQ(UCS_OK, ret);
+    choose_distance_from_topo_aware_level(&domain_distance);
 }
 
 TEST(ucg_plan_test, check_continus_number) {
